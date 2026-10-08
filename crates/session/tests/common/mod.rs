@@ -7,6 +7,8 @@
 
 #![allow(dead_code)] // each consuming test crate uses a different subset
 
+pub mod agent_fixtures;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -58,8 +60,7 @@ pub fn session_meta(id: &str, agent: &str) -> SessionMeta {
         skill: None,
         task_type: None,
         requirement: None,
-        plan_snapshot: None,
-        plan_input_count: 0,
+        kind: None,
     }
 }
 
@@ -76,6 +77,8 @@ pub fn parent_task_turn(task_ids: &[&str]) -> Message {
         });
     }
     Message {
+        provider_state: None,
+        display: None,
         id: "a1".into(),
         role: Role::Assistant,
         blocks,

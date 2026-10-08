@@ -26,6 +26,8 @@ async fn drain_mode_step_proceeds_when_transcript_ends_with_tool_result() {
     let (mut session, _store) = make_session("drain-tool-test").await;
 
     session.messages.push(opencoder_core::Message {
+        provider_state: None,
+        display: None,
         id: "tool-1".into(),
         role: Role::Tool,
         blocks: vec![],
@@ -76,9 +78,9 @@ async fn claim_one_queued_claims_even_when_turn_cancel_fired() {
     token.lock().unwrap().cancel();
 
     let result = claim_one_queued(&mut session, &mut |_| {}).await;
-    let (seq, prompt, _imgs) =
+    let (seq, input) =
         result.expect("claim_one_queued must pop the pending queue even when turn_cancel is fired");
-    assert_eq!(prompt, "queued");
+    assert_eq!(input.prompt, "queued");
     assert!(seq > 0);
 }
 
@@ -206,8 +208,8 @@ async fn claim_one_queued_completes_under_hard_cancel() {
     let hard = CancellationToken::new();
     hard.cancel();
     session.cancel = Some(hard);
-    let (seq, prompt, _) = claim_one_queued(&mut session, &mut |_| {}).await.unwrap();
-    assert_eq!(prompt, "survives-cancel");
+    let (seq, input) = claim_one_queued(&mut session, &mut |_| {}).await.unwrap();
+    assert_eq!(input.prompt, "survives-cancel");
     assert!(seq > 0);
     assert!(store
         .pending_inputs(&session.id, Delivery::Queue)

@@ -138,12 +138,14 @@ mod tests {
         assert_eq!(tools[0].name(), "mcp__calc__add");
 
         let ctx = ToolContext {
+            extra_env: Vec::new(),
             session_id: "s".into(),
             message_id: "m".into(),
             agent: "act".into(),
             working_dir: std::path::PathBuf::from("."),
             max_output: 4096,
             proxy: None,
+            tools_path: None,
         };
         let out = tools[0]
             .execute(serde_json::json!({"a": 1, "b": 2}), &ctx)
@@ -184,12 +186,14 @@ mod tests {
         );
 
         let ctx = ToolContext {
+            extra_env: Vec::new(),
             session_id: "s".into(),
             message_id: "m".into(),
             agent: "act".into(),
             working_dir: std::path::PathBuf::from("."),
             max_output: 4096,
             proxy: None,
+            tools_path: None,
         };
         let out = tools[0].execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(out.is_error);

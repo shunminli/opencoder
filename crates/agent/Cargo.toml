@@ -1,0 +1,37 @@
+[package]
+name = "opencoder-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "opencoder-agent"
+path = "src/main.rs"
+
+[dependencies]
+opencoder-core.workspace = true
+opencoder-node.workspace = true
+opencoder-worker.workspace = true
+opencoder-dag.workspace = true
+opencoder-llm.workspace = true
+opencoder-store.workspace = true
+opencoder-session.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+ulid.workspace = true
+axum = { version = "0.7", features = ["json"] }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+opencoder-dag-runtime.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

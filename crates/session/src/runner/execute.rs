@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use opencoder_core::{AgentKind, ToolArc, ToolContext, ToolOutput};
+use opencoder_core::{ToolArc, ToolContext, ToolOutput};
 use opencoder_llm::tool_call::CompletedToolCall;
 use opencoder_store::Store;
 use tokio_util::sync::CancellationToken;
@@ -80,7 +80,7 @@ pub(crate) fn leaf_tool_timeout(name: &str) -> Option<Duration> {
         // `question` waits for a human answer: wall-clock budgeting it
         // would cut off slow users. Cancel (double-Esc / turn interrupt)
         // remains the only way out, same as bash.
-        "bash" | "question" => None,
+        "bash" | "powershell" | "question" => None,
         "read" | "edit" | "search" => {
             Some(Duration::from_secs(crate::tools::bash::BASH_TIMEOUT_SECS))
         }
@@ -98,6 +98,22 @@ pub(super) async fn execute_call_with_timeout(
     timeout: Option<Duration>,
 ) -> ToolOutput {
     if tc.name == "task" {
+        // Plan admission admits `task` for evidence gathering, but the
+        // sidecar kind is read-only-only by contract: gate the spawn here
+        // (before any child session is created) so a sidecar cannot farm
+        // mutations out to a full write-capable subagent. Same denial text
+        // as the generic gate for a consistent UX.
+        if let Some(denial) = crate::bash_guard::gate_async(
+            &session.agent.kind,
+            &session.agent.name,
+            "task",
+            None,
+            &session.working_dir,
+        )
+        .await
+        {
+            return ToolOutput::err(denial);
+        }
         // The subagent runs as a child session and may legitimately take many
         // minutes, so it is exempt from the leaf-tool `DEFAULT_TOOL_TIMEOUT`.
         // It still gets its own (generous) deadline + the cancel guard so a
@@ -246,36 +262,107 @@ pub(super) async fn execute_call_with_timeout(
         };
     }
 
-    // Plan-mode bash write guard: classify the command and block mutating
-    // operations, returning a descriptive error to the model so it can adapt.
-    if tc.name == "bash" && session.agent.kind == AgentKind::Plan {
-        let cmd = tc
-            .input
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if let crate::bash_guard::BashVerdict::WriteBlocked(reason) =
-            crate::bash_guard::classify(cmd)
-        {
-            return ToolOutput::err(format!(
-                "Blocked in plan mode: this bash command modifies state ({reason}). \
-                 Plan mode is read-only. To make changes, switch to act mode (Alt+Tab)."
-            ));
-        }
+    // Read-only execution gate (plan mode + sidecar): unadmitted tools AND
+    // mutating bash are refused with a model-visible denial (names the
+    // session, forbids retry, points at the escape hatch) so the model stops
+    // attempting writes instead of looping; see bash_guard::gate for the
+    // policy. The effective workdir is
+    // resolved exactly like `tools::bash::execute` resolves it (`workdir`
+    // input, else the session working dir): the classifier must judge
+    // relative writes in the same directory the command will actually run in.
+    let effective_workdir = tc
+        .input
+        .get("workdir")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| session.working_dir.clone());
+    if let Some(denial) = crate::bash_guard::gate_async(
+        &session.agent.kind,
+        &session.agent.name,
+        &tc.name,
+        tc.input.get("command").and_then(|v| v.as_str()),
+        &effective_workdir,
+    )
+    .await
+    {
+        return ToolOutput::err(denial);
+    }
+    // Latent execution gate (defence in depth): latent tools stay in the
+    // registry even while hidden from the schema array, so a hallucinated
+    // `question`/`ssh_pty` call would otherwise execute silently. Refuse
+    // unless the live skill body still unlocks the tool. Sole exception: an
+    // ask on an ATTACHED question hub - a live human channel that renders the
+    // card for the user to answer or skip (the tool's own contract), so the
+    // ask stays user-visible instead of being dropped on the floor.
+    let unlocked = crate::tools::latent::latent_execution_allowed(
+        &tc.name,
+        session.skill_prompt_cloned().as_deref(),
+    );
+    let interactive_ask = tc.name == "question" && session.question_hub.is_attached();
+    if !unlocked && !interactive_ask {
+        return ToolOutput::err(format!(
+            "tool `{}` is latent and its owning skill is not active; \
+             activate the skill (e.g. `$task-plan`) before calling it",
+            tc.name
+        ));
     }
     let ctx = ToolContext {
+        // Workflow-orchestrated sessions (DAG agent steps) expose their
+        // step-scoped contract vars (e.g. OPENCODER_HOW_APPEND) here.
+        extra_env: session.env_passthrough.clone(),
         session_id: session.id.clone(),
         message_id: tc.id.clone(),
         agent: session.agent.name.clone(),
         working_dir: session.working_dir.clone(),
         max_output: MAX_OUTPUT,
         proxy: session.config.network.proxy.clone(),
+        // Agent-private tool dirs (file-based agents), colon-joined for the
+        // bash tool's PATH prefix. `None` for builtin/plain sessions.
+        tools_path: (!session.tools_path.is_empty()).then(|| {
+            session
+                .tools_path
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(if cfg!(windows) { ";" } else { ":" })
+        }),
     };
     match registry.get(&tc.name) {
         Some(tool) => {
+            let input = tc.input.clone();
+            #[cfg(windows)]
+            let input = if tc.name == "powershell"
+                && (session.agent.kind == opencoder_core::AgentKind::Plan
+                    || session.agent.name == "sidecar")
+            {
+                match crate::tools::command::powershell::prepare_read_only(
+                    input
+                        .get("command")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(""),
+                    &effective_workdir,
+                )
+                .await
+                {
+                    Ok(command) => {
+                        let mut prepared = input;
+                        prepared["command"] = serde_json::Value::String(command);
+                        prepared
+                    }
+                    Err(error) => {
+                        return ToolOutput::err(if session.agent.name == "sidecar" {
+                            crate::bash_guard::sidecar_denial(&tc.name, &error.to_string())
+                        } else {
+                            crate::bash_guard::plan_denial(&tc.name, &error.to_string())
+                        })
+                    }
+                }
+            } else {
+                input
+            };
             let mut cancel_fut = std::pin::pin!(await_cancel(session));
             let mut turn_cancel_fut = std::pin::pin!(await_turn_cancel(session));
-            let exec = tool.execute(tc.input.clone(), &ctx);
+            let exec = tool.execute(input, &ctx);
             // `None` exempts the tool from the safety net: the deadline future
             // never resolves, so only a cancel or the tool's own completion ends
             // the call. `bash` uses this — it runs in the foreground until it
@@ -342,8 +429,9 @@ async fn force_cancel_subagent(
 
 /// Render a duration compactly (seconds when >= 1 s, milliseconds otherwise) so
 /// the timeout message reads naturally for both the 10-minute default and the
-/// sub-second durations used in tests.
-fn fmt_dur(d: Duration) -> String {
+/// sub-second durations used in tests. Shared with local_memory for
+/// block-footer durations.
+pub(super) fn fmt_dur(d: Duration) -> String {
     if d.as_secs() >= 1 {
         format!("{}s", d.as_secs())
     } else {
@@ -352,431 +440,8 @@ fn fmt_dur(d: Duration) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use async_trait::async_trait;
-    use serde_json::json;
-
-    use super::*;
-    use crate::SessionEvent;
-    use opencoder_core::{resolve_agent, Config, Tool, ToolContext, ToolOutput};
-    use opencoder_llm::{ChatStream, MockChatClient};
-
-    /// A tool whose `execute` future never resolves, to exercise the timeout
-    /// safety net without depending on a real long-running tool.
-    struct HangingTool;
-
-    #[async_trait]
-    impl Tool for HangingTool {
-        fn name(&self) -> &str {
-            "hang"
-        }
-        fn description(&self) -> &str {
-            "never resolves"
-        }
-        fn parameters(&self) -> serde_json::Value {
-            json!({})
-        }
-        async fn execute(
-            &self,
-            _input: serde_json::Value,
-            _ctx: &ToolContext,
-        ) -> anyhow::Result<ToolOutput> {
-            std::future::pending::<()>().await;
-            unreachable!()
-        }
-    }
-
-    /// A tool that resolves instantly, to confirm the timeout does not trip
-    /// for well-behaved tools.
-    struct FastTool;
-
-    #[async_trait]
-    impl Tool for FastTool {
-        fn name(&self) -> &str {
-            "fast"
-        }
-        fn description(&self) -> &str {
-            "resolves immediately"
-        }
-        fn parameters(&self) -> serde_json::Value {
-            json!({})
-        }
-        async fn execute(
-            &self,
-            _input: serde_json::Value,
-            _ctx: &ToolContext,
-        ) -> anyhow::Result<ToolOutput> {
-            Ok(ToolOutput::ok("done"))
-        }
-    }
-
-    fn make_session() -> SessionState {
-        SessionState::new(
-            "sess-test",
-            resolve_agent("act").unwrap(),
-            Config::default(),
-            Arc::new(MockChatClient::new()) as Arc<dyn ChatStream>,
-            std::env::temp_dir().join("opencer-execute-tests"),
-        )
-    }
-
-    #[tokio::test]
-    async fn hung_tool_returns_timeout_error() {
-        let session = make_session();
-        let registry: HashMap<String, ToolArc> =
-            [("hang".to_string(), Arc::new(HangingTool) as ToolArc)]
-                .into_iter()
-                .collect();
-        let mut noop: Box<dyn FnMut(SessionEvent) + Send> = Box::new(|_| {});
-        let sink: Sink<'_> = Arc::new(Mutex::new(&mut *noop));
-        let tc = CompletedToolCall {
-            id: "tc-1".into(),
-            name: "hang".into(),
-            input: json!({}),
-        };
-        let out = execute_call_with_timeout(
-            &tc,
-            &session,
-            &registry,
-            &sink,
-            Some(Duration::from_millis(50)),
-        )
-        .await;
-        assert!(out.is_error);
-        assert!(
-            out.content.contains("timed out"),
-            "expected timeout message, got: {}",
-            out.content
-        );
-    }
-
-    #[tokio::test]
-    async fn fast_tool_is_unaffected_by_timeout() {
-        let session = make_session();
-        let registry: HashMap<String, ToolArc> =
-            [("fast".to_string(), Arc::new(FastTool) as ToolArc)]
-                .into_iter()
-                .collect();
-        let mut noop: Box<dyn FnMut(SessionEvent) + Send> = Box::new(|_| {});
-        let sink: Sink<'_> = Arc::new(Mutex::new(&mut *noop));
-        let tc = CompletedToolCall {
-            id: "tc-2".into(),
-            name: "fast".into(),
-            input: json!({}),
-        };
-        // A short timeout that would trip if the tool hung; a fast tool must
-        // still return its real result, not the timeout error.
-        let out = execute_call_with_timeout(
-            &tc,
-            &session,
-            &registry,
-            &sink,
-            Some(Duration::from_secs(30)),
-        )
-        .await;
-        assert!(!out.is_error);
-        assert_eq!(out.content, "done");
-    }
-
-    /// A tool that wraps synchronous blocking work in `spawn_blocking` and
-    /// sleeps ~200ms, simulating a real search/ls directory scan. Exercises
-    /// the turn_cancel interrupt path: with `spawn_blocking` the async worker
-    /// thread is free to poll the cancel token, so firing turn_cancel mid-scan
-    /// produces "turn interrupted" rather than blocking until completion.
-    struct BlockingTool;
-
-    #[async_trait]
-    impl Tool for BlockingTool {
-        fn name(&self) -> &str {
-            "block"
-        }
-        fn description(&self) -> &str {
-            "blocks for 200ms in spawn_blocking"
-        }
-        fn parameters(&self) -> serde_json::Value {
-            json!({})
-        }
-        async fn execute(
-            &self,
-            _input: serde_json::Value,
-            _ctx: &ToolContext,
-        ) -> anyhow::Result<ToolOutput> {
-            let out = tokio::task::spawn_blocking(move || -> ToolOutput {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                ToolOutput::ok("blocking done")
-            })
-            .await
-            .unwrap_or_else(|e| ToolOutput::err(format!("blocking task failed: {e}")));
-            Ok(out)
-        }
-    }
-
-    // turn_cancel must interrupt a spawn_blocking tool mid-execution. Before the
-    // search/ls fix, synchronous tools hijacked the worker thread and the
-    // cancel token was never polled. With spawn_blocking the blocking work runs
-    // on a dedicated thread, so the async select! can poll turn_cancel and win.
-    #[tokio::test]
-    async fn turn_cancel_interrupts_blocking_tool() {
-        let session = make_session();
-        let registry: HashMap<String, ToolArc> =
-            [("block".to_string(), Arc::new(BlockingTool) as ToolArc)]
-                .into_iter()
-                .collect();
-        let mut noop: Box<dyn FnMut(SessionEvent) + Send> = Box::new(|_| {});
-        let sink: Sink<'_> = Arc::new(Mutex::new(&mut *noop));
-        let tc = CompletedToolCall {
-            id: "tc-block".into(),
-            name: "block".into(),
-            input: json!({}),
-        };
-
-        // Grab the turn_cancel token before executing.
-        let turn_cancel = session.turn_cancel.as_ref().unwrap().clone();
-
-        // Fire turn_cancel concurrently after a short delay (well within the
-        // 200ms blocking window).
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            if let Ok(g) = turn_cancel.lock() {
-                g.cancel();
-            }
-        });
-
-        let out = execute_call_with_timeout(
-            &tc,
-            &session,
-            &registry,
-            &sink,
-            // Generous timeout so only turn_cancel can win.
-            Some(Duration::from_secs(10)),
-        )
-        .await;
-
-        assert!(out.is_error);
-        assert!(
-            out.content.contains("turn interrupted"),
-            "expected 'turn interrupted', got: {}",
-            out.content
-        );
-    }
-
-    // The blocking tool must still complete normally when no cancel fires —
-    // spawn_blocking does not break the happy path.
-    #[tokio::test]
-    async fn blocking_tool_completes_when_not_interrupted() {
-        let session = make_session();
-        let registry: HashMap<String, ToolArc> =
-            [("block".to_string(), Arc::new(BlockingTool) as ToolArc)]
-                .into_iter()
-                .collect();
-        let mut noop: Box<dyn FnMut(SessionEvent) + Send> = Box::new(|_| {});
-        let sink: Sink<'_> = Arc::new(Mutex::new(&mut *noop));
-        let tc = CompletedToolCall {
-            id: "tc-block-ok".into(),
-            name: "block".into(),
-            input: json!({}),
-        };
-
-        let out = execute_call_with_timeout(
-            &tc,
-            &session,
-            &registry,
-            &sink,
-            Some(Duration::from_secs(10)),
-        )
-        .await;
-
-        assert!(!out.is_error);
-        assert_eq!(out.content, "blocking done");
-    }
-    /// With `timeout: None` the safety net must never fire: a perpetually-pending
-    /// tool stays pending (responds only to a cancel), rather than erroring with a
-    /// "timed out" message. This is the bash exemption — bash has its own internal
-    /// timeout (BASH_TIMEOUT_SECS) and does not rely on this safety net.
-    #[tokio::test]
-    async fn none_timeout_never_fires_for_hung_tool() {
-        let session = make_session();
-        let registry: HashMap<String, ToolArc> =
-            [("hang".to_string(), Arc::new(HangingTool) as ToolArc)]
-                .into_iter()
-                .collect();
-        let mut noop: Box<dyn FnMut(SessionEvent) + Send> = Box::new(|_| {});
-        let sink: Sink<'_> = Arc::new(Mutex::new(&mut *noop));
-        let tc = CompletedToolCall {
-            id: "tc-3".into(),
-            name: "hang".into(),
-            input: json!({}),
-        };
-        let call = execute_call_with_timeout(&tc, &session, &registry, &sink, None);
-        // The call should NOT resolve on its own (no deadline, hung tool). Race it
-        // against a short outer deadline and confirm it was still pending.
-        if let Ok(out) = tokio::time::timeout(Duration::from_millis(120), call).await {
-            panic!("None deadline should never fire; got: {}", out.content);
-        }
-    }
-
-    /// `force_cancel_subagent` (the grace-expiry fallback) must replicate the
-    /// critical side-effects of `run_subagent`'s cleanup: mark the DB task
-    /// Cancelled, prune the stale registry entries, and emit SubagentEnd.
-    #[tokio::test]
-    async fn force_cancel_marks_task_and_prunes_registries() {
-        use opencoder_store::{LibsqlStore, Store, SubagentStatus, SubagentTaskRecord};
-
-        let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
-        store
-            .create_session(&opencoder_store::SessionMeta {
-                id: "force-cancel-parent".into(),
-                title: None,
-                agent: Some("act".into()),
-                model: Some("m".into()),
-
-                autopilot_mode: None,
-                workdir_hash: None,
-                created_at: 0,
-                updated_at: 0,
-                summary: None,
-                summary_seq: None,
-                summary_images: vec![],
-                handoff_seq: None,
-                handoff_plan: None,
-                skill: None,
-                task_type: None,
-                requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
-            })
-            .await
-            .unwrap();
-        store
-            .create_session(&opencoder_store::SessionMeta {
-                id: "child-1".into(),
-                title: None,
-                agent: Some("explore".into()),
-                model: Some("m".into()),
-
-                autopilot_mode: None,
-                workdir_hash: None,
-                created_at: 0,
-                updated_at: 0,
-                summary: None,
-                summary_seq: None,
-                summary_images: vec![],
-                handoff_seq: None,
-                handoff_plan: None,
-                skill: None,
-                task_type: None,
-                requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
-            })
-            .await
-            .unwrap();
-        store
-            .create_subagent_task(&SubagentTaskRecord {
-                task_id: "call-1".into(),
-                parent_session_id: "force-cancel-parent".into(),
-                child_session_id: "child-1".into(),
-                parent_message_id: None,
-                agent: "explore".into(),
-                prompt: "x".into(),
-                result: None,
-                status: SubagentStatus::Running,
-                ok: None,
-                started_at: 0,
-                completed_at: None,
-            })
-            .await
-            .unwrap();
-
-        // Build a session with the store and pre-populated registry entries.
-        let mut session = make_session();
-        session = session.with_store(store.clone());
-        let call_id = "call-1";
-        let token = CancellationToken::new();
-        session
-            .child_cancels
-            .lock()
-            .unwrap()
-            .insert(call_id.to_string(), token);
-        session
-            .child_turn_cancels
-            .lock()
-            .unwrap()
-            .insert(call_id.to_string(), {
-                Arc::new(Mutex::new(CancellationToken::new()))
-            });
-        session
-            .child_steer_gates
-            .lock()
-            .unwrap()
-            .insert(call_id.to_string(), crate::SubagentSteerGate::new());
-
-        let mut noop: Box<dyn FnMut(SessionEvent) + Send> = Box::new(|_| {});
-        let sink: Sink<'_> = Arc::new(Mutex::new(&mut *noop));
-
-        force_cancel_subagent(
-            session.store.clone(),
-            session.child_cancels.clone(),
-            session.child_turn_cancels.clone(),
-            session.child_steer_gates.clone(),
-            &sink,
-            call_id,
-        )
-        .await;
-
-        // DB task must be Cancelled.
-        let tasks = store
-            .list_subagent_tasks("force-cancel-parent")
-            .await
-            .unwrap();
-        store
-            .create_session(&opencoder_store::SessionMeta {
-                id: "child-1".into(),
-                title: None,
-                agent: Some("explore".into()),
-                model: Some("m".into()),
-
-                autopilot_mode: None,
-                workdir_hash: None,
-                created_at: 0,
-                updated_at: 0,
-                summary: None,
-                summary_seq: None,
-                summary_images: vec![],
-                handoff_seq: None,
-                handoff_plan: None,
-                skill: None,
-                task_type: None,
-                requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
-            })
-            .await
-            .unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert!(
-            matches!(tasks[0].status, SubagentStatus::Cancelled),
-            "task must be Cancelled after force_cancel, got {:?}",
-            tasks[0].status
-        );
-        // Registries must be pruned.
-        assert!(
-            session.child_cancels.lock().unwrap().is_empty(),
-            "child_cancels must be empty after force_cancel"
-        );
-        assert!(
-            session.child_turn_cancels.lock().unwrap().is_empty(),
-            "child_turn_cancels must be empty after force_cancel"
-        );
-        assert!(
-            session.child_steer_gates.lock().unwrap().is_empty(),
-            "child_steer_gates must be empty after force_cancel"
-        );
-    }
-}
-
+#[path = "execute_tests.rs"]
+mod tests;
 #[cfg(test)]
 #[path = "execute_timeout_tests.rs"]
 mod timeout_tests;

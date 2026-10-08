@@ -1,5 +1,5 @@
-//! Closed-loop integration tests for the web `question` bridge: a plan-agent
-//! turn whose LLM round returns a `question` tool call blocks mid-drain until
+//! Closed-loop integration tests for the web `question` bridge: a plan
+//! agent turn whose LLM round returns a `question` tool call blocks mid-drain until
 //! the HTTP endpoints answer/skip it, then the follow-up LLM round completes
 //! the turn. Driven through the real router with a `MockChatClient` (no
 //! network), tempdir workdir, in-memory store.
@@ -30,10 +30,15 @@ async fn app(mock: MockChatClient) -> (axum::Router, Arc<dyn Store>) {
     )
     .unwrap();
     let state = Arc::new(opencoder_web::AppState {
+        config_home: None,
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store: store.clone(),
         workdir,
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
         client_override: Some(Arc::new(mock) as Arc<dyn ChatStream>),
     });
     (opencoder_web::build_app(state, None, false), store)
@@ -169,11 +174,11 @@ async fn post(app: &axum::Router, uri: &str, body: String) -> (StatusCode, serde
 async fn answer_flows_into_tool_result_and_completes_the_turn() {
     let mock = MockChatClient::new()
         .push_script(vec![question_round()])
-        .push_script(vec![text_round("the plan will use pg")])
+        .push_script(vec![text_round("the answer will use pg")])
         .with_default(vec![text_round("t")]);
     let (app, store) = app(mock).await;
     let id = create_plan_session(&app).await;
-    post_plan_prompt(&app, &id, "plan something ambiguous").await;
+    post_plan_prompt(&app, &id, "explore something ambiguous").await;
 
     let q = wait_for_question(&app, &id).await;
     assert_eq!(q["id"].as_str(), Some("call_q1"));
@@ -196,7 +201,7 @@ async fn answer_flows_into_tool_result_and_completes_the_turn() {
     // The answered value is the tool result; the follow-up round's text is
     // the final assistant reply.
     wait_for_transcript(&store, &id, "pg").await;
-    wait_for_transcript(&store, &id, "the plan will use pg").await;
+    wait_for_transcript(&store, &id, "the answer will use pg").await;
 }
 
 /// Skipping resolves the blocked tool to the fixed SKIPPED_REPLY.
@@ -207,7 +212,7 @@ async fn skip_resolves_tool_to_skipped_reply() {
         .with_default(vec![text_round("ok, proceeding")]);
     let (app, store) = app(mock).await;
     let id = create_plan_session(&app).await;
-    post_plan_prompt(&app, &id, "plan something ambiguous").await;
+    post_plan_prompt(&app, &id, "explore something ambiguous").await;
 
     wait_for_question(&app, &id).await;
     let (status, body) = post(
@@ -307,7 +312,7 @@ async fn last_subscriber_disconnect_abandons_waiting_question() {
     assert_eq!(resp.status(), StatusCode::OK);
     let mut stream = resp.into_body().into_data_stream();
 
-    post_plan_prompt(&app, &id, "plan something ambiguous").await;
+    post_plan_prompt(&app, &id, "explore something ambiguous").await;
     let q = wait_for_question(&app, &id).await;
     assert_eq!(q["id"].as_str(), Some("call_q1"));
 

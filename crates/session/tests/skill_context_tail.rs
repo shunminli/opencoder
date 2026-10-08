@@ -1,21 +1,26 @@
 //! Skill-context tail injection — integration contract tests.
 //!
 //! Skill content never ships in the system prompt anymore (`build_system`
-//! takes no skill parameter): every LLM call derives one synthetic user
-//! message appended at the END of the payload (`skill_context::tail_reminder`)
-//! carrying (a) the `[skills]` catalog of config-enabled skills plus a
-//! lazy-load hint and (b) the `[active skill]` source path parsed from the
-//! `> Source:` prefix that `opencoder_core::body_with_source` writes. The
-//! message is transient — never recorded into `session.messages` — and is
-//! regenerated per call, so it survives compaction for free.
+//! takes no skill parameter): every LLM call derives synthetic user
+//! messages appended at the END of the payload — the transient
+//! `[skill loaded]` full-body message (`skill_context::
+//! body_message`) plus the tail reminder
+//! (`skill_context::tail_reminder`) carrying (a) the `[skills]` catalog of
+//! config-enabled skills plus a lazy-load hint and (b) — only when the
+//! armed skill has no injectable body (degenerate empty-body case) — the
+//! `[active skill]` source path parsed from the `> Source:` prefix that
+//! `opencoder_core::body_with_source` writes. Both messages are transient —
+//! never recorded into `session.messages` — and are regenerated per call,
+//! so they survive compaction for free.
 //!
 //! Pinned against real request payloads captured by `MockChatClient`:
 //! 1. prefix-cache stability: the system message stays byte-identical while
 //!    catalog config and active-skill state flip mid-session;
 //! 2. catalog reminder shape: final payload message, directory + entries +
 //!    lazy-load guidance, disabled skills filtered out, never persisted;
-//! 3. active-skill path reminder keeps the system prompt clean (and the
-//!    legacy no-`> Source:` body parse contract);
+//! 3. active-skill body ships as the trailing `[skill loaded]` message and
+//!    keeps the system prompt clean (and the legacy no-`> Source:` body
+//!    parse contract);
 //! 4. subagent/workflow exclusion.
 //!
 //! Every test flips `$HOME` (`PreparedHome` under a shared `HOME_LOCK`) so
@@ -135,7 +140,7 @@ fn session_on(
 
 /// System-message content of a request ("" when absent).
 fn system_content(req: &opencoder_llm::ChatRequest) -> String {
-    req.messages
+    opencoder_llm::lower_messages(&req.messages)
         .iter()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
@@ -146,7 +151,7 @@ fn system_content(req: &opencoder_llm::ChatRequest) -> String {
 /// Content of the LAST user-role message — where the transient skill-context
 /// reminder is appended.
 fn last_user_content(req: &opencoder_llm::ChatRequest) -> String {
-    req.messages
+    opencoder_llm::lower_messages(&req.messages)
         .iter()
         .rev()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
@@ -156,16 +161,20 @@ fn last_user_content(req: &opencoder_llm::ChatRequest) -> String {
 }
 
 fn any_user_contains(req: &opencoder_llm::ChatRequest, needle: &str) -> bool {
-    req.messages.iter().any(|m| {
-        m.get("role").and_then(|r| r.as_str()) == Some("user")
-            && m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|c| c.contains(needle))
-    })
+    opencoder_llm::lower_messages(&req.messages)
+        .iter()
+        .any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains(needle))
+        })
 }
 
 fn any_message_contains(req: &opencoder_llm::ChatRequest, needle: &str) -> bool {
-    req.messages.iter().any(|m| m.to_string().contains(needle))
+    opencoder_llm::lower_messages(&req.messages)
+        .iter()
+        .any(|m| m.to_string().contains(needle))
 }
 
 /// 1. Prefix-cache stability: flipping the skills-catalog config AND the
@@ -213,12 +222,19 @@ async fn system_prompt_bytes_stable_across_catalog_and_activation_changes() {
         "skill bodies never ship in the system prompt"
     );
 
-    // The payload tail DID change: turn 2's last user message carries both
-    // reminder sections (catalog + active path).
+    // The payload tail DID change: the catalog section appears, and the
+    // `[active skill]` pointer stays silent because turn 2 already carries
+    // the transient `[skill loaded]` body message adjacent in the payload.
     let tail = last_user_content(second);
     assert!(tail.contains("[skills]"), "{tail}");
-    assert!(tail.contains("[active skill]"), "{tail}");
+    assert!(!tail.contains("[active skill]"), "{tail}");
     assert_ne!(tail, last_user_content(first));
+    assert!(
+        any_message_contains(second, "[skill loaded]")
+            && any_message_contains(second, "alpha-BODY-CONTENT"),
+        "the active skill body ships via the loaded message: {:?}",
+        opencoder_llm::lower_messages(&second.messages)
+    );
 
     // Toggle everything back OFF: three-way byte stability.
     s.config.skills.clear();
@@ -260,7 +276,8 @@ async fn skills_catalog_reminder_is_last_payload_message_and_never_persisted() {
     let req = &requests[0];
 
     // The reminder is the final message of the payload: nothing after it.
-    let last = req.messages.last().expect("non-empty payload");
+    let wire_messages_275 = opencoder_llm::lower_messages(&req.messages);
+    let last = wire_messages_275.last().expect("non-empty payload");
     assert_eq!(
         last.get("role").and_then(|r| r.as_str()),
         Some("user"),
@@ -293,11 +310,12 @@ async fn skills_catalog_reminder_is_last_payload_message_and_never_persisted() {
     );
 }
 
-/// 3a. Active-skill path reminder: a `> Source:`-prefixed body surfaces ONLY
-/// its path in the tail reminder — the body text stays out of both the
-/// system message and the reminder (the model lazily reads the SKILL.md).
+/// 3a. Active-skill delivery: a `> Source:`-prefixed body reaches the model
+/// as the trailing transient `[skill loaded]` message; the `[active skill]`
+/// tail pointer stays silent while the body ships adjacent in the same
+/// payload — the body text stays out of the system message either way.
 #[tokio::test]
-async fn active_skill_source_path_rides_tail_reminder_and_keeps_system_clean() {
+async fn active_skill_body_ships_via_loaded_message_and_keeps_system_clean() {
     let home = PreparedHome::new();
     let mock = Arc::new(MockChatClient::new().push_script(vec![done_turn("ok")]));
     let (mut s, _workdir) = session_on("active", "act", config_with_skills(&[]), mock.clone());
@@ -318,18 +336,21 @@ async fn active_skill_source_path_rides_tail_reminder_and_keeps_system_clean() {
         "skill bodies never ship in the system prompt"
     );
     let tail = last_user_content(req);
-    assert!(tail.contains("[active skill]"), "{tail}");
     assert!(
-        tail.contains(&source.display().to_string()),
-        "must name the skill's source file: {tail}"
+        tail.contains("[skill loaded]") && tail.contains(&source.display().to_string()),
+        "the loaded message names the skill's source file: {tail}"
     );
     assert!(
-        tail.contains("as a `[skill loaded]` message"),
-        "activation section points at the injected message: {tail}"
+        tail.contains("alpha-BODY-CONTENT"),
+        "the body ships once, inside the loaded message: {tail}"
     );
     assert!(
-        !tail.contains("alpha-BODY-CONTENT"),
-        "the reminder carries the path, not the body: {tail}"
+        !tail.contains("[active skill]"),
+        "pointer silent while the body ships adjacent: {tail}"
+    );
+    assert!(
+        !system_content(req).contains("[active skill]"),
+        "the pointer never leaks into the system prompt"
     );
 }
 
@@ -380,12 +401,12 @@ async fn subagent_and_workflow_payloads_carry_no_skill_context() {
         assert!(
             !any_message_contains(req, "[skills]"),
             "{agent} must not receive the skills catalog: {:?}",
-            req.messages
+            opencoder_llm::lower_messages(&req.messages)
         );
         assert!(
             !any_message_contains(req, "[active skill]"),
             "{agent} must not receive the active-skill reminder: {:?}",
-            req.messages
+            opencoder_llm::lower_messages(&req.messages)
         );
     }
 }

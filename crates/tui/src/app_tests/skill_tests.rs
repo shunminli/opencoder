@@ -9,14 +9,15 @@ fn sys_tokens_counts_system_prompt() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir();
-    let base = crate::app::sys_tokens_for("act", &dir, None);
+    let base = crate::app_helpers::sys_tokens_for("act", &dir, None);
     assert!(base > 0, "the system prompt must register some tokens");
     // deterministic
-    assert_eq!(crate::app::sys_tokens_for("act", &dir, None), base);
+    assert_eq!(crate::app_helpers::sys_tokens_for("act", &dir, None), base);
     // a plain skill body (no Source prefix, no latent tools) no longer adds
     // tokens: skill bodies moved out of the system prompt, so the count is
     // unchanged until a Source path or latent tool name appears.
-    let plain = crate::app::sys_tokens_for("act", &dir, Some("extra skill guidance body text"));
+    let plain =
+        crate::app_helpers::sys_tokens_for("act", &dir, Some("extra skill guidance body text"));
     assert_eq!(
         plain, base,
         "a plain skill body must not change the system-prompt estimate"
@@ -24,19 +25,22 @@ fn sys_tokens_counts_system_prompt() {
     // a Source-prefixed body surfaces the one-line active-skill tail
     // reminder, which does add tokens on top of the base.
     let sourced_body = "> Source: /skills/x/SKILL.md\n\nbody";
-    let sourced = crate::app::sys_tokens_for("act", &dir, Some(sourced_body));
+    let sourced = crate::app_helpers::sys_tokens_for("act", &dir, Some(sourced_body));
     assert!(
         sourced > base,
         "a Source-prefixed skill body must raise the count (tail reminder)"
     );
     // unknown agent -> 0 (no panic)
-    assert_eq!(crate::app::sys_tokens_for("does-not-exist", &dir, None), 0);
+    assert_eq!(
+        crate::app_helpers::sys_tokens_for("does-not-exist", &dir, None),
+        0
+    );
 }
 
-/// Regression for the SwitchAgent token-recalculation bug (`app.rs`,
-/// `KeyAction::SwitchAgent`): when a skill is active and the user switches
-/// agent mode (plan <-> act), `sys_tokens` is recomputed via
-/// `sys_tokens_for(agent, workdir, skill)`. The `skill` argument must be the
+/// Regression for the agent-switch token-recalculation bug: when a skill is
+/// active and the user switches agent (`/plan` <-> `/act`), `sys_tokens`
+/// is recomputed via `sys_tokens_for(agent, workdir, skill)`. The `skill`
+/// argument must be the
 /// skill **body** (the stored instruction text), not the skill **name**: the
 /// body is what latent-tool unlocking (`tools::latent::unlocked_from_body`)
 /// derives from, and it carries the `> Source:` prefix that surfaces the
@@ -77,8 +81,8 @@ fn sys_tokens_skill_body_unlocks_latent_tools_and_beats_name() {
     // End-to-end: a stored body (Source-prefixed) out-estimates the bare
     // skill name — pinning that SwitchAgent passes the body.
     let dir = std::env::temp_dir();
-    let by_name = crate::app::sys_tokens_for("act", &dir, Some("code-review"));
-    let by_body = crate::app::sys_tokens_for(
+    let by_name = crate::app_helpers::sys_tokens_for("act", &dir, Some("code-review"));
+    let by_body = crate::app_helpers::sys_tokens_for(
         "act",
         &dir,
         Some("> Source: /skills/code-review/SKILL.md\n\nReview the diff line by line."),
@@ -239,244 +243,87 @@ fn skill_menu_intercepts_typing_from_composer() {
     assert!(menu.is_some(), "menu stays open while filtering");
 }
 
-#[test]
-fn flash_visible_within_window() {
-    assert!(flash_visible(10, 11, 5));
-    assert!(flash_visible(10, 14, 5));
-}
+// ----- resume mirror backfill (run_app startup) -----
+// Regression: `run_app` used to hard-code `active_skill`/`active_skill_body`
+// to `None` and discard `initial_skill_state`'s body. A resumed `task-plan`
+// commit therefore had an empty mirror, so the first idle submit's
+// `act_plan_highlight(active_skill)` re-derivation turned the chip gray for
+// the whole turn (and the skill-only submit trigger path stayed blind). The
+// fix backfills the mirrors from the derived body via
+// `skill_display::skill_mirror_from_body`.
 
+/// Chains the exact startup sequence `run_app` performs: derive state from
+/// the shared handle (resume read-back) -> backfill the mirror tuple ->
+/// re-derive the chip highlight the way the idle submit path does.
 #[test]
-fn flash_visible_expired() {
-    assert!(!flash_visible(10, 15, 5));
-    assert!(!flash_visible(10, 99, 5));
-}
+fn resume_mirror_backfill_keeps_resumed_task_plan_yellow() {
+    // A persisted `task-plan` skill body as the store row carries it on
+    // resume (directory-style skill with a `> Source:` prefix).
+    let body = "> Source: /home/u/.opencoder/skills/task-plan/SKILL.md\n\n\
+                plan the work before touching code";
+    let skill_handle: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Some(body.to_string())));
 
-#[test]
-fn flash_visible_handles_wraparound() {
-    // start near u32::MAX; `now` wraps past 0. Ages 0..4 -> visible, 5 -> expired.
-    assert!(flash_visible(u32::MAX, u32::MAX, 5));
-    assert!(flash_visible(u32::MAX, 0, 5));
-    assert!(flash_visible(u32::MAX, 3, 5));
-    assert!(!flash_visible(u32::MAX, 4, 5));
-    assert!(!flash_visible(u32::MAX, 99, 5));
-}
+    // 1. initial_skill_state derives body + chip highlight from the handle.
+    let (initial_body, _tokens, startup_highlight) = crate::skill_persist::initial_skill_state(
+        &skill_handle,
+        "act",
+        std::path::Path::new("/tmp"),
+    );
+    assert!(
+        startup_highlight,
+        "a resumed task-plan commit must start with the chip highlighted"
+    );
 
-#[test]
-fn skill_trigger_names_the_active_skill() {
+    // 2. run_app backfills the mirrors from that same body.
+    let (active_skill, active_skill_body) =
+        crate::skill_display::skill_mirror_from_body(initial_body);
+
+    // 3. the first idle-submit re-derivation keeps the yellow.
     assert_eq!(
-        crate::skill_display::skill_trigger("repo-memory"),
-        "The `repo-memory` skill is now active. Begin executing its instructions immediately."
+        active_skill.as_deref(),
+        Some("task-plan"),
+        "the mirror must carry the resumed skill name"
     );
-    // The trigger is identical across Submit/Steer/Queue so a pure-skill
-    // submission behaves consistently regardless of the submit verb.
-    assert!(crate::skill_display::skill_trigger("x").contains("`x`"));
-}
-
-/// `start_turn` must report failure when the worker command channel has no
-/// consumer — the exact signature of a dead worker task (panic or unexpected
-/// exit). The main loop relies on this `false` to surface a marker and exit
-/// instead of silently queuing into a void and spinning the spinner forever.
-#[tokio::test]
-async fn start_turn_reports_false_when_worker_is_dead() {
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
-
-    use crate::worker::UiCmd;
-
-    let (cmd_tx, cmd_rx) = mpsc::channel::<UiCmd>(8);
-    drop(cmd_rx); // worker gone — channel closed
-    let mut cancel = CancellationToken::new();
-    let ok =
-        crate::app::start_turn(&cmd_tx, &mut cancel, UiCmd::Prompt("hi".into(), Vec::new())).await;
+    assert_eq!(
+        active_skill_body.as_deref(),
+        Some(body),
+        "the mirror must carry the resumed skill body"
+    );
     assert!(
-        !ok,
-        "start_turn must return false when the worker channel is closed"
+        crate::skill_persist::act_plan_highlight(active_skill.as_deref()),
+        "resolve_persist's re-derivation must not grey out a resumed task-plan"
+    );
+    // Startup highlight and mirror agree on one shared derivation, so the
+    // first idle submit cannot disagree with the frame the user already saw.
+    assert_eq!(
+        startup_highlight,
+        crate::skill_persist::act_plan_highlight(active_skill.as_deref()),
+        "mirror backfill must agree with the startup highlight derivation"
     );
 }
 
-/// `worker_dead` surfaces a visible marker so the user understands the engine
-/// stopped (rather than an unexplained freeze).
+/// A resumed session with NO committed skill must keep both mirrors empty so
+/// the chip stays gray (no phantom yellow from the backfill).
 #[test]
-fn worker_dead_pushes_a_marker() {
-    let mut chat = crate::chat::ChatView::default();
-    crate::app::worker_dead(&mut chat);
-    let text = crate::chat::block_text(&chat);
-    assert!(
-        text.contains("worker stopped"),
-        "expected a worker-stopped marker; got: {text}"
-    );
-}
+fn resume_mirror_backfill_keeps_unskilled_session_gray() {
+    let skill_handle: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
 
-#[test]
-fn double_esc_while_running_cancels() {
-    // Two Esc presses within ESC_CANCEL_WINDOW_MS while running should produce
-    // KeyAction::Cancel (hard-abort). The first press records the timestamp;
-    // the second, falling inside the window, returns Cancel.
-    let history: Vec<String> = vec![];
-    let mut input = String::from("draft");
-    let mut idx = 5;
-    let mut hist_idx = None;
-    let mut scroll = 0u32;
-    let mut follow = true;
-    let mut last_esc: Option<Instant> = None;
-    let mut skill_menu: Option<SkillMenu> = None;
-    let mut undo_state = crate::undo::init("", 0);
-    let mut queue_scroll: u32 = 0;
-    let mut file_menu: Option<crate::file_menu::FileMenu> = None;
-    let workdir = std::path::Path::new(".");
-    let esc = key(KeyCode::Esc, KeyModifiers::NONE);
-
-    let first = handle_key(
-        esc,
-        &crate::keymap::KeyBindings::from_config(&opencoder_core::Config::default()),
-        &mut input,
-        &mut idx,
-        &history,
-        &mut hist_idx,
-        true,
+    let (initial_body, _tokens, startup_highlight) = crate::skill_persist::initial_skill_state(
+        &skill_handle,
         "act",
-        &mut scroll,
-        &mut follow,
-        &mut last_esc,
-        &mut skill_menu,
-        80,
-        2,
-        false,
-        false,
-        &mut undo_state,
-        &mut queue_scroll,
-        &mut file_menu,
-        workdir,
+        std::path::Path::new("/tmp"),
     );
-    assert!(
-        matches!(first, KeyAction::None),
-        "first esc is a soft clear"
-    );
-    assert!(last_esc.is_some(), "first esc records the timestamp");
-
-    let second = handle_key(
-        esc,
-        &crate::keymap::KeyBindings::from_config(&opencoder_core::Config::default()),
-        &mut input,
-        &mut idx,
-        &history,
-        &mut hist_idx,
-        true,
-        "act",
-        &mut scroll,
-        &mut follow,
-        &mut last_esc,
-        &mut skill_menu,
-        80,
-        2,
-        false,
-        false,
-        &mut undo_state,
-        &mut queue_scroll,
-        &mut file_menu,
-        workdir,
-    );
-    assert!(
-        matches!(second, KeyAction::Cancel),
-        "double esc within the window must hard-abort"
-    );
+    assert!(!startup_highlight);
+    let (active_skill, active_skill_body) =
+        crate::skill_display::skill_mirror_from_body(initial_body);
+    assert_eq!(active_skill, None);
+    assert_eq!(active_skill_body, None);
+    assert!(!crate::skill_persist::act_plan_highlight(
+        active_skill.as_deref()
+    ));
 }
 
-#[test]
-fn startup_endpoint_resolves_by_model_prefix_not_legacy_field() {
-    use opencoder_core::{Config, ProviderConfig};
-    use std::collections::HashMap;
-    let mut providers = HashMap::new();
-    providers.insert(
-        "deepseek".to_string(),
-        ProviderConfig {
-            base_url: "https://api.deepseek.com/v1".to_string(),
-            api_key: Some("dk-key".to_string()),
-            model: None,
-            headers: Vec::new(),
-        },
-    );
-    let cfg = Config {
-        model: "deepseek/deepseek-chat".to_string(),
-        // Legacy single-provider field — the value the OLD startup bug picked.
-        // Distinct from providers["deepseek"] so a revert to the raw field is
-        // caught (it would return the openai url + oai-key instead).
-        provider: ProviderConfig {
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: Some("oai-key".to_string()),
-            model: None,
-            headers: Vec::new(),
-        },
-        providers,
-        ..Default::default()
-    };
-    let ep = crate::app_helpers::startup_endpoint(&cfg).unwrap();
-    assert_eq!(ep.base_url, "https://api.deepseek.com/v1");
-    assert_eq!(ep.api_key, "dk-key");
-}
-
-#[test]
-fn startup_endpoint_falls_back_to_legacy_when_prefix_absent() {
-    use opencoder_core::{Config, ProviderConfig};
-    use std::collections::HashMap;
-    // Model prefix "unknown-svc" is not in providers -> fall back to the
-    // legacy top-level provider field (boundary case for the startup seam).
-    let cfg = Config {
-        model: "unknown-svc/model-x".to_string(),
-        provider: ProviderConfig {
-            base_url: "https://legacy.example.com/v1".to_string(),
-            api_key: Some("legacy-key".to_string()),
-            model: None,
-            headers: Vec::new(),
-        },
-        providers: HashMap::new(),
-        ..Default::default()
-    };
-    let ep = crate::app_helpers::startup_endpoint(&cfg).unwrap();
-    assert_eq!(ep.base_url, "https://legacy.example.com/v1");
-    assert_eq!(ep.api_key, "legacy-key");
-}
-
-#[test]
-fn size_changed_detects_dimension_change() {
-    use crate::app_helpers::size_changed;
-    assert!(
-        size_changed(Some((80, 24)), (80, 25)),
-        "height change must count"
-    );
-    assert!(
-        size_changed(Some((80, 24)), (81, 24)),
-        "width change must count"
-    );
-}
-
-#[test]
-fn size_changed_false_when_unchanged() {
-    use crate::app_helpers::size_changed;
-    assert!(!size_changed(Some((80, 24)), (80, 24)));
-}
-
-#[test]
-fn size_changed_true_when_no_prior_reading() {
-    use crate::app_helpers::size_changed;
-    assert!(size_changed(None, (80, 24)));
-}
-
-#[test]
-fn size_changed_false_for_zero_dimensions() {
-    // 0x0 is a transient glitch on minimize/detach; it should not be treated
-    // as a real resize target so we avoid spurious autoresize + re-render.
-    use crate::app_helpers::size_changed;
-    assert!(
-        !size_changed(Some((80, 24)), (0, 24)),
-        "zero width must not count as a resize"
-    );
-    assert!(
-        !size_changed(Some((80, 24)), (80, 0)),
-        "zero height must not count as a resize"
-    );
-    assert!(
-        !size_changed(None, (0, 0)),
-        "zero dims from first frame must not count"
-    );
-}
+#[path = "skill_tests/lifecycle.rs"]
+mod lifecycle;

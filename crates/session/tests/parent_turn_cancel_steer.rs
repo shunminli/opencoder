@@ -131,8 +131,7 @@ async fn turn_cancel_interrupts_llm_without_hard_abort() {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();

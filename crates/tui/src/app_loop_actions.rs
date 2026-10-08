@@ -1,12 +1,13 @@
-//! Mode-switch slash-command dispatch (`/act`, `/plan`, `/act_clear_context`)
-//! extracted from `app_loop.rs` to keep that file under the 800-line
-//! iteration cap. The three commands share one gate-and-start flow: a
-//! running/subagent busy gate, an optional plan→act handoff, and the plain
-//! prompt fallback. This is a pure move — the logic, signatures and doc
+//! Agent-switch slash-command dispatch (`/act`, `/plan`,
+//! `/act_clear_context`) extracted from `app_loop.rs` to keep that file under
+//! the 800-line iteration cap. The three commands share one gate-and-start
+//! flow: a running/subagent busy gate, then submission of the control-command
+//! text as a pure prompt. This is a pure move — the logic, signatures and doc
 //! comments are unchanged from their original inline location. The
 //! `pub(crate)` items are re-exported from `app_loop.rs`, so the call sites
 //! in `dispatch_command` stay thin.
 
+use crossterm::event::KeyEvent;
 use std::path::Path;
 
 use ratatui::style::Style;
@@ -14,8 +15,8 @@ use ratatui::text::{Line, Span};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{prep_plan_to_act, LoopFlow};
-use crate::app_helpers::{start_turn, worker_dead};
+use super::LoopFlow;
+use crate::app_helpers::{start_turn, sys_tokens_for, worker_dead};
 use crate::chat::ChatView;
 use crate::theme;
 use std::sync::Arc;
@@ -29,42 +30,45 @@ use crate::local_cmd;
 use crate::model_menu::{ConfigForm, ModelMenu, ProviderList};
 use crate::worker::{gate_compact, gate_switch, CompactGate, SwitchGate, UiCmd};
 
-/// Which mode-switch command triggered the dispatch. Parameterizes the plain
-/// prompt text and whether the plan→act handoff applies.
+/// Which agent-switch command triggered the dispatch. Parameterizes the
+/// control-command prompt text submitted to the runner. The clear-context
+/// fold is NOT here: it is destructive, so it goes through the
+/// `clear_confirm` countdown guard (arm -> fire/cancel) instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ModeSwitch {
     Act,
     Plan,
-    ClearContext,
 }
 
 impl ModeSwitch {
+    pub(crate) fn for_agent(agent: &str) -> Self {
+        if agent == "act" {
+            Self::Act
+        } else {
+            Self::Plan
+        }
+    }
+
     fn prompt(self) -> &'static str {
         match self {
             ModeSwitch::Act => "/act",
             ModeSwitch::Plan => "/plan",
-            ModeSwitch::ClearContext => "/act_clear_context",
         }
-    }
-
-    /// `/act` and `/act_clear_context` from plan mode with a submitted plan
-    /// route through `SwitchAndStart` (plan→act handoff) — same as Shift+Tab
-    /// — preserving the plan and starting execution instead of wiping the
-    /// transcript. `/plan` never hands off.
-    fn may_handoff(self) -> bool {
-        !matches!(self, ModeSwitch::Plan)
     }
 }
 
-/// Dispatch one of the three mode-switch slash commands through the worker.
+/// Dispatch an act/plan switch command through the worker.
 /// `run_with_registry` short-circuits them (no LLM call) and emits
 /// `AgentSwitch` / `TranscriptReset` + `Done`. No user echo — the popup path
 /// never calls `push_user`.
 ///
-/// RUNNING-GATE: while a turn is in flight (`running`), all three are refused
-/// with a `[switch] busy — retry when idle` marker — a mode switch mid-turn
-/// would start the next turn with a stale agent at an arbitrary partial
-/// boundary (mirrors `/compact`'s `SkipRunning`).
+/// BUSY = REFUSED (never queued): idle starts the control-command turn now;
+/// while a turn is in flight (`running`) the switch is refused with the
+/// shared busy flash (`mode_switch_busy_flash`) — a mid-turn switch would
+/// re-aim the session the worker is streaming into, so it is neither applied
+/// nor deferred to a boundary; the user retries when idle. A live subagent
+/// does not count as busy: the parent session is idle, exactly when
+/// switching is safe.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_mode_switch(
     mode: ModeSwitch,
@@ -73,24 +77,24 @@ pub(crate) async fn dispatch_mode_switch(
     running: &mut bool,
     follow: &mut bool,
     chat: &mut ChatView,
-    input: &mut String,
-    cursor_idx: &mut usize,
     sys_tokens: &mut u64,
     mode_flash: &mut Option<(String, u32)>,
     anim_tick: u32,
     workdir: &Path,
 ) -> LoopFlow {
-    match gate_switch(*running || chat.subagents_running > 0) {
+    if chat.remote {
+        *mode_flash = Some((
+            "Mode controls are available for /agent self tasks".into(),
+            anim_tick,
+        ));
+        return LoopFlow::Proceed;
+    }
+    match gate_switch(*running) {
         SwitchGate::Run => {
-            if mode.may_handoff() && chat.agent == "plan" && chat.plan_submitted {
-                let extra = prep_plan_to_act(
-                    input, cursor_idx, sys_tokens, mode_flash, anim_tick, workdir,
-                );
-                if !start_turn(cmd_tx, cancel, UiCmd::SwitchAndStart("act".into(), extra)).await {
-                    worker_dead(chat);
-                    return LoopFlow::Quit;
-                }
-            } else if !start_turn(
+            let name = mode.prompt().trim_start_matches('/');
+            *sys_tokens = sys_tokens_for(name, workdir, None);
+            *mode_flash = Some((format!("\u{2192} {name} mode"), anim_tick));
+            if !start_turn(
                 cmd_tx,
                 cancel,
                 UiCmd::Prompt(mode.prompt().into(), Vec::new()),
@@ -105,10 +109,9 @@ pub(crate) async fn dispatch_mode_switch(
             chat.begin_turn();
         }
         SwitchGate::SkipRunning => {
-            chat.push_marker(Line::from(Span::styled(
-                "[switch] busy \u{2014} retry when idle",
-                Style::default().fg(theme::warn_color()),
-            )));
+            // Refuse, don't queue: the in-flight turn owns the session and a
+            // mid-flight re-aim is exactly what the gate exists to prevent.
+            *mode_flash = Some(crate::app_helpers::mode_switch_busy_flash(anim_tick));
         }
     }
     LoopFlow::Proceed
@@ -122,15 +125,18 @@ pub(crate) async fn dispatch_mode_switch(
 ///
 /// Returns [`LoopFlow::Proceed`] for commands that only open a menu or
 /// render chrome (Task, Fork, Model, Config, Mcp, CacheSalt, Annotation,
-/// Notepad, Ps, Stop, Ap). For mode-switch commands
+/// Notepad, Ps, Stop, Ap, Sidecar). For mode-switch commands
 /// (Act, Plan, ClearContext, Compact) returns whatever the gate-and-start
-/// flow yields (typically [`LoopFlow::Proceed`] or [`LoopFlow::Quit`]).
+/// flow yields (typically [`LoopFlow::Proceed`] or [`LoopFlow::Quit`]). While
+/// a turn is running, Act/Plan queue through `admit_tx` (apply at the idle
+/// boundary) is refused with the busy flash — see `dispatch_mode_switch`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_slash_action(
     action: SlashAction,
     cmd_tx: &mpsc::Sender<UiCmd>,
     cancel: &mut CancellationToken,
     chat: &mut ChatView,
+    sidecar_ask: &mpsc::Sender<crate::sidecar_ui::SidecarCmd>,
     running: &mut bool,
     follow: &mut bool,
     store: &Arc<dyn Store>,
@@ -138,14 +144,11 @@ pub(crate) async fn dispatch_slash_action(
     task_picker: &mut Option<crate::task::TaskPicker>,
     model_menu: &mut Option<ModelMenu>,
     mcp_menu: &mut Option<crate::mcp_menu::McpMenu>,
-    envs_menu: &mut Option<crate::envs_menu::EnvsMenu>,
     cli_menu: &mut Option<crate::cli_menu::CliMenu>,
     skill_toggle_menu: &mut Option<crate::skill_menu::SkillMenu>,
     ap_menu: &mut Option<crate::ap_menu::ApMenu>,
     cache_salt_menu: &mut Option<CacheSaltMenu>,
     agent_name: &str,
-    input: &mut String,
-    cursor_idx: &mut usize,
     config: &mut Config,
     workdir: &Path,
     mode_flash: &mut Option<(String, u32)>,
@@ -153,7 +156,24 @@ pub(crate) async fn dispatch_slash_action(
     sys_tokens: &mut u64,
     plan_edit: &mut Option<crate::plan_edit::PlanEdit>,
     notepad: &mut Option<crate::notepad::NotepadView>,
+    clear_confirm: &mut Option<crate::clear_confirm::ClearConfirm>,
+    // `/agent` picker slot — the Agent arm fills it; every other action
+    // leaves it untouched. (Trailing param so existing call sites can
+    // append one argument instead of reshuffling.)
+    agent_menu: &mut Option<crate::agent_menu::AgentMenu>,
 ) -> LoopFlow {
+    if chat.remote
+        && !matches!(
+            action,
+            SlashAction::Task | SlashAction::Agent | SlashAction::Notepad | SlashAction::Stop
+        )
+    {
+        *mode_flash = Some((
+            "This control is available for /agent self tasks".into(),
+            anim_tick,
+        ));
+        return LoopFlow::Proceed;
+    }
     match action {
         SlashAction::Task => {
             let sessions = store
@@ -186,11 +206,6 @@ pub(crate) async fn dispatch_slash_action(
                 crate::mcp_menu::McpList::new(config),
             ));
         }
-        SlashAction::Envs => {
-            *envs_menu = Some(crate::envs_menu::EnvsMenu::List(
-                crate::envs_menu::EnvsList::discover(),
-            ));
-        }
         SlashAction::Cli => {
             *cli_menu = Some(crate::cli_menu::CliMenu::List(
                 crate::cli_menu::CliList::new(config),
@@ -200,6 +215,9 @@ pub(crate) async fn dispatch_slash_action(
             *skill_toggle_menu = Some(crate::skill_menu::SkillMenu::List(
                 crate::skill_menu::SkillList::new(config),
             ));
+        }
+        SlashAction::Agent => {
+            *agent_menu = Some(crate::agent_menu::AgentMenu::configured(config.clone()));
         }
         SlashAction::Compact => match gate_compact(*running) {
             CompactGate::Run => {
@@ -235,8 +253,6 @@ pub(crate) async fn dispatch_slash_action(
                 running,
                 follow,
                 chat,
-                input,
-                cursor_idx,
                 sys_tokens,
                 mode_flash,
                 anim_tick,
@@ -252,8 +268,6 @@ pub(crate) async fn dispatch_slash_action(
                 running,
                 follow,
                 chat,
-                input,
-                cursor_idx,
                 sys_tokens,
                 mode_flash,
                 anim_tick,
@@ -262,21 +276,11 @@ pub(crate) async fn dispatch_slash_action(
             .await;
         }
         SlashAction::ClearContext => {
-            return dispatch_mode_switch(
-                ModeSwitch::ClearContext,
-                cmd_tx,
-                cancel,
-                running,
-                follow,
-                chat,
-                input,
-                cursor_idx,
-                sys_tokens,
-                mode_flash,
-                anim_tick,
-                workdir,
-            )
-            .await;
+            // Destructive fold: arm the countdown guard instead of firing.
+            // The chip counts down; Esc cancels, Enter / window-elapsed fires
+            // via `fire_clear_confirm`.
+            crate::clear_confirm::engage(clear_confirm, chat, mode_flash, anim_tick, None, None);
+            return LoopFlow::Proceed;
         }
         SlashAction::Annotation => {
             crate::plan_edit::enter_annotation(
@@ -292,10 +296,22 @@ pub(crate) async fn dispatch_slash_action(
             local_cmd::run("/ps", chat).await;
         }
         SlashAction::Stop => {
-            local_cmd::run("/stop", chat).await;
+            if chat.remote {
+                cancel.cancel();
+            } else {
+                local_cmd::run("/stop", chat).await;
+            }
         }
         SlashAction::Ap => {
             *ap_menu = Some(crate::ap_menu::ApMenu::new(config));
+        }
+        SlashAction::Sidecar => {
+            // Bypass semantics: the panel opens even mid-turn — the sidecar
+            // never touches the parent's steer/queue/prompt paths, so the
+            // running gate does not apply. Entry destroys the previous
+            // conversation, so the next question sees a fresh snapshot.
+            crate::sidecar_ui::enter_panel(chat, sidecar_ask);
+            *follow = true;
         }
     }
     LoopFlow::Proceed
@@ -333,8 +349,8 @@ pub(crate) async fn steer_submit_after_mouse(
 }
 
 /// Hard-cancel the running turn (double-Esc / Ctrl+C arm in `app.rs`):
-/// drop a deferred `/plan` arming, cancel tokens, and show the interrupted
-/// marker. Pending steer/queue rows are deliberately KEPT — both in the
+/// cancel tokens and show the interrupted marker. Pending steer/queue rows
+/// are deliberately KEPT — both in the
 /// store and in the UI mirrors — so they are consumed FIFO on the next
 /// submit's drain or a `>` panel drain. This matches the web
 /// `/interrupt` semantics, where cancelling a run also preserves queued
@@ -358,4 +374,264 @@ pub(crate) async fn cancel_running_turn(
     *running = false;
     *cancelled = true;
     *follow = true;
+}
+
+/// Fire an armed clear-context confirm at its (unattended) expiry or from
+/// idle. While running the compound command text queues verbatim (the runner
+/// applies it at the idle boundary, tail included) with an explicit queued
+/// marker so the fire is never silent; idle starts the control-command turn
+/// now, mirroring the `dispatch_mode_switch` Run arm. Manual confirmation
+/// (second Shift+Tab / Enter) routes through [`fire_clear_confirm_now`]
+/// instead — it interrupts the running turn rather than queueing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fire_clear_confirm(
+    cc: crate::clear_confirm::ClearConfirm,
+    cmd_tx: &mpsc::Sender<UiCmd>,
+    cancel: &mut CancellationToken,
+    running: &mut bool,
+    follow: &mut bool,
+    chat: &mut ChatView,
+    sys_tokens: &mut u64,
+    mode_flash: &mut Option<(String, u32)>,
+    anim_tick: u32,
+    workdir: &Path,
+    admit_tx: &mpsc::Sender<crate::queue_admitter::AdmitReq>,
+    admit_st: &mut crate::queue_admitter::AdmitUiState,
+    queue_items: &mut Vec<(i64, String)>,
+    pending_images: &mut Vec<(String, String)>,
+    session_id: &str,
+    history: &mut Vec<String>,
+    hist_idx: &mut Option<usize>,
+) -> LoopFlow {
+    let text = crate::clear_confirm::command_text(&cc);
+    if *running {
+        // Failed hand-off flashes; temp row/images already rolled back.
+        crate::app_helpers::queue_submit_flash(
+            &text,
+            admit_tx,
+            admit_st,
+            queue_items,
+            pending_images,
+            session_id,
+            anim_tick,
+            mode_flash,
+        );
+        // Unattended expiry is conservative (queue at the idle boundary), so
+        // the queue panel row alone could read as a swallowed key — echo the
+        // deferral into the transcript explicitly.
+        chat.push_marker(Line::from(Span::styled(
+            "[clear] 已排队——当前轮结束后执行\u{2026}",
+            Style::default().fg(theme::warn_color()),
+        )));
+        crate::app_helpers::push_history(history, hist_idx, &text);
+        return LoopFlow::Proceed;
+    }
+    // Echo the model-facing tail: the compound rest runs as a real user
+    // turn in the fresh context, so it must be echoed; the command token
+    // itself never is (applied inline, never recorded).
+    if let Some(echo) = opencoder_session::consumed_echo_text(&text) {
+        chat.blocks.push(crate::chat::ChatBlock::User {
+            rendered: crate::markdown::render(&echo),
+        });
+        chat.push_marker(Line::from(""));
+    }
+    let name = crate::clear_confirm::CLEAR_CONTEXT_CMD.trim_start_matches('/');
+    *sys_tokens = sys_tokens_for(name, workdir, None);
+    *mode_flash = Some((format!("\u{2192} {name} mode"), anim_tick));
+    if !start_turn(cmd_tx, cancel, UiCmd::Prompt(text, Vec::new())).await {
+        worker_dead(chat);
+        return LoopFlow::Quit;
+    }
+    *running = true;
+    *follow = true;
+    chat.begin_turn();
+    LoopFlow::Proceed
+}
+
+/// Manual confirmation (a second Shift+Tab or Enter on the armed guard)
+/// fires NOW instead of queueing: a human explicitly asked for the fold, so
+/// the running turn is interrupted first — cancel token + child cancels +
+/// interrupted marker, the same `cancel_running_turn` semantics as the
+/// double-Esc hard-abort — and the clear turn starts immediately on the
+/// fresh idle path. The unattended expiry (`confirm_tick`) keeps the
+/// conservative queue-at-idle-boundary semantics: nobody confirmed, so the
+/// in-flight turn is never killed on a timer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fire_clear_confirm_now(
+    cc: crate::clear_confirm::ClearConfirm,
+    cmd_tx: &mpsc::Sender<UiCmd>,
+    cancel: &mut CancellationToken,
+    running: &mut bool,
+    follow: &mut bool,
+    chat: &mut ChatView,
+    sys_tokens: &mut u64,
+    mode_flash: &mut Option<(String, u32)>,
+    anim_tick: u32,
+    workdir: &Path,
+    admit_tx: &mpsc::Sender<crate::queue_admitter::AdmitReq>,
+    admit_st: &mut crate::queue_admitter::AdmitUiState,
+    queue_items: &mut Vec<(i64, String)>,
+    pending_images: &mut Vec<(String, String)>,
+    session_id: &str,
+    history: &mut Vec<String>,
+    hist_idx: &mut Option<usize>,
+    child_runtime: &mut crate::worker::ChildRuntimeHandles,
+    cancelled: &mut bool,
+) -> LoopFlow {
+    if *running {
+        cancel_running_turn(chat, cancel, child_runtime, running, cancelled, follow).await;
+    }
+    fire_clear_confirm(
+        cc,
+        cmd_tx,
+        cancel,
+        running,
+        follow,
+        chat,
+        sys_tokens,
+        mode_flash,
+        anim_tick,
+        workdir,
+        admit_tx,
+        admit_st,
+        queue_items,
+        pending_images,
+        session_id,
+        history,
+        hist_idx,
+    )
+    .await
+}
+
+/// Armed-guard key handling with all side effects: fire early on Enter or a
+/// second Shift+Tab (`fire_clear_confirm_now` — a manual confirm interrupts
+/// the running turn and starts the clear turn immediately) — the composer
+/// text typed during the live window merges into the compound rest first, so
+/// a submission executes right away with what was typed — cancel on Esc (回撤
+/// marker + draft restore), let plain editing keys through. Returns true when
+/// the worker died firing (caller quits).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_confirm_key(
+    clear_confirm: &mut Option<crate::clear_confirm::ClearConfirm>,
+    k: KeyEvent,
+    input: &mut String,
+    cursor_idx: &mut usize,
+    undo_state: &mut crate::undo::UndoState,
+    chat: &mut ChatView,
+    cmd_tx: &mpsc::Sender<UiCmd>,
+    cancel: &mut CancellationToken,
+    running: &mut bool,
+    follow: &mut bool,
+    sys_tokens: &mut u64,
+    mode_flash: &mut Option<(String, u32)>,
+    anim_tick: u32,
+    workdir: &Path,
+    admit_tx: &mpsc::Sender<crate::queue_admitter::AdmitReq>,
+    admit_st: &mut crate::queue_admitter::AdmitUiState,
+    queue_items: &mut Vec<(i64, String)>,
+    pending_images: &mut Vec<(String, String)>,
+    session_id: &str,
+    history: &mut Vec<String>,
+    hist_idx: &mut Option<usize>,
+    child_runtime: &mut crate::worker::ChildRuntimeHandles,
+    cancelled: &mut bool,
+) -> bool {
+    match crate::clear_confirm::intercept(clear_confirm, input, cursor_idx, undo_state, k) {
+        Some(crate::clear_confirm::ConfirmFlow::Fire) => {
+            if let Some(mut cc) = clear_confirm.take() {
+                // The submission confirms the countdown: fold the text typed
+                // during the window into the compound rest and fire now
+                // instead of waiting out the window.
+                crate::clear_confirm::merge_typed(&mut cc, input);
+                input.clear();
+                *cursor_idx = 0;
+                crate::undo::reset(undo_state, input, 0);
+                return matches!(
+                    fire_clear_confirm_now(
+                        cc,
+                        cmd_tx,
+                        cancel,
+                        running,
+                        follow,
+                        chat,
+                        sys_tokens,
+                        mode_flash,
+                        anim_tick,
+                        workdir,
+                        admit_tx,
+                        admit_st,
+                        queue_items,
+                        pending_images,
+                        session_id,
+                        history,
+                        hist_idx,
+                        child_runtime,
+                        cancelled,
+                    )
+                    .await,
+                    LoopFlow::Quit
+                );
+            }
+            false
+        }
+        Some(crate::clear_confirm::ConfirmFlow::Cancel) => {
+            crate::clear_confirm::push_cancel_marker(chat);
+            // Idle freezes anim_tick once the guard is gone, so a leftover
+            // flash would stay pinned on screen forever — drop the chip.
+            *mode_flash = None;
+            false
+        }
+        None => false,
+    }
+}
+
+/// Anim-tick side of the armed guard: refresh the countdown chip and
+/// auto-fire when the window elapsed. Returns true when the worker died
+/// firing (caller quits).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn confirm_tick(
+    clear_confirm: &mut Option<crate::clear_confirm::ClearConfirm>,
+    mode_flash: &mut Option<(String, u32)>,
+    anim_tick: u32,
+    cmd_tx: &mpsc::Sender<UiCmd>,
+    cancel: &mut CancellationToken,
+    running: &mut bool,
+    follow: &mut bool,
+    chat: &mut ChatView,
+    sys_tokens: &mut u64,
+    workdir: &Path,
+    admit_tx: &mpsc::Sender<crate::queue_admitter::AdmitReq>,
+    admit_st: &mut crate::queue_admitter::AdmitUiState,
+    queue_items: &mut Vec<(i64, String)>,
+    pending_images: &mut Vec<(String, String)>,
+    session_id: &str,
+    history: &mut Vec<String>,
+    hist_idx: &mut Option<usize>,
+) -> bool {
+    if let Some(cc) = crate::clear_confirm::tick(clear_confirm, mode_flash, anim_tick) {
+        return matches!(
+            fire_clear_confirm(
+                cc,
+                cmd_tx,
+                cancel,
+                running,
+                follow,
+                chat,
+                sys_tokens,
+                mode_flash,
+                anim_tick,
+                workdir,
+                admit_tx,
+                admit_st,
+                queue_items,
+                pending_images,
+                session_id,
+                history,
+                hist_idx,
+            )
+            .await,
+            LoopFlow::Quit
+        );
+    }
+    false
 }

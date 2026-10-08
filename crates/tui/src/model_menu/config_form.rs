@@ -8,9 +8,12 @@ use super::patch::ConfigPatch;
 use super::state::{ModelMenu, ModelOutcome};
 
 /// Reasoning-effort selector state. `Off` serializes to "" (key preserved).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reasoning {
     Off,
+    None,
+    Minimal,
+    Custom(String),
     Low,
     Medium,
     High,
@@ -19,9 +22,12 @@ pub enum Reasoning {
 }
 
 impl Reasoning {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &str {
         match self {
-            Reasoning::Off => "off",
+            Reasoning::Off => "default",
+            Reasoning::None => "none",
+            Reasoning::Minimal => "minimal",
+            Reasoning::Custom(value) => value,
             Reasoning::Low => "low",
             Reasoning::Medium => "medium",
             Reasoning::High => "high",
@@ -29,9 +35,12 @@ impl Reasoning {
             Reasoning::Max => "max",
         }
     }
-    pub fn next(self) -> Self {
+    pub fn next(&self) -> Self {
         match self {
-            Reasoning::Off => Reasoning::Low,
+            Reasoning::Off => Reasoning::None,
+            Reasoning::None => Reasoning::Minimal,
+            Reasoning::Minimal => Reasoning::Low,
+            Reasoning::Custom(_) => Reasoning::Off,
             Reasoning::Low => Reasoning::Medium,
             Reasoning::Medium => Reasoning::High,
             Reasoning::High => Reasoning::XHigh,
@@ -39,10 +48,13 @@ impl Reasoning {
             Reasoning::Max => Reasoning::Off,
         }
     }
-    pub fn prev(self) -> Self {
+    pub fn prev(&self) -> Self {
         match self {
             Reasoning::Off => Reasoning::Max,
-            Reasoning::Low => Reasoning::Off,
+            Reasoning::Low => Reasoning::Minimal,
+            Reasoning::Minimal => Reasoning::None,
+            Reasoning::None => Reasoning::Off,
+            Reasoning::Custom(_) => Reasoning::Off,
             Reasoning::Medium => Reasoning::Low,
             Reasoning::High => Reasoning::Medium,
             Reasoning::XHigh => Reasoning::High,
@@ -51,17 +63,23 @@ impl Reasoning {
     }
     pub fn from_config(v: Option<&str>) -> Self {
         match v.map(|s| s.trim().to_lowercase()).as_deref() {
+            Some("none") => Reasoning::None,
+            Some("minimal") => Reasoning::Minimal,
             Some("low") => Reasoning::Low,
             Some("medium") => Reasoning::Medium,
             Some("high") => Reasoning::High,
             Some("xhigh") => Reasoning::XHigh,
             Some("max") => Reasoning::Max,
+            Some(value) if !value.is_empty() => Reasoning::Custom(v.unwrap().trim().to_owned()),
             _ => Reasoning::Off,
         }
     }
-    pub fn to_option(self) -> Option<String> {
+    pub fn to_option(&self) -> Option<String> {
         match self {
             Reasoning::Off => None,
+            Reasoning::None => Some("none".into()),
+            Reasoning::Minimal => Some("minimal".into()),
+            Reasoning::Custom(value) => Some(value.clone()),
             Reasoning::Low => Some("low".into()),
             Reasoning::Medium => Some("medium".into()),
             Reasoning::High => Some("high".into()),
@@ -81,12 +99,13 @@ pub enum ConfigField {
     Fps,
     ApMaxIter,
     EnableTmuxSession,
+    LocalMemory,
     Save,
     Cancel,
 }
 
 impl ConfigField {
-    const ORDER: [ConfigField; 10] = [
+    const ORDER: [ConfigField; 11] = [
         ConfigField::Reasoning,
         ConfigField::InterleavedThinking,
         ConfigField::MaxTokens,
@@ -95,6 +114,7 @@ impl ConfigField {
         ConfigField::Fps,
         ConfigField::ApMaxIter,
         ConfigField::EnableTmuxSession,
+        ConfigField::LocalMemory,
         ConfigField::Save,
         ConfigField::Cancel,
     ];
@@ -132,6 +152,7 @@ pub struct ConfigForm {
     /// Char-index edit cursor within `ap_max_iter_input`.
     pub ap_max_iter_cursor: usize,
     pub enable_tmux_session: bool,
+    pub local_memory: bool,
     pub focus: ConfigField,
     pub error: Option<String>,
 }
@@ -159,6 +180,7 @@ impl ConfigForm {
             ap_max_iter_input: ap_max_iter_input.clone(),
             ap_max_iter_cursor: ap_max_iter_input.chars().count(),
             enable_tmux_session: config.enable_tmux_session.unwrap_or(false),
+            local_memory: config.local_memory,
             focus: ConfigField::Reasoning,
             error: None,
         }
@@ -216,6 +238,7 @@ impl ConfigForm {
             fps,
             ap_max_iter,
             enable_tmux_session: Some(self.enable_tmux_session),
+            local_memory: self.local_memory,
         }
     }
 
@@ -303,6 +326,7 @@ pub fn handle_key(mut form: ConfigForm, k: KeyEvent) -> (ModelOutcome, Option<Mo
                 form.interleaved_thinking = !form.interleaved_thinking
             }
             ConfigField::EnableTmuxSession => form.enable_tmux_session = !form.enable_tmux_session,
+            ConfigField::LocalMemory => form.local_memory = !form.local_memory,
             ConfigField::MaxTokens
             | ConfigField::ContextSize
             | ConfigField::Threshold
@@ -316,6 +340,7 @@ pub fn handle_key(mut form: ConfigForm, k: KeyEvent) -> (ModelOutcome, Option<Mo
                 form.interleaved_thinking = !form.interleaved_thinking
             }
             ConfigField::EnableTmuxSession => form.enable_tmux_session = !form.enable_tmux_session,
+            ConfigField::LocalMemory => form.local_memory = !form.local_memory,
             ConfigField::MaxTokens
             | ConfigField::ContextSize
             | ConfigField::Threshold
@@ -352,6 +377,7 @@ pub fn handle_key(mut form: ConfigForm, k: KeyEvent) -> (ModelOutcome, Option<Mo
             ConfigField::EnableTmuxSession if c == ' ' => {
                 form.enable_tmux_session = !form.enable_tmux_session
             }
+            ConfigField::LocalMemory if c == ' ' => form.local_memory = !form.local_memory,
             ConfigField::MaxTokens
             | ConfigField::ContextSize
             | ConfigField::Threshold

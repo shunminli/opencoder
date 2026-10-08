@@ -72,6 +72,8 @@ impl ContentBlock {
 /// be recovered, only tracked from the point this change shipped.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageUsage {
+    #[serde(default)]
+    pub reasoning_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
@@ -83,6 +85,8 @@ pub struct MessageUsage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_state: Option<crate::ProviderState>,
     pub id: String,
     pub role: Role,
     pub blocks: Vec<ContentBlock>,
@@ -96,11 +100,21 @@ pub struct Message {
     pub created_at: i64,
     #[serde(default)]
     pub synthetic: bool,
+    /// Verbatim display text for user input — the echo-side single source of
+    /// truth. Populated with the raw prompt (e.g. `$skill` tokens included)
+    /// at record time; every display surface (TUI replay, SPA, `session
+    /// show`) prefers it over `text()`, which carries the post-resolution
+    /// clean text the LLM consumes. Never serialized into LLM wire requests
+    /// (those read `blocks` only). `None` on legacy rows: callers fall back
+    /// to `text()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 impl Message {
     pub fn user(id: impl Into<String>, text: impl Into<String>) -> Self {
         Message {
+            provider_state: None,
             id: id.into(),
             role: Role::User,
             blocks: vec![ContentBlock::text(text)],
@@ -109,6 +123,7 @@ impl Message {
             usage: MessageUsage::default(),
             created_at: now_ms(),
             synthetic: false,
+            display: None,
         }
     }
 
@@ -135,6 +150,7 @@ impl Message {
             });
         }
         Message {
+            provider_state: None,
             id: id.into(),
             role: Role::User,
             blocks,
@@ -143,12 +159,30 @@ impl Message {
             usage: MessageUsage::default(),
             created_at: now_ms(),
             synthetic: false,
+            display: None,
         }
     }
+
+    /// Like [`Message::user_with_images`] but with a verbatim display text
+    /// (the raw user input, `$skill` tokens included). `text` stays the
+    /// post-resolution clean text the LLM consumes; `display` is echo-only.
+    pub fn user_with_display(
+        id: impl Into<String>,
+        text: impl Into<String>,
+        display: Option<String>,
+        images: &[String],
+    ) -> Self {
+        let mut m = Message::user_with_images(id, text, images);
+        m.display = display;
+        m
+    }
+
     pub fn assistant(id: impl Into<String>) -> Self {
         Message {
+            provider_state: None,
             id: id.into(),
             role: Role::Assistant,
+            display: None,
             blocks: vec![],
             model: None,
             agent: None,
@@ -159,8 +193,10 @@ impl Message {
     }
     pub fn system(id: impl Into<String>, text: impl Into<String>) -> Self {
         Message {
+            provider_state: None,
             id: id.into(),
             role: Role::System,
+            display: None,
             blocks: vec![ContentBlock::text(text)],
             model: None,
             agent: None,
@@ -218,4 +254,50 @@ impl Message {
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Legacy persisted JSON (predating `display`) deserializes with
+    /// `display: None` — no schema/data migration required.
+    #[test]
+    fn legacy_json_without_display_deserializes_to_none() {
+        let raw = r#"{"id":"m1","role":"user","blocks":[{"kind":"text","text":"hi"}]}"#;
+        let m: Message = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.text(), "hi");
+        assert!(m.display.is_none());
+        assert!(!m.synthetic);
+    }
+
+    /// `display` round-trips through serde and stays absent from the JSON
+    /// when `None` (keeps the wire/persisted shape unchanged for old rows).
+    #[test]
+    fn display_roundtrip_and_skip_when_none() {
+        let m =
+            Message::user_with_display("m2", "fix the bug", Some("$haiku fix the bug".into()), &[]);
+        assert_eq!(m.text(), "fix the bug");
+        assert_eq!(m.display.as_deref(), Some("$haiku fix the bug"));
+
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"display\":\"$haiku fix the bug\""));
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.display.as_deref(), Some("$haiku fix the bug"));
+
+        let plain = Message::user("m3", "plain");
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("display"), "None display must not serialize");
+    }
+
+    /// `user_with_display` with no images and no display is equivalent to
+    /// `user`; images land after the text block either way.
+    #[test]
+    fn user_with_display_mirrors_user_with_images() {
+        let a = Message::user_with_display("m4", "t", None, &["img".to_string()]);
+        let b = Message::user_with_images("m4", "t", &["img".to_string()]);
+        assert_eq!(a.blocks.len(), b.blocks.len());
+        assert!(a.display.is_none());
+        assert!(a.has_image());
+    }
 }

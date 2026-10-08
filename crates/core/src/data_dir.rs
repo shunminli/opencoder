@@ -3,7 +3,7 @@
 //! Every crate that opens a SQLite store (CLI, TUI, Web) must derive the
 //! *same* on-disk data dir for the same workdir, otherwise sessions created in
 //! one process are invisible to another — surfacing as "session not found" and
-//! a detached `opencode[exited]` pane. This module owns the single canonical
+//! a detached `opencoder[exited]` pane. This module owns the single canonical
 //! algorithm so the three former call sites can no longer drift.
 
 use std::hash::{Hash, Hasher};
@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 ///
 /// Each workdir's store lives in a `<data_root>/<hash>` subdirectory (see
 /// [`data_dir_for`]). Exposed as its own function so global operations (e.g.
-/// `opencode ts -l`) can scan *every* per-workdir store regardless of the
+/// `opencoder ts -l`) can scan *every* per-workdir store regardless of the
 /// current directory — the same algorithm used by [`data_dir_for`] cannot
 /// drift from it.
 pub fn data_root() -> PathBuf {
-    let mut base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    let mut base = crate::platform::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
     base.push("opencoder");
     base
 }
@@ -88,7 +88,7 @@ mod tests {
     fn workdir_hash_canonicalizes_and_is_stable_hex() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().canonicalize().unwrap();
-        let with_slash: PathBuf = format!("{}/", real.to_string_lossy()).into();
+        let with_slash: PathBuf = format!("{}{}", real.display(), std::path::MAIN_SEPARATOR).into();
         assert_eq!(workdir_hash(&real), workdir_hash(&with_slash));
         #[cfg(unix)]
         {
@@ -114,7 +114,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().canonicalize().unwrap();
         // A trailing slash on the input must NOT change the data dir.
-        let with_slash: PathBuf = format!("{}/", real.to_string_lossy()).into();
+        let with_slash: PathBuf = format!("{}{}", real.display(), std::path::MAIN_SEPARATOR).into();
         assert_eq!(
             data_dir_for(&real),
             data_dir_for(&with_slash),

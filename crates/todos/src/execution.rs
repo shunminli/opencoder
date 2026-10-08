@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result};
 use opencoder_core::{message::now_ms, resolve_agent, Config, Message, Role};
@@ -28,7 +32,10 @@ pub async fn execute(
     cancel: CancellationToken,
 ) -> Result<TodoExecution> {
     config.autopilot.mode = opencoder_core::ApMode::Off;
-    let agent = resolve_agent(&todo.agent)
+    let agent =
+        opencoder_core::agent::scope::with_root_sync(config.agent.agents_dir.clone(), || {
+            resolve_agent(&todo.agent)
+        })
         .with_context(|| format!("TODO {} has unknown agent {}", todo.id, todo.agent))?;
     if !agent.is_primary() || agent.name == "workflow" {
         anyhow::bail!(
@@ -65,26 +72,67 @@ pub async fn execute(
         .mark_session_created()
     };
     session.cancel = Some(cancel);
+    // TODO env takes effect at runtime: `metadata.env_vars` (stamped at
+    // dispatch) rides env_passthrough into every tool subprocess (bash) and
+    // the Codex harness process. Resume keeps harness-restored vars; the
+    // bound TODO env wins on key conflicts (BTreeMap insert overwrites).
+    let todo_env = crate::domain::env_passthrough_from_metadata(&workflow.metadata);
+    if !todo_env.is_empty() {
+        let mut merged: std::collections::BTreeMap<String, String> =
+            session.env_passthrough.drain(..).collect();
+        for (key, value) in todo_env {
+            merged.insert(key, value);
+        }
+        session.env_passthrough = merged.into_iter().collect();
+    }
     // Snapshot the transcript size before this run: on Resume the session
     // carries the previous attempt's messages, and only assistant messages
     // produced by THIS run are valid candidates.
     let watermark = session.messages.len();
     let prompt = focused_prompt(workflow, state, todo, context_mode)?;
-    let event_seq = store.last_event_seq(&session.id).await?;
-    opencoder_session::run(&mut session, prompt, |_| {}).await?;
-    let events = store
-        .events_after(&session.id, event_seq)
-        .await?
-        .into_iter()
-        .map(|record| {
-            let kind = record
-                .sse_kind
-                .as_deref()
-                .context("TODO event is missing its exact SSE kind")?;
-            SessionEvent::from_sse(kind, record.payload)
-                .with_context(|| format!("decode persisted TODO event {kind}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // B1: the session runner only surfaces events through this callback — the
+    // old `|_| {}` dropped them, so required-tool-call gates never matched.
+    // Mirror the web drain: persist every event through a flusher sink AND
+    // keep it in memory so `evaluate_gate` sees the real ToolStart/ToolEnd
+    // stream (no store round-trip, no SSE re-decode).
+    let (sink, flusher) =
+        opencoder_session::spawn_checked_event_flusher(store.clone(), session.id.clone());
+    // `FnMut` owns its captures, so the buffer is shared through an Arc and
+    // reclaimed lock-free via `Arc::into_inner` once the run settles.
+    let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let collected = events.clone();
+    let persistence_error = Arc::new(Mutex::new(None));
+    let sink_error = persistence_error.clone();
+    let stop = session.cancel.clone();
+    // The sink is a cheap clonable handle: only the clone moves into the
+    // closure; the outer copy stays alive so it can be dropped right after
+    // the run, closing the channel ahead of the final flusher await.
+    let run_result = opencoder_session::run(&mut session, prompt, {
+        let sink = sink.clone();
+        move |ev| {
+            if let Err(error) = sink.push(&ev) {
+                *sink_error.lock().unwrap() = Some(error.to_string());
+                if let Some(stop) = &stop {
+                    stop.cancel();
+                }
+            }
+            collected.lock().unwrap().push(ev);
+        }
+    })
+    .await;
+    // The flusher MUST be awaited (after dropping the sink) so the final
+    // batch lands on the normal path and on run failure alike; only then is
+    // the run error propagated.
+    drop(sink);
+    flusher.await.context("TODO event flusher stopped")??;
+    if let Some(error) = persistence_error.lock().unwrap().take() {
+        anyhow::bail!("TODO event persistence failed: {error}");
+    }
+    run_result?;
+    let events = Arc::into_inner(events)
+        .expect("TODO event buffer still shared after run")
+        .into_inner()
+        .unwrap();
     let raw = latest_new_assistant(&session.messages, watermark)
         .context("TODO agent returned no final candidate")?;
     let candidate = parse_candidate(&raw)
@@ -121,6 +169,7 @@ pub async fn prepare_session(
     let now = now_ms();
     store
         .create_session(&SessionMeta {
+            kind: Some("todos".into()),
             id: session_id.into(),
             title: Some(format!("{} / {}", workflow.name, todo.title)),
             agent: Some(todo.agent.clone()),
@@ -138,8 +187,6 @@ pub async fn prepare_session(
             skill: None,
             task_type: Some(TASK_TYPE_TODO.into()),
             requirement: Some(todo.instructions.clone()),
-            plan_snapshot: None,
-            plan_input_count: 0,
         })
         .await
 }
@@ -150,35 +197,8 @@ fn focused_prompt(
     todo: &TodoSpec,
     context_mode: ContextMode,
 ) -> Result<String> {
-    let mut dependencies = Vec::new();
-    for id in &todo.depends_on {
-        let item = state
-            .todos
-            .get(id)
-            .with_context(|| format!("state missing TODO {id}"))?;
-        dependencies.push(serde_json::json!({
-            "todo_id": id,
-            "summary": item.candidate.as_ref().map(|candidate| &candidate.summary),
-            "evidence_refs": item.candidate.as_ref().map(|candidate| &candidate.evidence_refs),
-        }));
-    }
-    let recovery = state
-        .todos
-        .get(&todo.id)
-        .with_context(|| format!("state missing TODO {}", todo.id))?
-        .candidate
-        .as_ref()
-        .map(|candidate| &candidate.recovery_context);
-    Ok(format!(
-        "Complete exactly one focused TODO. You may use available tools and may delegate supporting work through the task tool, but must not advance another TODO. Return only the final Candidate JSON object with fields status(candidate|blocked|interrupted), summary(string), result(string|null), verification(string), evidence_refs(string[]), recovery_context{{summary:string,refs:string[]}}.\n\
-         WORKFLOW_OBJECTIVE={}\nCONSTRAINTS={}\nTODO={}\nACCEPTED_DEPENDENCIES={}\nCONTEXT_MODE={}\nPREVIOUS_RECOVERY={}",
-        serde_json::to_string(&workflow.objective)?,
-        serde_json::to_string(&workflow.constraints)?,
-        serde_json::to_string(todo)?,
-        serde_json::to_string(&dependencies)?,
-        serde_json::to_string(&context_mode)?,
-        serde_json::to_string(&recovery)?,
-    ))
+    let context = crate::review::context::dispatch_context(workflow, state, todo, context_mode)?;
+    crate::review::context::focused_prompt(&context)
 }
 
 fn evaluate_gate(todo: &TodoSpec, events: &[SessionEvent]) -> serde_json::Value {

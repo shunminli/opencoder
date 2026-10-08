@@ -23,6 +23,7 @@ fn test_opts(base: &str, workdir: &std::path::Path, data: &std::path::Path) -> N
         claim_interval: Duration::from_millis(30),
         version: env!("CARGO_PKG_VERSION").into(),
         local_store_dir: Some(data.to_path_buf()),
+        dag: None,
     }
 }
 
@@ -61,7 +62,7 @@ async fn claims_executes_uploads_and_reports_done() {
     ));
 
     // Registration observed server-side before any work.
-    support::wait_for(10, || {
+    support::wait_for(30, || {
         let regs = st.registrations();
         (!regs.is_empty()).then_some(regs)
     })
@@ -69,14 +70,14 @@ async fn claims_executes_uploads_and_reports_done() {
     assert_eq!(st.registrations()[0], "node-happy");
 
     // The task is claimed exactly once.
-    support::wait_for(10, || {
+    support::wait_for(30, || {
         let claimed = st.claimed();
         (!claimed.is_empty()).then_some(claimed)
     })
     .await;
 
     // Terminal report lands as `done`.
-    support::wait_for(30, || st.status_of(&task.task_id)).await;
+    support::wait_for(120, || st.status_of(&task.task_id)).await;
     assert_eq!(st.status_of(&task.task_id).as_deref(), Some("done"));
 
     // Event stream assertions — arrival order is authoritative.

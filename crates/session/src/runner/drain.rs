@@ -30,7 +30,7 @@ pub(super) const MAX_CONSUME_STREAK: u32 = 32;
 pub(super) async fn claim_one_queued(
     session: &mut SessionState,
     on_event: &mut (dyn FnMut(SessionEvent) + Send),
-) -> Option<(i64, String, Vec<String>)> {
+) -> Option<(i64, opencoder_store::SessionInput)> {
     let store = session.store.clone()?;
     let sid = session.id.clone();
     // No cancel-guard select here. claim_next_queue runs
@@ -41,7 +41,7 @@ pub(super) async fn claim_one_queued(
     // transaction completes in <1ms on local SQLite; the run loop's
     // top-of-loop interrupt check catches cancellation on the next iteration.
     match store.claim_next_queue(&sid).await {
-        Ok(Some((seq, input))) => Some((seq, input.prompt, input.images.clone())),
+        Ok(Some((seq, input))) => Some((seq, input)),
         Ok(None) => None,
         Err(e) => {
             // Transient contention (e.g. a concurrent writer racing the
@@ -52,7 +52,7 @@ pub(super) async fn claim_one_queued(
             // stranding is never silent (P2-4).
             tracing::warn!(error = %e, "claim_one_queued failed, retrying once");
             match store.claim_next_queue(&sid).await {
-                Ok(Some((seq, input))) => Some((seq, input.prompt, input.images.clone())),
+                Ok(Some((seq, input))) => Some((seq, input)),
                 Ok(None) => None,
                 Err(e2) => {
                     tracing::warn!(error = %e2, "claim_one_queued retry failed");
@@ -93,7 +93,10 @@ pub(super) async fn drain_one_queued(
     session: &mut SessionState,
     on_event: &mut (dyn FnMut(SessionEvent) + Send),
 ) -> Result<DrainOutcome> {
-    if let Some((seq, q, imgs)) = claim_one_queued(session, on_event).await {
+    if let Some((seq, input)) = claim_one_queued(session, on_event).await {
+        let q = input.prompt;
+        let imgs = input.images;
+        let display = input.display_text;
         // Hard-cancel guard between claim and apply: a cancel that fired
         // after the atomic claim must NOT apply a queued control command
         // (mode switch under a cancelled run). Unpromote the claimed row so
@@ -109,9 +112,14 @@ pub(super) async fn drain_one_queued(
             unpromote_batch(session, &[seq]).await;
             return Ok(DrainOutcome::Empty);
         }
+        // Echo only what the model will see: the compound tail is recorded
+        // as the real user turn; a bare control command is applied inline
+        // with nothing recorded, so its echo is empty (display surfaces
+        // suppress empty echoes).
         on_event(SessionEvent::QueueConsumed {
             seq,
-            text: q.clone(),
+            text: crate::control_cmd::consumed_echo_text(display.as_deref().unwrap_or(&q))
+                .unwrap_or_default(),
         });
         if let Some((cmd, rest)) = crate::control_cmd::split_control_prefix(&q) {
             if let Err(e) = crate::control_cmd::apply(session, &cmd, &mut *on_event).await {
@@ -130,8 +138,9 @@ pub(super) async fn drain_one_queued(
                 mark_input_recorded(session, seq).await;
                 return Ok(DrainOutcome::Prompt);
             }
-            // Bare ClearContext with a preserved result breaks to execute it;
-            // sentinel path (no result) forces an outer iteration.
+            // Bare ClearContext with a preserved seed falls through so the
+            // model sees the continuity context; blank sentinel (nothing
+            // preserved) goes idle.
             if matches!(cmd, crate::control_cmd::ControlCmd::ClearContext)
                 && !crate::control_cmd::is_clear_context_handoff(
                     session.handoff_plan.as_deref().unwrap_or(""),
@@ -146,7 +155,8 @@ pub(super) async fn drain_one_queued(
         }
         // Real prompt: resolve `$skill` tokens, record, break.
         // F2: per-item marking (mirrors the steer loop) — never lost on failure.
-        crate::skill_resolve::record_compound(session, &q, &imgs).await;
+        crate::skill_resolve::record_compound_with_display(session, &q, &imgs, display.as_deref())
+            .await;
         mark_input_recorded(session, seq).await;
         return Ok(DrainOutcome::Prompt);
     }
@@ -232,7 +242,7 @@ pub(super) async fn drain_mode_step(
         DrainOutcome::ControlCmd => Ok(DrainModeAction::ConsumeNext),
         DrainOutcome::Empty => {
             // Queue empty. If the transcript ends with an unresponded user
-            // message (e.g. a plan→act handoff awaiting execution), proceed
+            // message (e.g. an execution handoff awaiting run), proceed
             // to the LLM call. A trailing Role::Tool message is equally
             // "unresponded" — the model must process the tool result — so
             // treat it the same way. Without this, a drain-mode session that
@@ -350,6 +360,7 @@ pub(super) async fn entry_drain_mode(
     has_text: bool,
     has_images: bool,
     handoff_pending: bool,
+    trigger_display: Option<String>,
 ) -> bool {
     let has_skill = session.skill_prompt_cloned().is_some();
     let drain_mode = !has_text
@@ -359,6 +370,11 @@ pub(super) async fn entry_drain_mode(
     if has_skill && !has_text && !drain_mode {
         let mut msg = Message::user(new_id(), crate::skill_resolve::SKILL_TRIGGER);
         msg.synthetic = true;
+        // Echo contract: when this trigger stands in for a verbatim user
+        // submit (`$name` alone), replay surfaces show the raw input instead
+        // of the injected trigger body. `None` (empty resubmit / resume
+        // re-trigger) keeps the message replay-skipped.
+        msg.display = trigger_display;
         session.record(msg).await;
     }
     drain_mode

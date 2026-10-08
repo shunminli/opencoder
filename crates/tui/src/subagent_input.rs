@@ -5,7 +5,7 @@
 //! The ">" button on child steer rows calls [`fire_subagent_turn_cancel`] to
 //! interrupt the current turn and force immediate steer absorption.
 //!
-//! Mirrors `steer_fire::admit_keyboard_steer` for the parent: the steer is
+//! Mirrors `steer_admit::submit_steer` for the parent: the steer is
 //! admitted to the CHILD session (`Delivery::Steer` keyed by the child's
 //! `session_id`) and pushed onto the child view's `steer_items`. The parent's
 //! steer panel, queue, skill tokens and active turn are all untouched — no
@@ -75,7 +75,7 @@ pub(crate) async fn handle_subagent_steer(
 /// Admit a steer to the focused subagent's child session and push it to the
 /// child view's `steer_items` for display.
 ///
-/// Snapshot-and-consume convention matches `steer_fire::admit_keyboard_steer`:
+/// Snapshot-and-consume convention matches `steer_admit::submit_steer`:
 /// the pending images are only cleared after a successful store write, so an
 /// attached image is never silently dropped on a store error.
 #[allow(clippy::too_many_arguments)]
@@ -140,6 +140,21 @@ pub(crate) async fn admit_subagent_steer(
         }
         Err(e) => AdmitOutcome::StoreError(format!("subagent steer admit failed: {e:#}")),
     }
+}
+
+/// Whether the focus points at a LIVE (`done == false`) subagent block.
+///
+/// Single source of truth for "does `>` target the child" — must mirror both
+/// [`fire_subagent_turn_cancel`]'s match and the display fallback in
+/// `app_display::steer_queue_sources` (a done/stale focus shows the PARENT's
+/// steer rows, so the click must also take the parent path). Without this
+/// liveness check a stale focus silently no-ops the click: no interrupt, no
+/// submit.
+pub(crate) fn is_live_subagent_focus(chat: &ChatView, subagent_focus: Option<usize>) -> bool {
+    matches!(
+        subagent_focus.and_then(|idx| chat.blocks.get(idx)),
+        Some(ChatBlock::Subagent { done: false, .. })
+    )
 }
 
 /// Fire the focused subagent's turn-cancel token to interrupt its current

@@ -22,10 +22,10 @@ use ratatui::Frame;
 /// the default highlight when the popup opens with an empty query.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/task", "切换 / 新建 / 恢复会话 (task picker)"),
+    ("/agent", "新建本地任务，或选择 Server 的 Agent / Operator"),
     ("/fork", "从已有会话复制上下文创建新任务 (fork picker)"),
     ("/model", "切换供应商 / 模型 (provider picker)"),
     ("/mcp", "管理 MCP server 列表 (enable/disable/增删改)"),
-    ("/envs", "管理环境配置集 (激活/新建/快照/删除)"),
     ("/cli", "管理 CLI 注册内容及注入范围 (parent/subagents/all)"),
     (
         "/skill",
@@ -33,22 +33,29 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/config",
-        "配置模型 / 思考深度 / base_url / api_key / 上下文阈值 / 渲染帧率 / tmux",
+        "配置思考深度 / 上下文阈值 / 渲染帧率 / tmux / local-memory",
     ),
     (
         "/compact",
         "手动压缩对话历史（总结早期消息，释放上下文窗口）",
     ),
-    ("/act", "切换到 act 模式（不重置上下文）"),
-    ("/plan", "切换到 plan 模式（不重置上下文）"),
+    ("/act", "退出只读模式，切换到 act 执行代理（不重置上下文）"),
+    (
+        "/plan",
+        "只读探索：拦截写操作，切换到 plan 探索代理（不重置上下文）",
+    ),
     ("/annotation", "记录/编辑任务备注 (annotation editor)"),
     ("/notepad", "IDE 式文件浏览/编辑 (文件树 + vim 编辑器)"),
     (
         "/act_clear_context",
-        "清空对话上下文并切换到 act 模式（重新开始）",
+        "清空对话上下文并执行（plan 下保留计划并切到 act；/clear_context 同效）",
     ),
-    ("/ps", "查看所有后台 bash 进程（不计入模型上下文）"),
-    ("/stop", "强制结束所有后台 bash 进程（不计入模型上下文）"),
+    ("/ps", "查看所有后台命令进程（不计入模型上下文）"),
+    ("/stop", "强制结束所有后台命令进程（不计入模型上下文）"),
+    (
+        "/sidecar",
+        "旁路快照问答：进入临时问询界面，ESC 返回即销毁不留痕（token 计入主任务）",
+    ),
     ("/ap", "选择 autopilot 模式 (off / 完全自动 / 自动 review)"),
 ];
 
@@ -63,13 +70,14 @@ pub enum SlashAction {
     CacheSalt,
     Act,
     Plan,
+    /// `/agent` — open the primary-agent picker (a pick fills the composer
+    /// with `/agent <name> `; a manually typed name rides the prompt path).
+    Agent,
     Annotation,
     Notepad,
     ClearContext,
     /// `/mcp` — manage MCP servers (enable/disable/add/edit/delete).
     Mcp,
-    /// `/envs` — manage env config sets (activate/create/recapture/delete).
-    Envs,
     /// `/cli` — manage CLI prompt registrations.
     Cli,
     /// `/skill` — manage default-injection skill toggles.
@@ -81,6 +89,9 @@ pub enum SlashAction {
     /// Display-only: open the autopilot mode menu (never enters model
     /// context).
     Ap,
+    /// `/sidecar` — enter the bypass Q/A panel (never enters model context;
+    /// destroy-on-entry / destroy-on-exit).
+    Sidecar,
 }
 
 /// Outcome of a keystroke while the command popup is open. `Dispatch` carries
@@ -163,18 +174,34 @@ impl CommandMenu {
     fn refilter(&mut self) {
         let q = self.query.trim().to_lowercase();
         let q = q.strip_prefix('/').unwrap_or(&q);
-        self.rows = COMMANDS
+        // A complete command must win over a substring such as /compact
+        // matching "act". Prefixes then substrings precede description hits;
+        // ties keep registration order, including the empty-query default.
+        let mut ranked = COMMANDS
             .iter()
             .enumerate()
-            .filter(|(_, (name, desc))| {
-                if q.is_empty() {
-                    return true;
-                }
-                let name_l = name.trim_start_matches('/').to_lowercase();
-                name_l.contains(q) || desc.to_lowercase().contains(q)
+            .filter_map(|(i, (name, desc))| {
+                let rank = if q.is_empty() {
+                    0
+                } else {
+                    let name_l = name.trim_start_matches('/').to_lowercase();
+                    if name_l == q {
+                        0
+                    } else if name_l.starts_with(q) {
+                        1
+                    } else if name_l.contains(q) {
+                        2
+                    } else if desc.to_lowercase().contains(q) {
+                        3
+                    } else {
+                        return None;
+                    }
+                };
+                Some((i, rank))
             })
-            .map(|(i, _)| i)
-            .collect();
+            .collect::<Vec<_>>();
+        ranked.sort_by_key(|&(_, rank)| rank);
+        self.rows = ranked.into_iter().map(|(i, _)| i).collect();
         self.selected = if self.rows.is_empty() {
             0
         } else {
@@ -190,7 +217,8 @@ pub fn parse(input: &str) -> Option<SlashAction> {
     let t = input.trim();
     let bare = t.strip_prefix('/')?;
     match bare {
-        "" | "t" | "task" => Some(SlashAction::Task),
+        "" | "t" | "task" | "tasks" => Some(SlashAction::Task),
+        "agent" => Some(SlashAction::Agent),
         "fork" | "fk" => Some(SlashAction::Fork),
         "model" | "mdl" => Some(SlashAction::Model),
         "config" | "cfg" => Some(SlashAction::Config),
@@ -199,12 +227,12 @@ pub fn parse(input: &str) -> Option<SlashAction> {
         "plan" => Some(SlashAction::Plan),
         "annotation" | "ann" => Some(SlashAction::Annotation),
         "notepad" | "note" => Some(SlashAction::Notepad),
-        "act_clear_context" => Some(SlashAction::ClearContext),
+        "act_clear_context" | "clear_context" => Some(SlashAction::ClearContext),
         "mcp" | "mc" => Some(SlashAction::Mcp),
-        "envs" | "env" => Some(SlashAction::Envs),
         "cli" => Some(SlashAction::Cli),
         "skill" | "sk" => Some(SlashAction::Skill),
         "ps" => Some(SlashAction::Ps),
+        "sidecar" => Some(SlashAction::Sidecar),
         "stop" => Some(SlashAction::Stop),
         "ap" => Some(SlashAction::Ap),
         _ => None,
@@ -214,6 +242,7 @@ pub fn parse(input: &str) -> Option<SlashAction> {
 fn dispatch(name: &str) -> Option<SlashAction> {
     match name {
         "/task" => Some(SlashAction::Task),
+        "/agent" => Some(SlashAction::Agent),
         "/fork" => Some(SlashAction::Fork),
         "/model" => Some(SlashAction::Model),
         "/config" => Some(SlashAction::Config),
@@ -222,13 +251,13 @@ fn dispatch(name: &str) -> Option<SlashAction> {
         "/plan" => Some(SlashAction::Plan),
         "/annotation" => Some(SlashAction::Annotation),
         "/notepad" => Some(SlashAction::Notepad),
-        "/act_clear_context" => Some(SlashAction::ClearContext),
+        "/act_clear_context" | "/clear_context" => Some(SlashAction::ClearContext),
         "/mcp" => Some(SlashAction::Mcp),
-        "/envs" => Some(SlashAction::Envs),
         "/cli" => Some(SlashAction::Cli),
         "/skill" => Some(SlashAction::Skill),
         "/ps" => Some(SlashAction::Ps),
         "/stop" => Some(SlashAction::Stop),
+        "/sidecar" => Some(SlashAction::Sidecar),
         "/ap" => Some(SlashAction::Ap),
         _ => None,
     }
@@ -236,7 +265,9 @@ fn dispatch(name: &str) -> Option<SlashAction> {
 
 /// Map a [`SlashAction`] to its canonical control-command string, or `None`
 /// for non-control actions. Used to queue a control command (Tab) or dispatch
-/// it immediately (Enter) without echoing it as user text.
+/// it immediately (Enter) without echoing it as user text. The legacy
+/// `/clear_context` spelling still parses as an alias of
+/// `/act_clear_context`.
 pub fn control_cmd_string(action: &SlashAction) -> Option<&'static str> {
     match action {
         SlashAction::Act => Some("/act"),
@@ -280,7 +311,7 @@ pub fn handle_command_key(menu: &mut Option<CommandMenu>, k: KeyEvent) -> (Comma
         }
         // A command token cannot contain spaces. Complete the highlighted
         // command before requirement text reaches the filter query, so
-        // natural compound input such as `/plan <requirement>` works.
+        // natural compound input such as `/plan <topic>` works.
         KeyCode::Char(' ') if k.modifiers.is_empty() => match m.selected_name() {
             Some(name) => {
                 let name = name.to_string();
@@ -401,382 +432,8 @@ pub fn render_command_popup(f: &mut Frame, area: Rect, composer_top: u16, menu: 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_known_commands() {
-        assert_eq!(parse("/config"), Some(SlashAction::Config));
-        assert_eq!(parse("/cfg"), Some(SlashAction::Config));
-        assert_eq!(parse("/task"), Some(SlashAction::Task));
-        assert_eq!(parse("/t"), Some(SlashAction::Task));
-        assert_eq!(parse("/compact"), Some(SlashAction::Compact));
-        assert_eq!(parse("/c"), Some(SlashAction::Compact));
-        assert_eq!(parse("/cli"), Some(SlashAction::Cli));
-        assert_eq!(parse("/mcp"), Some(SlashAction::Mcp));
-        assert_eq!(parse("/envs"), Some(SlashAction::Envs));
-        assert_eq!(parse("/skill"), Some(SlashAction::Skill));
-        assert_eq!(parse("/sk"), Some(SlashAction::Skill));
-        assert_eq!(parse("/"), Some(SlashAction::Task));
-        assert_eq!(parse("/unknown"), None);
-        assert_eq!(parse("hello"), None);
-        assert_eq!(parse(" /config "), Some(SlashAction::Config));
-    }
-
-    #[test]
-    fn menu_filters_by_query() {
-        let mut m = CommandMenu::new();
-        assert!(
-            m.visible_count() >= 3,
-            "all commands visible with empty query"
-        );
-        for c in "config".chars() {
-            m.on_char(c);
-        }
-        assert_eq!(m.visible_count(), 1, "only /config matches 'config'");
-        assert_eq!(m.selected_action(), Some(SlashAction::Config));
-    }
-
-    #[test]
-    fn menu_filters_compact() {
-        let mut m = CommandMenu::new();
-        for c in "compact".chars() {
-            m.on_char(c);
-        }
-        assert_eq!(m.visible_count(), 1, "only /compact matches 'compact'");
-        assert_eq!(m.selected_action(), Some(SlashAction::Compact));
-    }
-
-    #[test]
-    fn empty_query_defaults_to_task() {
-        let m = CommandMenu::new();
-        assert_eq!(
-            m.selected_action(),
-            Some(SlashAction::Task),
-            "first row is /task"
-        );
-    }
-
-    #[test]
-    fn paste_appends_to_query_and_refilters() {
-        let mut m = CommandMenu::new();
-        let all = m.visible_count();
-        assert!(m.query().is_empty());
-        m.paste("task");
-        assert_eq!(m.query(), "task");
-        assert!(m.visible_count() >= 1, "filter should still match 'task'");
-        assert!(
-            m.visible_count() < all,
-            "refilter should narrow the visible list"
-        );
-    }
-
-    #[test]
-    fn parse_control_commands() {
-        assert_eq!(parse("/act"), Some(SlashAction::Act));
-        assert_eq!(parse("/plan"), Some(SlashAction::Plan));
-        assert_eq!(parse("/act_clear_context"), Some(SlashAction::ClearContext));
-        assert_eq!(parse(" /plan "), Some(SlashAction::Plan));
-    }
-
-    #[test]
-    fn control_cmd_string_maps_correctly() {
-        assert_eq!(control_cmd_string(&SlashAction::Act), Some("/act"));
-        assert_eq!(control_cmd_string(&SlashAction::Plan), Some("/plan"));
-        assert_eq!(
-            control_cmd_string(&SlashAction::ClearContext),
-            Some("/act_clear_context")
-        );
-        assert_eq!(control_cmd_string(&SlashAction::Task), None);
-        assert_eq!(control_cmd_string(&SlashAction::Compact), None);
-        assert_eq!(control_cmd_string(&SlashAction::Ps), None);
-        assert_eq!(control_cmd_string(&SlashAction::Stop), None);
-    }
-
-    #[test]
-    fn tab_fills_input_with_command_name() {
-        let mut menu = Some(CommandMenu::new());
-        // Filter to /plan
-        for c in "plan".chars() {
-            if let Some(m) = menu.as_mut() {
-                m.on_char(c);
-            }
-        }
-        let (outcome, _quit) = handle_command_key(&mut menu, key(KeyCode::Tab, KeyModifiers::NONE));
-        match outcome {
-            CommandOutcome::FillInput(s) => assert_eq!(s, "/plan"),
-            other => panic!("expected FillInput, got {:?}", other),
-        }
-        assert!(menu.is_none(), "popup closed after Tab-fill");
-    }
-
-    #[test]
-    fn space_fills_selected_command_for_compound_input() {
-        let mut menu = Some(CommandMenu::new());
-        for c in "plan".chars() {
-            menu.as_mut().expect("menu open").on_char(c);
-        }
-
-        let (outcome, quit) =
-            handle_command_key(&mut menu, key(KeyCode::Char(' '), KeyModifiers::NONE));
-
-        assert!(!quit);
-        assert!(matches!(outcome, CommandOutcome::FillInput(ref s) if s == "/plan"));
-        assert!(menu.is_none(), "popup must close after Space-fill");
-    }
-
-    #[test]
-    fn space_with_no_matching_command_keeps_popup_open() {
-        let mut menu = Some(CommandMenu::new());
-        menu.as_mut().expect("menu open").paste("no-such-command");
-
-        let (outcome, quit) =
-            handle_command_key(&mut menu, key(KeyCode::Char(' '), KeyModifiers::NONE));
-
-        assert!(!quit);
-        assert!(matches!(outcome, CommandOutcome::Idle));
-        assert_eq!(
-            menu.as_ref().expect("popup stays open").query(),
-            "no-such-command"
-        );
-    }
-
-    #[test]
-    fn tab_on_non_control_command_fills_input() {
-        let mut menu = Some(CommandMenu::new());
-        // Filter to /task (non-control)
-        for c in "task".chars() {
-            if let Some(m) = menu.as_mut() {
-                m.on_char(c);
-            }
-        }
-        let (outcome, _quit) = handle_command_key(&mut menu, key(KeyCode::Tab, KeyModifiers::NONE));
-        match outcome {
-            CommandOutcome::FillInput(s) => assert_eq!(s, "/task"),
-            other => panic!("expected FillInput, got {:?}", other),
-        }
-        assert!(menu.is_none(), "popup closed after Tab-fill");
-    }
-
-    #[test]
-    fn enter_on_control_command_dispatches() {
-        let mut menu = Some(CommandMenu::new());
-        // Type "act" — matches /compact, /act, /act_clear_context.
-        for c in "act".chars() {
-            if let Some(m) = menu.as_mut() {
-                m.on_char(c);
-            }
-        }
-        // Move down to /act (index 1 after /compact).
-        if let Some(m) = menu.as_mut() {
-            m.move_down();
-        }
-        let (outcome, _quit) =
-            handle_command_key(&mut menu, key(KeyCode::Enter, KeyModifiers::NONE));
-        match outcome {
-            CommandOutcome::Dispatch(SlashAction::Act) => {}
-            other => panic!("expected Dispatch(Act), got {:?}", other),
-        }
-        assert!(menu.is_none(), "popup closed after Enter-dispatch");
-    }
-
-    #[test]
-    fn enter_on_clear_context_dispatches() {
-        let mut menu = Some(CommandMenu::new());
-        for c in "act_clear_context".chars() {
-            if let Some(m) = menu.as_mut() {
-                m.on_char(c);
-            }
-        }
-        let (outcome, _quit) =
-            handle_command_key(&mut menu, key(KeyCode::Enter, KeyModifiers::NONE));
-        match outcome {
-            CommandOutcome::Dispatch(SlashAction::ClearContext) => {}
-            other => panic!("expected Dispatch(ClearContext), got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_local_commands() {
-        assert_eq!(parse("/ps"), Some(SlashAction::Ps));
-        assert_eq!(parse("/stop"), Some(SlashAction::Stop));
-        assert_eq!(parse("/ap"), Some(SlashAction::Ap));
-        assert_eq!(parse(" /ps "), Some(SlashAction::Ps));
-        assert_eq!(parse(" /ap "), Some(SlashAction::Ap));
-    }
-
-    #[test]
-    fn enter_on_ps_dispatches() {
-        let mut menu = Some(CommandMenu::new());
-        for c in "ps".chars() {
-            if let Some(m) = menu.as_mut() {
-                m.on_char(c);
-            }
-        }
-        let (outcome, _quit) =
-            handle_command_key(&mut menu, key(KeyCode::Enter, KeyModifiers::NONE));
-        match outcome {
-            CommandOutcome::Dispatch(SlashAction::Ps) => {}
-            other => panic!("expected Dispatch(Ps), got {:?}", other),
-        }
-        assert!(menu.is_none(), "popup closed after Enter-dispatch");
-    }
-
-    #[test]
-    fn enter_on_stop_dispatches() {
-        let mut menu = Some(CommandMenu::new());
-        for c in "stop".chars() {
-            if let Some(m) = menu.as_mut() {
-                m.on_char(c);
-            }
-        }
-        let (outcome, _quit) =
-            handle_command_key(&mut menu, key(KeyCode::Enter, KeyModifiers::NONE));
-        match outcome {
-            CommandOutcome::Dispatch(SlashAction::Stop) => {}
-            other => panic!("expected Dispatch(Stop), got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn enter_on_ap_dispatches() {
-        let mut menu = Some(CommandMenu::new());
-        for c in "ap".chars() {
-            if let Some(m) = menu.as_mut() {
-                m.on_char(c);
-            }
-        }
-        // Query "ap" also matches "/config" (its description contains
-        // "api_key"), which sorts before "/ap" — move down once to it.
-        menu.as_mut().expect("menu open").move_down();
-        let (outcome, _quit) =
-            handle_command_key(&mut menu, key(KeyCode::Enter, KeyModifiers::NONE));
-        match outcome {
-            CommandOutcome::Dispatch(SlashAction::Ap) => {}
-            other => panic!("expected Dispatch(Ap), got {:?}", other),
-        }
-        assert!(menu.is_none(), "popup closed after Enter-dispatch");
-    }
-
-    #[test]
-    fn tab_on_local_command_fills_input() {
-        let mut menu = Some(CommandMenu::new());
-        for c in "ps".chars() {
-            if let Some(m) = menu.as_mut() {
-                m.on_char(c);
-            }
-        }
-        let (outcome, _quit) = handle_command_key(&mut menu, key(KeyCode::Tab, KeyModifiers::NONE));
-        match outcome {
-            CommandOutcome::FillInput(s) => assert_eq!(s, "/ps"),
-            other => panic!("expected FillInput, got {:?}", other),
-        }
-        assert!(menu.is_none(), "popup closed after Tab-fill");
-    }
-
-    #[test]
-    fn parse_fork() {
-        assert_eq!(parse("/fork"), Some(SlashAction::Fork));
-        assert_eq!(parse("/fk"), Some(SlashAction::Fork)); // alias
-        assert_eq!(parse("fork"), None); // bare name (no slash) -> None
-        assert_eq!(parse(" /fork "), Some(SlashAction::Fork)); // trimmed
-    }
-
-    #[test]
-    fn dispatch_fork() {
-        assert_eq!(dispatch("/fork"), Some(SlashAction::Fork));
-        assert_eq!(dispatch("/fk"), None); // alias resolved by parse, not dispatch
-    }
-
-    #[test]
-    fn enter_on_fork_dispatches() {
-        let mut menu = Some(CommandMenu::new());
-        for c in "fork".chars() {
-            if let Some(m) = menu.as_mut() {
-                m.on_char(c);
-            }
-        }
-        let (outcome, _quit) =
-            handle_command_key(&mut menu, key(KeyCode::Enter, KeyModifiers::NONE));
-        match outcome {
-            CommandOutcome::Dispatch(SlashAction::Fork) => {}
-            other => panic!("expected Dispatch(Fork), got {:?}", other),
-        }
-        assert!(menu.is_none(), "popup closed after Enter-dispatch");
-    }
-
-    #[test]
-    fn short_key_command_removed() {
-        assert_eq!(parse("/short_key"), None);
-        // `/sk` is now the alias of `/skill` (default-injection toggles).
-        assert_eq!(parse("/sk"), Some(SlashAction::Skill));
-        assert_eq!(parse("short_key"), None);
-        assert_eq!(dispatch("/short_key"), None);
-    }
-
-    #[test]
-    fn parse_annotation_full() {
-        assert_eq!(parse("/annotation"), Some(SlashAction::Annotation));
-    }
-
-    #[test]
-    fn parse_annotation_alias() {
-        assert_eq!(parse("/ann"), Some(SlashAction::Annotation));
-    }
-
-    #[test]
-    fn dispatch_annotation() {
-        assert_eq!(dispatch("/annotation"), Some(SlashAction::Annotation));
-    }
-
-    #[test]
-    fn parse_notepad_full() {
-        assert_eq!(parse("/notepad"), Some(SlashAction::Notepad));
-    }
-
-    #[test]
-    fn parse_notepad_alias() {
-        assert_eq!(parse("/note"), Some(SlashAction::Notepad));
-    }
-
-    #[test]
-    fn dispatch_notepad() {
-        assert_eq!(dispatch("/notepad"), Some(SlashAction::Notepad));
-    }
-
-    #[test]
-    fn parse_mcp_full() {
-        assert_eq!(parse("/mcp"), Some(SlashAction::Mcp));
-    }
-
-    #[test]
-    fn parse_mcp_alias() {
-        assert_eq!(parse("/mc"), Some(SlashAction::Mcp));
-    }
-
-    #[test]
-    fn parse_model_and_alias() {
-        assert_eq!(parse("/model"), Some(SlashAction::Model));
-        assert_eq!(parse("/mdl"), Some(SlashAction::Model));
-    }
-
-    #[test]
-    fn dispatch_mcp() {
-        assert_eq!(dispatch("/mcp"), Some(SlashAction::Mcp));
-    }
-
-    #[test]
-    fn parse_envs_full_and_alias() {
-        assert_eq!(parse("/envs"), Some(SlashAction::Envs));
-        assert_eq!(parse("/env"), Some(SlashAction::Envs));
-    }
-
-    #[test]
-    fn dispatch_envs() {
-        assert_eq!(dispatch("/envs"), Some(SlashAction::Envs));
-    }
-
-    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, mods)
-    }
-}
+#[path = "command/catalog_tests.rs"]
+mod catalog_tests;
+#[cfg(test)]
+#[path = "command/key_tests.rs"]
+mod key_tests;

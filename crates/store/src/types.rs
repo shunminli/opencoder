@@ -5,14 +5,25 @@ use serde::{Deserialize, Serialize};
 pub const TASK_TYPE_PARENT: &str = "parent";
 /// Child session spawned by a `task` subagent invocation.
 pub const TASK_TYPE_SUBAGENT: &str = "subagent";
+/// Session created for an Agent step inside a DAG. It is an execution detail,
+/// not a top-level chat conversation.
+pub const TASK_TYPE_AGENT_STEP: &str = "agent_step";
 /// Internal parent session used by the todos workflow scheduler.
 pub const TASK_TYPE_TODO_WORKFLOW: &str = "todo_workflow";
 /// Full primary session assigned to one focused TODO.
 pub const TASK_TYPE_TODO: &str = "todo";
+/// Primary session assigned to a project-module todo run.
+pub const TASK_TYPE_PROJECT: &str = "project";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub id: String,
+    /// Lane tag for execution-owned sessions (`"operator"`, `"agent"`,
+    /// `"dag"`, `"team"`, ...). `None` for interactive/TUI sessions and rows
+    /// created before tagging existed. Store-level list filters use it to
+    /// keep operator sessions out of the default lanes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,19 +66,6 @@ pub struct SessionMeta {
     /// slash command so it survives session resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requirement: Option<String>,
-    /// Pre-compaction snapshot of the finalized plan text for plan-mode
-    /// sessions. Captured by compaction before the plan assistant message
-    /// can be folded into the summary head, so a later plan->act handoff
-    /// still finds the plan even when it slid out of the retained tail.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_snapshot: Option<String>,
-    /// Number of user prompts recorded in the current plan phase (since the
-    /// last handoff or re-entry into plan mode). Persisted so a resumed
-    /// session can re-arm plan-phase affordances (TUI Shift+Tab handoff,
-    /// /act_clear_context plan-provenance gate) that were previously lost
-    /// on restart.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub plan_input_count: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,28 +129,10 @@ pub struct SessionPatch {
     /// an explicit empty annotation save can be distinguished from no-op.
     #[serde(default, skip_serializing_if = "is_false")]
     pub clear_requirement: bool,
-    /// Mirrors the in-memory plan snapshot onto the sessions row. Compaction
-    /// writes it while the plan text is still extractable; see
-    /// `SessionMeta::plan_snapshot`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_snapshot: Option<String>,
-    /// When true, sets `plan_snapshot` to NULL (consumed by a plan->act
-    /// handoff or reset by plan-phase re-entry). Mutually exclusive with the
-    /// `plan_snapshot` value.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub clear_plan_snapshot: bool,
-    /// Persists the plan-phase input counter; see
-    /// `SessionMeta::plan_input_count`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_input_count: Option<i64>,
 }
 
 fn is_false(b: &bool) -> bool {
     !b
-}
-
-fn is_zero(v: &i64) -> bool {
-    *v == 0
 }
 
 impl SessionPatch {
@@ -195,6 +175,10 @@ pub struct SessionFilter {
     pub workdir_hash: Option<String>,
     pub search: Option<String>,
     pub include_subagents: bool,
+    /// Exact-match lane filter. When unset, rows tagged `operator` are
+    /// excluded from every list lane (they are execution detail, never
+    /// chat history); pass `Some("operator")` to inspect them.
+    pub kind: Option<String>,
 }
 
 impl Default for SessionFilter {
@@ -205,6 +189,7 @@ impl Default for SessionFilter {
             workdir_hash: None,
             search: None,
             include_subagents: false,
+            kind: None,
         }
     }
 }
@@ -212,6 +197,9 @@ impl Default for SessionFilter {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionListItem {
     pub id: String,
+    /// Lane tag written at session creation (`SessionMeta.kind`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub title: Option<String>,
     pub agent: Option<String>,
     /// The session's active skill **body** (full instruction text), when one
@@ -223,15 +211,6 @@ pub struct SessionListItem {
     pub created_at: i64,
     pub updated_at: i64,
     pub preview: String,
-    /// Number of subagent tasks still in-flight (`Running`) for this session,
-    /// derived from `subagent_tasks` at list time. `0` when none.
-    #[serde(default)]
-    pub subagent_running: usize,
-    /// Number of subagent tasks interrupted (`Cancelled`, pending replay on the
-    /// next user turn), derived from `subagent_tasks` at list time. `0` when
-    /// none.
-    #[serde(default)]
-    pub subagent_cancelled: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +263,34 @@ pub struct SessionInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted_seq: Option<i64>,
 }
+
+/// Result of admitting an input under a caller-supplied idempotency key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputAdmission {
+    /// Stable database row sequence. Retries return the original value.
+    pub seq: i64,
+    /// True only for the call that created the durable row.
+    pub inserted: bool,
+}
+
+/// A reused input id whose semantic prompt payload differs from the original.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputConflict {
+    pub session_id: String,
+    pub input_id: String,
+}
+
+impl std::fmt::Display for InputConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "input id {:?} already exists for session {:?} with a different payload",
+            self.input_id, self.session_id
+        )
+    }
+}
+
+impl std::error::Error for InputConflict {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -416,6 +423,10 @@ pub struct NodeRecord {
     /// the latest work); see `node_tasks.id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_task_id: Option<String>,
+    /// Last observed address: the client-declared value, else the TCP source
+    /// IP captured at registration. None only for pre-migration rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_addr: Option<String>,
 }
 
 /// Lifecycle status of a dispatched node task.
@@ -498,6 +509,15 @@ pub struct NodeTaskRecord {
     pub finished_at: Option<i64>,
 }
 
+/// Result of a node-dialog bulk clear ([`crate::Store::clear_node_dialogs`]):
+/// `removed` counts deleted session rows; `skipped` lists the session ids
+/// kept because their node task was still pending/running/cancelling.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ClearNodeDialogs {
+    pub removed: u64,
+    pub skipped: Vec<String>,
+}
+
 pub fn message_preview(msgs: &[Message], max_chars: usize) -> String {
     let mut out = String::new();
     for m in msgs {
@@ -512,4 +532,112 @@ pub fn message_preview(msgs: &[Message], max_chars: usize) -> String {
         break;
     }
     out
+}
+
+/// Raw persisted message row — the read model of the P3 node message relay.
+///
+/// Unlike [`Message`] this keeps the per-session `seq` (the resume/compaction
+/// boundary unit) and the blocks as an already-parsed raw JSON value, so a
+/// relay can forward exactly what the worker stored without re-interpreting
+/// block kinds. Produced by `Store::load_message_rows`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageRow {
+    /// Persisted per-session sequence number (`messages.seq`).
+    pub seq: i64,
+    /// Stored role literal: `system | user | assistant | tool`.
+    pub role: String,
+    /// Raw stored `blocks_json`, parsed as a JSON value (array of blocks).
+    pub blocks: serde_json::Value,
+    /// Emitter clock (epoch ms) persisted with the row.
+    pub created_at: i64,
+}
+
+/// Bounded raw slice of one persisted `blocks_json` value. The slice is taken
+/// in SQL before libsql materializes it, so legacy oversized rows stay bounded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageChunkRecord {
+    pub seq: i64,
+    pub role: String,
+    pub created_at: i64,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageChunkPage {
+    pub chunks: Vec<MessageChunkRecord>,
+    pub next_cursor: Option<opencoder_core::fleet::MessageCursor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionEventPage {
+    pub events: Vec<SessionEventRecord>,
+    pub more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadChunkRecord {
+    pub total_bytes: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// Persisted DAG definition (`dag_defs`): the spec under its stable id.
+/// `spec.name` is unique — upsert replaces the row with the same name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagDefRecord {
+    pub id: String,
+    pub name: String,
+    /// Raw spec JSON (`spec_json`) — parsed lazily by readers.
+    pub spec_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One dispatched workflow run (`dag_runs`). The `spec_json` SNAPSHOT is
+/// copied at dispatch time so later def edits never mutate an in-flight
+/// run. `node_id` is `None` while queued for "any node" and set at claim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagRunRecord {
+    pub id: String,
+    pub dag_id: String,
+    /// Display name captured from the spec snapshot at dispatch.
+    pub name: String,
+    pub spec_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    pub status: opencoder_dag::DagRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+}
+
+/// One node-uploaded DAG event (`dag_events`, append-only). The browser UI's
+/// step state is a pure projection of this stream; the server keeps NO
+/// per-step scheduling state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DagEventRecord {
+    /// Row seq — the SSE `Last-Event-ID` replay cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+    pub run_id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    pub at_ms: i64,
+}
+
+/// One lost-node-converged DAG run plus the seq of its synthetic terminal
+/// `run_finished` event — appended in the SAME transaction as the status
+/// flip, so a terminal run can never be left without its final frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvergedDagRun {
+    pub record: DagRunRecord,
+    pub run_finished_seq: i64,
 }

@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use opencoder_core::{resolve_agent, Config};
@@ -21,6 +22,9 @@ use crate::TuiOpts;
 /// Entry point: load config, resume or create a session, enter the terminal,
 /// then drive the event loop via `super::run_app`.
 pub(super) async fn run(opts: &TuiOpts) -> Result<()> {
+    crate::boot_clock::mark();
+    let t_total = Instant::now();
+    let t_config_client = Instant::now();
     let workdir = opts
         .workdir
         .clone()
@@ -30,52 +34,105 @@ pub(super) async fn run(opts: &TuiOpts) -> Result<()> {
     if let Some(m) = &opts.model {
         config.model = m.clone();
     }
+    let store: Arc<dyn Store> = open_store(&workdir).await?;
+    let stored = if let Some(id) = &opts.session {
+        let effective_id = match store.get_subagent_task(id).await? {
+            Some(task) if store.get_session(id).await?.is_none() => task.parent_session_id,
+            _ => id.clone(),
+        };
+        let runtime = store.harness_runtime(&effective_id).await?;
+        if runtime.is_none() && store.last_message_seq(&effective_id).await? > 0 {
+            Some(opencoder_core::harness::HarnessRuntime::default())
+        } else {
+            runtime
+        }
+    } else {
+        None
+    };
+    if stored
+        .as_ref()
+        .is_some_and(|runtime| runtime.remote.is_some())
+    {
+        anyhow::ensure!(
+            config.opencoder_server.enabled,
+            "This is a remote task; enable opencoder_server.enabled to resume it"
+        );
+    }
+    let harness = if let Some(runtime) = &stored {
+        anyhow::ensure!(
+            runtime.remote.is_some() || opts.harness.is_none_or(|h| h == runtime.harness),
+            "harness is fixed when the session starts"
+        );
+        runtime.harness
+    } else {
+        opts.harness.unwrap_or_else(|| {
+            opencoder_core::harness::agent_harness(&crate::fresh_agent_name(opts, &config))
+        })
+    };
     let (config, client, active_terminal): (Config, Arc<dyn ChatStream>, Option<ActiveTerminal>) =
-        match crate::onboarding::build_ready_client(&config) {
-            Ok(concrete_client) => (config, Arc::new(concrete_client), None),
-            // The wizard can fix endpoint/credential problems: run it as before.
-            Err(crate::onboarding::StartupFailure::Credentials(startup_error)) => {
-                let mut terminal = ActiveTerminal::enter()?;
-                match crate::onboarding::run(
-                    &mut terminal.terminal,
-                    &workdir,
-                    opts.model.as_deref(),
-                    config,
-                    startup_error,
-                )
-                .await?
-                {
-                    crate::onboarding::OnboardingOutcome::Ready { config, client } => {
-                        (*config, Arc::new(client), Some(terminal))
+        if harness == opencoder_core::harness::Harness::Codex || config.opencoder_server.enabled {
+            let client = opencoder_session::harness::configured_client(config.clone());
+            (config, client, None)
+        } else {
+            match crate::onboarding::build_ready_client(&config) {
+                Ok(concrete_client) => (config, Arc::new(concrete_client), None),
+                // The wizard can fix endpoint/credential problems: run it as before.
+                Err(crate::onboarding::StartupFailure::Credentials(startup_error)) => {
+                    let mut terminal = ActiveTerminal::enter()?;
+                    match crate::onboarding::run(
+                        &mut terminal.terminal,
+                        &workdir,
+                        opts.model.as_deref(),
+                        config,
+                        startup_error,
+                    )
+                    .await?
+                    {
+                        crate::onboarding::OnboardingOutcome::Ready { config, client } => {
+                            (*config, Arc::new(client), Some(terminal))
+                        }
+                        crate::onboarding::OnboardingOutcome::Exit => return Ok(()),
                     }
-                    crate::onboarding::OnboardingOutcome::Exit => return Ok(()),
+                }
+                // Unbuildable (invalid proxy env/header/base_url scheme) cannot be
+                // fixed from the wizard — entering it would loop Save-fail forever.
+                // Enter the app instead with a stub client that fails every turn
+                // with this reason, so the user sees the root cause per turn.
+                Err(crate::onboarding::StartupFailure::Unbuildable(error)) => {
+                    let reason = format!("{error:#}");
+                    tracing::warn!(
+                        reason = %reason,
+                        "model client unbuildable; entering the UI with turn-level errors"
+                    );
+                    (
+                        config,
+                        Arc::new(crate::onboarding::UnbuildableClient { reason }),
+                        None,
+                    )
                 }
             }
-            // Unbuildable (invalid proxy env/header/base_url scheme) cannot be
-            // fixed from the wizard — entering it would loop Save-fail forever.
-            // Enter the app instead with a stub client that fails every turn
-            // with this reason, so the user sees the root cause per turn.
-            Err(crate::onboarding::StartupFailure::Unbuildable(error)) => {
-                let reason = format!("{error:#}");
-                tracing::warn!(
-                    reason = %reason,
-                    "model client unbuildable; entering the UI with turn-level errors"
-                );
-                (
-                    config,
-                    Arc::new(crate::onboarding::UnbuildableClient { reason }),
-                    None,
-                )
-            }
         };
+    let config_client_ms = t_config_client.elapsed().as_millis() as u64;
 
-    let store: Arc<dyn Store> = open_store(&workdir).await?;
+    let t_store = Instant::now();
+    let store_ms = t_store.elapsed().as_millis() as u64;
+
     // Mirror ts-owned sessions into the central ts registry (`<data_root>/ts.db`)
     // when one exists; a pure tui/run with no ts usage is unaffected.
+    let t_mirror = Instant::now();
     let store: Arc<dyn Store> = crate::ts_mirror::maybe_wrap(store, &workdir).await;
+    let mirror_ms = t_mirror.elapsed().as_millis() as u64;
 
     // Resume an existing session if --session was given, otherwise start fresh.
-    let mut session = if let Some(id) = &opts.session {
+    let t_session = Instant::now();
+    let remote_session = if let Some(id) = &opts.session {
+        crate::remote::load(id, config.clone(), client.clone(), store.clone(), &workdir).await?
+    } else {
+        None
+    };
+    let mut session = if let Some(remote) = remote_session {
+        remote
+    } else if let Some(id) = &opts.session {
         let existing = store.get_session(id).await?;
         // If not found as a session, try as a subagent task_id to resolve
         // the parent session.
@@ -88,7 +145,9 @@ pub(super) async fn run(opts: &TuiOpts) -> Result<()> {
             // Unknown id — this is the tmux launch path where `ts_start`
             // allocated an id but deliberately did NOT seed a session row.
             // Create a fresh session that persists lazily on first record.
-            let agent_name = config.agent.default.clone();
+            // Fresh-session agent choice: --agent > active file-agent marker
+            // > config default (headless run-path parity).
+            let agent_name = crate::fresh_agent_name(opts, &config);
             let agent = resolve_agent(&agent_name)
                 .or_else(|| resolve_agent("act"))
                 .context("agent")?;
@@ -118,7 +177,9 @@ pub(super) async fn run(opts: &TuiOpts) -> Result<()> {
             .await?
         }
     } else {
-        let agent_name = config.agent.default.clone();
+        // Fresh-session agent choice: --agent > active file-agent marker
+        // > config default (headless run-path parity).
+        let agent_name = crate::fresh_agent_name(opts, &config);
         let agent = resolve_agent(&agent_name)
             .or_else(|| resolve_agent("act"))
             .context("agent")?;
@@ -131,10 +192,38 @@ pub(super) async fn run(opts: &TuiOpts) -> Result<()> {
         )
         .with_store(store.clone())
     };
+    session.harness.literal_mentions = true;
+    if stored.is_some() && session.harness.remote.is_none() {
+        anyhow::ensure!(
+            opencoder_core::harness::matches_requested_env(&session.harness, &opts.envs),
+            "environment is fixed when the session starts"
+        );
+        anyhow::ensure!(
+            opts.model.is_none()
+                || harness != opencoder_core::harness::Harness::Codex
+                || opts.model == session.harness.model,
+            "Codex model is fixed when the session starts"
+        );
+    } else if stored.is_none() && session.messages.is_empty() {
+        session.harness = opencoder_core::harness::fresh_runtime(
+            harness,
+            Some(harness),
+            opts.envs.clone(),
+            opts.model.clone(),
+        );
+    }
+    let session_ms = t_session.elapsed().as_millis() as u64;
 
     // Explicit --model wins over a resumed session's stored model and is
     // re-persisted so later resumes honor it (headless run-path parity).
-    if let Some(m) = reapply_session_model(&mut session, &opts.model) {
+    let local = session.harness.remote.is_none();
+    if let Some(m) = reapply_session_model(
+        &mut session,
+        &opts
+            .model
+            .clone()
+            .filter(|_| harness == opencoder_core::harness::Harness::Opencoder && local),
+    ) {
         persist_session_model(store.as_ref(), &session.id, m).await;
     }
 
@@ -149,12 +238,44 @@ pub(super) async fn run(opts: &TuiOpts) -> Result<()> {
     // the old "cleanup only ran on the happy path" trap that bricked the
     // terminal on any panic, leaving the user with a frozen last frame, no
     // echo, and ineffective Ctrl+C/D.
+    let t_terminal = Instant::now();
     let mut active_terminal = match active_terminal {
         Some(terminal) => terminal,
         None => ActiveTerminal::enter()?,
     };
+    let terminal_ms = t_terminal.elapsed().as_millis() as u64;
+
+    let stages = [
+        ("config_client", config_client_ms),
+        ("store", store_ms),
+        ("mirror", mirror_ms),
+        ("session", session_ms),
+        ("terminal", terminal_ms),
+    ];
+    tracing::info!(
+        config_client_ms,
+        store_ms,
+        mirror_ms,
+        session_ms,
+        terminal_ms,
+        total_ms = t_total.elapsed().as_millis() as u64,
+        "tui bootstrap stages"
+    );
+    if let Some((stage, ms)) = stages
+        .iter()
+        .copied()
+        .max_by_key(|s| s.1)
+        .filter(|s| s.1 > 1000)
+    {
+        tracing::warn!(
+            slowest_stage = stage,
+            slowest_ms = ms,
+            "slow tui bootstrap stage"
+        );
+    }
 
     let result = super::run_app(
+        opts,
         &mut active_terminal.terminal,
         session,
         store,

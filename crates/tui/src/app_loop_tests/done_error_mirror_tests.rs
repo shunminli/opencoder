@@ -4,6 +4,8 @@
 
 use super::*;
 
+use opencoder_store::LibsqlStore;
+
 // ----- Done/Error queue_items mirror semantics -----
 //
 // Both `Done` and `Error` in `fold_ui_events` re-sync the queue AND steer
@@ -82,6 +84,7 @@ async fn fold_error_resyncs_mirrors_from_store() {
         &store,
         "test-session",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -145,6 +148,7 @@ async fn fold_done_clears_queue_items() {
         &store,
         "test-session",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -203,6 +207,7 @@ async fn fold_queue_consumed_echoes_marker_and_drops_entry() {
         &store,
         "test-session",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -268,6 +273,7 @@ async fn fold_queue_consumed_unknown_seq_is_noop() {
         &store,
         "test-session",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -315,6 +321,7 @@ async fn fold_error_when_cancelled_preserves_queue_items() {
         &store,
         "test-session",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -341,4 +348,198 @@ async fn fold_error_when_cancelled_preserves_queue_items() {
         "queue_items must be untouched for a stale (cancelled) Error event"
     );
     assert_eq!(queue_items[0].0, 30);
+}
+
+/// A bare control command consumed from the queue echoes NOTHING: empty event
+/// text plus a raw mirror row must not resurrect the command as a user block
+/// (the mirror entry is still dropped by seq). Legacy raw event text
+/// normalizes to the compound tail.
+#[tokio::test]
+async fn fold_queue_consumed_bare_control_command_echoes_nothing() {
+    let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
+    let mut chat = ChatView::default();
+    let mut queue_items: Vec<(i64, String)> = vec![(30, "/plan".into())];
+    let mut running = true;
+    let mut cancelled = false;
+    let mut drain_pending = false;
+    let mut skip_next_render = false;
+    let mut follow = true;
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<UiCmd>(64);
+    let mut cancel = CancellationToken::new();
+    let (_evt_tx, mut evt_rx) = mpsc::channel::<UiEvent>(64);
+    let mut notepad: Option<crate::notepad::NotepadView> = None;
+
+    let _flow = fold_ui_events(
+        Some(UiEvent::Session(SessionEvent::QueueConsumed {
+            seq: 30,
+            text: String::new(),
+        })),
+        &mut chat,
+        &store,
+        "test-session",
+        &mut queue_items,
+        &mut false,
+        &mut crate::queue_admitter::AdmitUiState::default(),
+        &mut running,
+        &mut cancelled,
+        &mut drain_pending,
+        &mut skip_next_render,
+        &mut follow,
+        &cmd_tx,
+        &mut cancel,
+        &mut evt_rx,
+        &mut notepad,
+        &mut None,
+        &opencoder_session::QuestionHub::new(),
+    )
+    .await;
+
+    assert!(
+        queue_items.is_empty(),
+        "the consumed entry is dropped by seq regardless of echo"
+    );
+    assert!(
+        !crate::chat::block_text(&chat).contains("User:"),
+        "a bare control command must not echo a user block"
+    );
+
+    // Legacy persisted event carrying the raw compound prefix: the display
+    // layer normalizes to the tail — the command token never shows.
+    let mut queue_items: Vec<(i64, String)> = vec![(31, "/plan review".into())];
+    let _flow = fold_ui_events(
+        Some(UiEvent::Session(SessionEvent::QueueConsumed {
+            seq: 31,
+            text: "/plan review".into(),
+        })),
+        &mut chat,
+        &store,
+        "test-session",
+        &mut queue_items,
+        &mut false,
+        &mut crate::queue_admitter::AdmitUiState::default(),
+        &mut running,
+        &mut cancelled,
+        &mut drain_pending,
+        &mut skip_next_render,
+        &mut follow,
+        &cmd_tx,
+        &mut cancel,
+        &mut evt_rx,
+        &mut notepad,
+        &mut None,
+        &opencoder_session::QuestionHub::new(),
+    )
+    .await;
+
+    let text = crate::chat::block_text(&chat);
+    assert!(text.contains("review"), "compound tail echoed: {text}");
+    assert!(!text.contains("/plan"), "token suppressed: {text}");
+}
+
+/// The QueueConsumed echo re-anchors the live ladder floor below the echo
+/// (app-layer half of the Turn contract): the queued turn's `N Steps` group
+/// must render AFTER its own prompt echo — `begin_turn` ran at the drain
+/// restart before the echo landed, so without the re-anchor the group would
+/// be inserted at the stale floor ABOVE the echo (and, before that fix,
+/// post-boundary rounds merged into the previous turn's ladder).
+#[tokio::test]
+async fn fold_queue_consumed_reanchors_ladder_below_echo() {
+    let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
+    let mut chat = ChatView::default();
+    // A settled previous turn with its own ladder, so a stale floor would
+    // find and merge into it.
+    chat.blocks.push(crate::chat::ChatBlock::User {
+        rendered: crate::markdown::render("first prompt"),
+    });
+    chat.begin_turn();
+    chat.apply(&SessionEvent::ToolStart {
+        id: "c1".into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": "echo x"}),
+    });
+    chat.apply(&SessionEvent::ToolEnd {
+        id: "c1".into(),
+        name: "bash".into(),
+        output: "o1".into(),
+        is_error: false,
+        images: Vec::new(),
+    });
+    chat.apply(&SessionEvent::Done);
+
+    // Drain restart at TurnDone: begin_turn sets the floor BEFORE the echo.
+    chat.begin_turn();
+    let floor_before = chat.turn_block_start;
+
+    let mut queue_items: Vec<(i64, String)> = vec![(30, "queued prompt X".into())];
+    let mut running = true;
+    let mut cancelled = false;
+    let mut drain_pending = false;
+    let mut skip_next_render = false;
+    let mut follow = true;
+    let (cmd_tx, _cmd_rx) = mpsc::channel::<UiCmd>(64);
+    let mut cancel = CancellationToken::new();
+    let (_evt_tx, mut evt_rx) = mpsc::channel::<UiEvent>(64);
+    let mut notepad: Option<crate::notepad::NotepadView> = None;
+    let _flow = fold_ui_events(
+        Some(UiEvent::Session(SessionEvent::QueueConsumed {
+            seq: 30,
+            text: "queued prompt X".into(),
+        })),
+        &mut chat,
+        &store,
+        "test-session",
+        &mut queue_items,
+        &mut false,
+        &mut crate::queue_admitter::AdmitUiState::default(),
+        &mut running,
+        &mut cancelled,
+        &mut drain_pending,
+        &mut skip_next_render,
+        &mut follow,
+        &cmd_tx,
+        &mut cancel,
+        &mut evt_rx,
+        &mut notepad,
+        &mut None,
+        &opencoder_session::QuestionHub::new(),
+    )
+    .await;
+
+    // The echo lands AT the stale floor position (blocks were exactly
+    // floor_before long when begin_turn ran).
+    let echo_idx = chat
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| *i >= floor_before && matches!(b, crate::chat::ChatBlock::User { .. }))
+        .map(|(i, _)| i)
+        .next()
+        .expect("echo landed at/after the stale floor");
+    assert!(
+        chat.turn_block_start > echo_idx,
+        "floor must move below the echo (got {} vs echo {})",
+        chat.turn_block_start,
+        echo_idx
+    );
+
+    // The queued turn's first tool round lands BELOW the echo.
+    chat.apply(&SessionEvent::ToolStart {
+        id: "c2".into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": "echo y"}),
+    });
+    let group_positions: Vec<usize> = chat
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| match b {
+            crate::chat::ChatBlock::StepGroup { .. } => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(group_positions.len(), 2, "queued turn owns a new ladder");
+    assert!(
+        group_positions[1] > echo_idx,
+        "queued ladder must render below its prompt echo"
+    );
 }

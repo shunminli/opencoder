@@ -59,8 +59,7 @@ fn session_meta(id: &str, agent: &str) -> SessionMeta {
         skill: None,
         task_type: None,
         requirement: None,
-        plan_snapshot: None,
-        plan_input_count: 0,
+        kind: None,
     }
 }
 
@@ -459,6 +458,8 @@ async fn resume_does_not_inject_when_tool_result_already_present() {
         .await
         .unwrap();
     let mut tool_msg = Message {
+        provider_state: None,
+        display: None,
         id: "t1".into(),
         role: Role::Tool,
         blocks: vec![ContentBlock::ToolResult {

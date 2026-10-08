@@ -1,40 +1,105 @@
 pub mod api;
-pub mod api_envs;
+pub mod api_agent_nfs;
+pub mod api_agent_resources;
+pub mod api_agents;
+pub mod api_brain;
+pub mod api_control;
+pub mod api_dag;
+pub mod api_dag_binaries;
+pub mod api_dag_binaries_nfs;
+pub mod api_dag_workspace_nfs;
 pub mod api_events;
 pub mod api_inputs;
 pub mod api_meta;
 pub mod api_nodes;
+pub mod api_nodes_dag;
 pub mod api_nodes_ops;
 pub mod api_ops;
+pub mod api_project;
+pub mod api_project_initiatives;
+pub mod api_project_runs;
+pub mod api_project_tags;
+pub mod api_project_todos;
+pub mod api_project_util;
 pub mod api_questions;
 pub mod api_subagents;
-pub mod auth;
+pub mod api_teams;
+pub mod api_teams_topics;
+pub mod api_todo_directory;
+pub mod api_todo_envs;
+pub mod api_todo_runs;
+pub mod api_todo_template_versions;
+pub mod api_todo_templates;
+pub mod api_todo_util;
+pub mod api_transcript;
+pub mod auth_mw;
 pub mod cmd;
+pub mod control_state;
+pub mod dag_state;
 pub mod handle;
 mod handle_lifecycle;
 mod handle_questions;
 pub mod html;
+pub mod nfs_exports;
 pub mod nodes_state;
+pub mod sse_dag;
 pub mod sse_dedup;
 pub mod sse_nodes;
+pub mod team_hub;
+pub mod team_state;
+pub mod todo_hub;
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use opencoder_store::{LibsqlStore, Store};
 
+use crate::control_state::ControlHub;
 use crate::handle::HandleMap;
 use crate::nodes_state::NodeHub;
+use crate::team_state::TeamWebState;
+
+pub use opencoder_project::ProjectService;
 
 pub struct AppState {
     pub store: Arc<dyn Store>,
     pub workdir: std::path::PathBuf,
+    /// Per-execution config home redirect (operator isolation): sessions
+    /// belonging to an operator execution reload their config from this
+    /// frozen snapshot instead of the daemon user's live `~/.opencoder`.
+    /// `None` = default discovery (TUI, web frontend, non-operator kinds).
+    pub config_home: Option<std::path::PathBuf>,
     pub handles: HandleMap,
     /// Broadcast hub for node-task sessions (they own no drain handle).
     pub nodes: Arc<NodeHub>,
+    /// P3 message-relay control hub: per-node FIFO of control tasks plus the
+    /// pending browser waiters they must wake. Payloads are never persisted.
+    pub controls: Arc<ControlHub>,
+    /// Project module runtime (goals → milestones → todos → plan/execute
+    /// runs). `new()` is dependency-free so every AppState construction site
+    /// stays cheap; `serve` (and integration tests) inject the real deps via
+    /// `init` — until then every /api/project route answers 503.
+    pub project: Arc<ProjectService>,
+    /// Project brain (capability library) runtime: embedding-backed CRUD +
+    /// semantic search over the same `store`. Wired to the primary provider
+    /// endpoint in `serve`, degraded (bail-only client) when config fails.
+    /// Multi-agent team-discussion runtime state: resolved team run config
+    /// (team_root + turn bounds), the node dispatcher prompts fan out
+    /// through, and the hub of live topic-runtime tasks.
+    pub team: Arc<TeamWebState>,
+    pub brain: opencoder_brain::Runtime,
     pub client_override: Option<Arc<dyn opencoder_llm::ChatStream>>,
+}
+
+impl AppState {
+    pub async fn reload_agents(&self) {
+        let ids: Vec<String> = self.handles.lock().await.keys().cloned().collect();
+        for id in ids {
+            handle::send_cmd(&self.handles, &id, cmd::DrainCmd::ReloadConfig).await;
+        }
+    }
 }
 
 pub async fn serve(
@@ -46,15 +111,78 @@ pub async fn serve(
 ) -> Result<()> {
     let data_dir = data_dir_for(&workdir);
     tokio::fs::create_dir_all(&data_dir).await.ok();
-    let store: Arc<dyn Store> = Arc::new(LibsqlStore::open(data_dir.join("opencoder.db")).await?);
+    // Project and session operations share one libsql connection and lock.
+    let libsql = Arc::new(LibsqlStore::open(data_dir.join("opencoder.db")).await?);
+    let store: Arc<dyn Store> = libsql.clone();
 
+    // Brain (capability library) rides the dedicated embedding endpoint when
+    // `embedding_provider` is configured (local embedding server), else the
+    // primary provider's — the exact Config::load → resolve_embedding_endpoint
+    // → ChatClient chain the
+    // `DrainCmd::ReloadConfig` branch in `handle.rs` uses (proxy, headers and
+    // read-timeout included). Any failure degrades to a bail-only client so
+    // serve() still boots and brain routes answer a clear 502. Built BEFORE
+    // the project service: brain todos resolve their executor through it.
+    let brain = match opencoder_core::Config::load(&workdir) {
+        Ok(cfg) => match cfg.resolve_embedding_endpoint() {
+            Ok(ep) => match opencoder_llm::ChatClient::from_config(&cfg, &ep) {
+                Ok(c) => opencoder_brain::Runtime::new(
+                    store.clone(),
+                    Arc::new(c) as Arc<dyn opencoder_llm::ChatStream>,
+                    cfg.embedding_model_id(),
+                ),
+                Err(e) => {
+                    tracing::warn!("brain degraded, llm client unavailable: {e:#}");
+                    api_brain::degraded_brain(store.clone())
+                }
+            },
+            Err(e) => {
+                tracing::warn!("brain degraded, endpoint resolve failed: {e:#}");
+                api_brain::degraded_brain(store.clone())
+            }
+        },
+        Err(e) => {
+            tracing::warn!("brain degraded, config load failed: {e:#}");
+            api_brain::degraded_brain(store.clone())
+        }
+    };
+    let project = ProjectService::new();
+    project
+        .init(
+            store.clone(),
+            libsql,
+            workdir.clone(),
+            None,
+            Some(brain.clone()),
+        )
+        .await?;
+
+    // Team runtime deps: resolved run config (team_root beside this
+    // workdir's DB unless explicitly configured) + the node dispatcher.
+    let team = crate::team_state::production(store.clone(), &workdir)?;
+    if let Err(error) = tokio::fs::create_dir_all(&team.run.team_root).await {
+        tracing::warn!(error = %error, "team root creation failed; team routes may fail until it exists");
+    }
     let state = Arc::new(AppState {
         store,
         workdir: workdir.clone(),
+        config_home: None,
         handles: handle::new_handle_map(),
         nodes: Arc::new(NodeHub::new()),
+        controls: Arc::new(ControlHub::new()),
+        project,
+        team,
+        brain,
         client_override: None,
     });
+
+    // Daemon autostart for the agents NFS export: bring it up (when
+    // `agent.nfs.enabled`) before the HTTP listener binds, so the API is
+    // live from the first request. Failures only log — never fatal.
+    api_agent_nfs::autostart(&workdir).await;
+    // Second named export: the DAG binary pool (`dag.nfs.enabled`).
+    api_dag_binaries_nfs::autostart(&workdir).await?;
+    api_dag_workspace_nfs::autostart(&workdir).await?;
 
     let app = build_app(state, Some(token), web);
 
@@ -68,17 +196,29 @@ pub async fn serve(
         "opencoder {} listening on http://{addr}",
         opencoder_core::version::VERSION_LONG
     );
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
-/// Build the application router. `token = Some(t)` enables bearer-token auth on
-/// every route (production); `token = None` skips the middleware (used by tests
-/// that build their own router with an injected `MockChatClient`).
+/// Build the application router. `token = Some(t)` enables Bearer-token
+/// auth on every route (production); `token = None` skips the middleware (used
+/// by tests that build their own router with an injected `MockChatClient`).
 pub fn build_app(state: Arc<AppState>, token: Option<String>, web: bool) -> axum::Router {
+    // Captured before the builder chain consumes `state`: the bearer
+    // middleware resolves platform users through the same store.
+    let auth_store = state.store.clone();
+    // Captured before `with_state` consumes the Arc: the DAG binary pool
+    // scope middleware resolves the pool root from the same workdir.
+    let scope_state = state.clone();
     let mut app = Router::<Arc<AppState>>::new();
     if web {
-        app = app.route("/", get(html::index));
+        app = app
+            .route("/", get(html::index))
+            .route("/static/:name", get(html::static_asset));
     }
     let mut app = app
         .route(
@@ -92,6 +232,7 @@ pub fn build_app(state: Arc<AppState>, token: Option<String>, web: bool) -> axum
             get(api::get_session).delete(api::delete_session),
         )
         .route("/api/sessions/:id/messages", get(api::get_messages))
+        .route("/api/sessions/:id/transcript", get(api_transcript::get))
         .route("/api/sessions/:id/prompt", post(api::post_prompt))
         .route("/api/sessions/:id/events", get(api::get_events))
         .route("/api/sessions/:id/seq", get(api::get_event_seq))
@@ -143,16 +284,187 @@ pub fn build_app(state: Arc<AppState>, token: Option<String>, web: bool) -> axum
         .route("/api/skills", get(api_meta::get_skills))
         .route("/api/config", get(api_ops::get_config))
         .route("/api/config", patch(api_ops::patch_config))
+        // ── custom agents：reference cards + shared pools（会话级 agent 切换
+        //    走 /api/sessions/:id/agent，无全局激活端点）──
         .route(
-            "/api/envs",
-            get(api_envs::list)
-                .post(api_envs::create)
-                .patch(api_envs::patch),
+            "/api/agents",
+            get(api_agents::list).post(api_agents::create),
         )
-        .route("/api/envs/:name/recapture", post(api_envs::recapture))
-        .route("/api/envs/:name", delete(api_envs::delete))
+        .route(
+            "/api/agents/:name/resources/:cat",
+            get(api_agents::resources::get)
+                .put(api_agents::resources::put)
+                .layer(axum::extract::DefaultBodyLimit::max(3 * 1024 * 1024)),
+        )
+        .route(
+            "/api/agents/:name/resources/:cat/restore",
+            post(api_agents::resources::restore),
+        )
+        .route("/api/agents/:name/meta", get(api_agents::meta))
+        .route(
+            "/api/agents/:name",
+            put(api_agents::update).delete(api_agents::delete),
+        )
+        .route(
+            "/api/agents/resources/:cat",
+            get(api_agent_resources::list).post(api_agent_resources::create),
+        )
+        .route(
+            "/api/agents/resources/:cat/:name",
+            put(api_agent_resources::put_version).delete(api_agent_resources::delete),
+        )
+        .route(
+            "/api/agents/resources/:cat/:name/meta",
+            get(api_agent_resources::meta),
+        )
+        .route(
+            "/api/agents/resources/:cat/:name/rollback",
+            post(api_agent_resources::rollback),
+        )
+        .route(
+            "/api/agents/resources/:cat/:name/versions/:v/files/*path",
+            get(api_agent_resources::read_file),
+        )
+        .route(
+            "/api/agents/nfs",
+            get(api_agent_nfs::get_status).post(api_agent_nfs::post_set),
+        )
+        // ── TODO 管理（share 树）：envs / tools / templates / workflows ──
+        .route(
+            "/api/todo/envs",
+            get(api_todo_envs::list_envs).post(api_todo_envs::create_env),
+        )
+        .route(
+            "/api/todo/envs/:name",
+            get(api_todo_envs::get_env)
+                .put(api_todo_envs::update_env)
+                .delete(api_todo_envs::delete_env),
+        )
+        .route("/api/todo/tools", get(api_todo_envs::list_tools))
+        .route("/api/todo/tools/import", post(api_todo_envs::import_tool))
+        .route(
+            "/api/todo/validate-files",
+            post(api_todo_directory::validate_files),
+        )
+        .route(
+            "/api/todo/templates/:name/:version/files",
+            get(api_todo_directory::files),
+        )
+        .route(
+            "/api/todo/templates",
+            get(api_todo_templates::list_templates).post(api_todo_templates::create_template),
+        )
+        .route(
+            "/api/todo/templates/:name",
+            get(api_todo_templates::get_template)
+                .delete(api_todo_template_versions::delete_template),
+        )
+        .route(
+            "/api/todo/templates/:name/todo.json",
+            put(api_todo_templates::update_meta).get(api_todo_templates::get_meta),
+        )
+        .route(
+            "/api/todo/templates/:name/new-version",
+            post(api_todo_template_versions::new_version),
+        )
+        .route(
+            "/api/todo/templates/:name/:version/context.json",
+            get(api_todo_templates::get_context).put(api_todo_templates::put_context),
+        )
+        .route(
+            "/api/todo/templates/:name/:version/env.json",
+            get(api_todo_templates::get_env_binding).put(api_todo_templates::put_env_binding),
+        )
+        .route(
+            "/api/todo/templates/:name/:version",
+            delete(api_todo_template_versions::delete_version),
+        )
+        .route(
+            "/api/todo/templates/:name/:version/run",
+            post(api_todo_runs::run_template),
+        )
+        .route("/api/todo/workflows", get(api_todo_runs::list_workflows))
+        .route("/api/todo/workflows/:id", get(api_todo_runs::get_workflow))
+        .route(
+            "/api/todo/workflows/:id/interrupt",
+            post(api_todo_runs::interrupt_workflow),
+        )
+        .route(
+            "/api/todo/workflows/:id/resume",
+            post(api_todo_runs::resume_workflow),
+        )
+        .route(
+            "/api/todo/workflows/:id/events",
+            get(todo_hub::workflow_events),
+        )
         .route("/api/bg", get(api_ops::list_bg))
         .route("/api/bg/stop", post(api_ops::stop_bg))
+        // ── project 模块（goals → milestones → todos → plan/execute runs）──
+        .route("/api/project/overview", get(api_project_runs::get_overview))
+        .route(
+            "/api/project/tags",
+            get(api_project_tags::list).post(api_project_tags::create),
+        )
+        .route(
+            "/api/project/tags/:id",
+            patch(api_project_tags::rename).delete(api_project_tags::delete),
+        )
+        .route(
+            "/api/project/goals",
+            get(api_project::list_goals).post(api_project::create_goal),
+        )
+        .route(
+            "/api/project/goals/:id",
+            patch(api_project::patch_goal).delete(api_project::delete_goal),
+        )
+        .route(
+            "/api/project/initiatives",
+            get(api_project_initiatives::list).post(api_project_initiatives::create),
+        )
+        .route(
+            "/api/project/initiatives/:id",
+            patch(api_project_initiatives::patch).delete(api_project_initiatives::delete),
+        )
+        .route(
+            "/api/project/todos",
+            get(api_project_todos::list_todos).post(api_project_todos::create_todo),
+        )
+        .route(
+            "/api/project/todos/order",
+            axum::routing::put(api_project_todos::reorder_todos),
+        )
+        .route(
+            "/api/project/todos/:id",
+            patch(api_project_todos::patch_todo).delete(api_project_todos::delete_todo),
+        )
+        .route(
+            "/api/project/todos/:id/plan",
+            post(api_project_runs::start_plan),
+        )
+        .route(
+            "/api/project/todos/:id/execute",
+            post(api_project_runs::start_execute),
+        )
+        .route(
+            "/api/project/todos/:id/runs",
+            get(api_project_runs::list_todo_runs),
+        )
+        .route(
+            "/api/project/runs/:rid/cancel",
+            post(api_project_runs::cancel_run),
+        )
+        // ── project brain (capability library) ───────────────────────
+        .route(
+            "/api/brain/capabilities",
+            get(api_brain::list_capabilities).post(api_brain::create_capability),
+        )
+        .route(
+            "/api/brain/capabilities/:id",
+            get(api_brain::get_capability)
+                .put(api_brain::update_capability)
+                .delete(api_brain::delete_capability),
+        )
+        .route("/api/brain/search", post(api_brain::search))
         // ── multi-node fleet (Phase 2) ────────────────────────────────
         .route("/api/nodes", get(api_nodes::list_nodes))
         .route("/api/nodes/register", post(api_nodes::post_register))
@@ -165,6 +477,12 @@ pub fn build_app(state: Arc<AppState>, token: Option<String>, web: bool) -> axum
             "/api/nodes/tasks/:tid/status",
             post(api_nodes_ops::post_status),
         )
+        .route("/api/nodes/tasks", get(api_nodes_ops::list_all_tasks))
+        .route("/api/nodes/tasks/:tid", get(api_nodes_ops::get_task))
+        .route(
+            "/api/sessions/:id/task",
+            get(api_nodes_ops::get_session_task),
+        )
         .route("/api/nodes/:id/heartbeat", post(api_nodes::post_heartbeat))
         .route(
             "/api/nodes/:id/tasks",
@@ -174,11 +492,95 @@ pub fn build_app(state: Arc<AppState>, token: Option<String>, web: bool) -> axum
             "/api/nodes/:node_id/tasks/:tid/cancel",
             post(api_nodes_ops::cancel_task),
         )
+        // ── P3 message relay (browser ⇄ server ⇄ worker) ─────────────
+        .route(
+            "/api/nodes/:id/messages",
+            post(api_control::fetch_node_messages),
+        )
+        .route(
+            "/api/nodes/:id/control_result",
+            post(api_control::post_control_result),
+        )
+        .route(
+            "/api/nodes/:id/dialogs",
+            get(api_control::list_dialogs).delete(api_control::clear_dialogs),
+        )
         .route("/api/nodes/:id", delete(api_nodes::delete_node))
+        // ── node-side DAG workflows (server stores + forwards only) ────
+        .route(
+            "/api/dag/defs",
+            get(api_dag::list_defs).post(api_dag::post_def),
+        )
+        .route(
+            "/api/dag/defs/:id",
+            get(api_dag::get_def).delete(api_dag::delete_def),
+        )
+        .route("/api/dag/defs/:id/dispatch", post(api_dag::dispatch))
+        .route("/api/dag/runs", get(api_dag::list_runs))
+        .route("/api/dag/runs/:id", get(api_dag::get_run))
+        .route("/api/dag/runs/:id/cancel", post(api_dag::cancel_run))
+        .route("/api/dag/runs/:id/events", get(sse_dag::get_dag_run_events))
+        // ── DAG binary-module pool (versioned, NFS-exported) ────────────
+        .route(
+            "/api/dag/binaries",
+            get(api_dag_binaries::list).post(api_dag_binaries::create),
+        )
+        .route(
+            "/api/dag/binaries/nfs",
+            get(api_dag_binaries_nfs::nfs_get).post(api_dag_binaries_nfs::nfs_post),
+        )
+        .route(
+            "/api/dag/binaries/:name",
+            get(api_dag_binaries::get)
+                .put(api_dag_binaries::put_version)
+                .delete(api_dag_binaries::delete),
+        )
+        .route(
+            "/api/dag/binaries/:name/rollback",
+            post(api_dag_binaries::rollback),
+        )
+        .route(
+            "/api/dag/workspace/nfs",
+            get(api_dag_workspace_nfs::get_status).post(api_dag_workspace_nfs::set_status),
+        )
+        .route(
+            "/api/dag/binaries/:name/versions/:v/binary.bin",
+            get(api_dag_binaries::download),
+        )
+        .route("/api/nodes/dag/claim", get(api_nodes_dag::claim))
+        .route(
+            "/api/nodes/dag/runs/:rid/events",
+            post(api_nodes_dag::post_events),
+        )
+        .route(
+            "/api/nodes/dag/runs/:rid/status",
+            post(api_nodes_dag::post_status),
+        )
+        // ── team orchestration (opencoder-team) ──────────────────────
+        .merge(api_teams::routes())
         .route("/api/health", get(api::health))
+        // Unauthenticated compatibility/readiness time endpoint.
+        .route("/api/time", get(auth_mw::server_time))
         .with_state(state);
+    // Captured before `with_state` consumes the Arc: the bearer middleware
+    // resolves platform users through the same store.
+
+    // DAG binary pool scope: inject the resolved pool root (config
+    // `dag.binary_dir` or the per-workdir data-dir default; an existing
+    // scope/override wins) into every /api/dag/binaries* request. Added
+    // BEFORE the bearer layer below, so it runs INSIDE it (layers added
+    // later wrap the earlier ones).
+    app = app.layer(axum::middleware::from_fn_with_state(
+        scope_state,
+        api_dag_binaries_nfs::configured_dag_binary,
+    ));
+
     if let Some(t) = token {
-        app = app.layer(axum::middleware::from_fn_with_state(t, auth::require_token));
+        let auth = std::sync::Arc::new(auth_mw::AuthState::new(t, auth_store));
+        app = app.layer(axum::middleware::from_fn_with_state(
+            Some(auth),
+            auth_mw::require_bearer,
+        ));
     }
     app
 }
@@ -219,10 +621,15 @@ mod tests {
     async fn make_app() -> axum::Router {
         let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
         let state = Arc::new(AppState {
+            brain: crate::api_brain::mock_brain(store.clone()),
             store,
             workdir: std::env::temp_dir(),
+            config_home: None,
             handles: handle::new_handle_map(),
             nodes: Arc::new(crate::nodes_state::NodeHub::new()),
+            controls: Arc::new(crate::control_state::ControlHub::new()),
+            team: crate::team_state::mock(),
+            project: crate::ProjectService::new(),
             client_override: None,
         });
         build_app(state, None, true)
@@ -231,10 +638,15 @@ mod tests {
     async fn make_api_only_app() -> axum::Router {
         let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
         let state = Arc::new(AppState {
+            brain: crate::api_brain::mock_brain(store.clone()),
             store,
             workdir: std::env::temp_dir(),
+            config_home: None,
             handles: handle::new_handle_map(),
             nodes: Arc::new(crate::nodes_state::NodeHub::new()),
+            controls: Arc::new(crate::control_state::ControlHub::new()),
+            team: crate::team_state::mock(),
+            project: crate::ProjectService::new(),
             client_override: None,
         });
         build_app(state, None, false)

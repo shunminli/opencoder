@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
-use opencoder_core::{message::now_ms, AgentKind, ContentBlock, Message, Role, ToolArc};
-use opencoder_llm::{estimate_messages, lower_messages, ChatRequest, LlmEvent};
+use opencoder_core::{message::now_ms, ContentBlock, Message, Role, ToolArc};
+use opencoder_llm::{estimate_messages, ChatRequest, LlmEvent};
 use opencoder_store::SessionPatch;
 
 use crate::prompt::{build_system, compaction_system_prompt, compaction_user_prompt};
@@ -39,11 +39,35 @@ pub fn should_compact(session: &SessionState) -> bool {
     reported != 0 && reported >= budget
 }
 
-/// Estimated tokens of the conversation about to be sent (system + messages).
+/// Hint emitted when a manual-compaction session crosses the hard context
+/// limit: auto-compaction is off, so the run is aborted instead of silently
+/// degrading. Tells the user exactly which lever to pull.
+pub const MANUAL_COMPACT_HINT: &str =
+    "context window exhausted: run /compact to summarize the transcript, or enable compaction.auto";
+
+/// Hard-limit check that applies even when auto-compaction is OFF: the
+/// transcript (estimated or model-reported) no longer fits the model's
+/// context window at all, so the next request would 400/degrade. Unlike
+/// `should_compact` this is not a threshold preference — it is a physical
+/// limit of the configured model.
+pub fn exceeds_hard_limit(session: &SessionState) -> bool {
+    let context_limit = session.config.context_limit();
+    estimated_tokens(session) >= context_limit || {
+        let reported = reported_tokens(session);
+        reported != 0 && reported >= context_limit
+    }
+}
+
+/// Estimated tokens of the conversation about to be sent (system + messages
+/// + transient skill payload).
 ///
 /// The global `~/.opencoder/AGENTS.md` ships in the system prompt (see
 /// `build_system`), so its tokens count toward the compaction budget exactly
 /// like any other context the model actually consumes.
+///
+/// The armed skill's body rides the payload as a transient message that is
+/// never persisted to `session.messages`, so it is counted explicitly below;
+/// omitting it made compaction fire late on large skills.
 ///
 /// Also used by the runner's hard-limit gate: when compaction has nothing to
 /// summarize, the request may still proceed if this estimate fits under the
@@ -64,11 +88,29 @@ pub(crate) fn estimated_tokens(session: &SessionState) -> u64 {
     let agent = &session.agent;
     let cli = crate::prompt::cli_section(&session.config.enabled_cli_for(&agent.name, agent.mode));
     let runtime = crate::prompt::runtime_sections(mcp.as_deref(), cli.as_deref());
-    let system = build_system(&session.agent, &session.working_dir, runtime.as_deref());
+    let system = build_system(
+        &session.agent,
+        &session.working_dir,
+        runtime.as_deref(),
+        session.skill_prompt_cloned().as_deref(),
+    );
     let base = estimate_messages(&session.messages)
         .saturating_add(estimate(&system.text()))
         .saturating_add(
             crate::skill_context::tail_reminder(session)
+                .map(|m| estimate(&m.text()))
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            // The armed skill's body rides ONLY the first post-activation
+            // LLM payload (never persisted), so
+            // `estimate_messages(&session.messages)` cannot see it while it
+            // is still undelivered — count it here or a large armed skill
+            // pushes that first real payload past the budget (late
+            // compaction, hard-limit gate over-admission).
+            (!session.skill_body_delivered())
+                .then(|| crate::skill_context::body_message(session))
+                .flatten()
                 .map(|m| estimate(&m.text()))
                 .unwrap_or(0),
         );
@@ -96,6 +138,10 @@ pub async fn compact(
     _registry: &HashMap<String, ToolArc>,
     on_event: &mut (impl FnMut(SessionEvent) + Send + ?Sized),
 ) -> Result<Option<String>> {
+    anyhow::ensure!(
+        session.harness.harness != opencoder_core::harness::Harness::Codex,
+        "Codex manages its own context; OpenCoder compaction is unavailable for this harness"
+    );
     let tail = session.config.compaction.tail_turns.max(1) as usize;
     let Some(split) = compaction_split(&session.messages, tail) else {
         // Genuinely nothing to summarize (empty or single-message transcript).
@@ -149,17 +195,6 @@ pub async fn compact(
             });
         }
     }
-    // Plan snapshot capture: in plan mode the final plan is an assistant
-    // message that may live in the head being folded into the user-role
-    // summary. Snapshot it BEFORE `session.messages` is replaced so a later
-    // plan→act handoff still finds the plan (`final_plan_text` only scans
-    // the live tail). On miss, keep any existing snapshot — an earlier
-    // compaction may already hold the newest plan text.
-    if session.agent.kind == AgentKind::Plan {
-        if let Some(plan) = crate::plan_handoff::final_plan_text(&session.messages) {
-            session.plan_snapshot = Some(plan);
-        }
-    }
     let tail_msgs: Vec<Message> = session.messages[split..].to_vec();
     session.messages = vec![summary_msg].into_iter().chain(tail_msgs).collect();
 
@@ -180,7 +215,7 @@ pub async fn compact(
     session.after_compaction(summary.clone(), new_skip);
     session.summary_images = preserved.clone();
     if let Some(store) = &session.store {
-        let mut patch = SessionPatch {
+        let patch = SessionPatch {
             summary: Some(summary.clone()),
             summary_seq: Some(new_skip),
             // Persist the head images that survived compaction so resume
@@ -190,15 +225,8 @@ pub async fn compact(
             summary_images: Some(preserved.clone()),
             updated_at: Some(now_ms()),
             clear_handoff: true,
-            // Mirror the plan phase so a resumed plan session keeps its
-            // arming (counter) and compaction-captured plan snapshot.
-            plan_input_count: Some(session.plan_input_count as i64),
             ..Default::default()
         };
-        match &session.plan_snapshot {
-            Some(snap) => patch.plan_snapshot = Some(snap.clone()),
-            None => patch.clear_plan_snapshot = true,
-        }
         store
             .update_session(&session.id, &patch)
             .await
@@ -260,6 +288,13 @@ fn split_index(messages: &[Message], tail_turns: usize) -> usize {
 /// Returns `None` only when there is genuinely nothing to summarize — an
 /// empty transcript or a single message.
 fn compaction_split(messages: &[Message], tail_turns: usize) -> Option<usize> {
+    let desired = preferred_split(messages, tail_turns)?;
+    boundary::tool_safe_split(messages, desired)
+}
+
+mod boundary;
+
+fn preferred_split(messages: &[Message], tail_turns: usize) -> Option<usize> {
     let turn_starts = turn_start_indices(messages);
     if turn_starts.is_empty() {
         return None;
@@ -285,18 +320,28 @@ async fn summarize(
     previous_summary: Option<&str>,
     on_event: &mut (impl FnMut(SessionEvent) + Send + ?Sized),
 ) -> Result<String> {
-    let mut msgs: Vec<serde_json::Value> = Vec::new();
+    let mut msgs: Vec<Message> = Vec::new();
     // System prompt: anchored context summarization assistant.
-    msgs.push(serde_json::json!({ "role": "system", "content": compaction_system_prompt() }));
+    msgs.push(Message::system(
+        "compaction-system",
+        compaction_system_prompt(),
+    ));
     // The conversation head to summarize.
-    msgs.extend(lower_messages(head));
+    msgs.extend_from_slice(head);
     // User prompt: structured output template (+ optional previous-summary).
-    msgs.push(
-        serde_json::json!({ "role": "user", "content": compaction_user_prompt(previous_summary) }),
-    );
+    msgs.push(Message::user(
+        "compaction-user",
+        compaction_user_prompt(previous_summary),
+    ));
     // Summarization is a cheap background call → use small_model when configured.
-    let model = session.config.small_model_or_primary().to_string();
+    let model = session
+        .config
+        .small_model
+        .as_deref()
+        .unwrap_or(&session.config.model)
+        .to_string();
     let req = ChatRequest {
+        purpose: opencoder_llm::RequestPurpose::Compaction,
         model,
         messages: msgs,
         tools: Vec::new(),
@@ -308,6 +353,7 @@ async fn summarize(
     };
     let mut rx = session.client.chat_stream(req)?;
     let mut text = String::new();
+    let mut completed = false;
     // Cancel guard only: the event-level idle watchdog now lives inside the
     // streaming client, which retries stalls transparently. A double-Esc / web
     // interrupt during the compaction-summary stream must still break out
@@ -330,9 +376,8 @@ async fn summarize(
                         on_event(SessionEvent::CompactionDelta(t));
                     }
                     LlmEvent::Completed { text: t, .. } => {
-                        if !t.is_empty() {
-                            text = t;
-                        }
+                completed = true;
+                        text = t;
                     }
                     LlmEvent::Retrying { .. } => {
                         // Mid-stream retry: the client discarded its partial
@@ -347,6 +392,9 @@ async fn summarize(
             }
         }
     }
+    if !completed {
+        return Err(anyhow::anyhow!("stream ended without completion"));
+    }
     if text.trim().is_empty() {
         return Err(anyhow!("empty compaction summary"));
     }
@@ -360,7 +408,7 @@ async fn summarize(
 const MAX_PRESERVED_IMAGES: usize = 4;
 
 /// Collect image URIs from messages that are about to be discarded by
-/// compaction or plan->act handoff -- both user-attached `Image` blocks and
+/// compaction or a transcript handoff -- both user-attached `Image` blocks and
 /// tool-returned `ToolResult.images`. Keeps the most recent
 /// `MAX_PRESERVED_IMAGES` (newest last) so the freshest visual context
 /// survives while older ones are summarized in prose.

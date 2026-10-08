@@ -1,5 +1,6 @@
 .DS_Store
 node_modules
+/.vite/
 .worktrees
 .sst
 .env
@@ -53,6 +54,7 @@ target-clean/
 .target-gate/
 .target-rv2/
 .target-rv3/
+.target-skillcheck/
 .tgt-title-task/
 .target-release/
 

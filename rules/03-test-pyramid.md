@@ -6,7 +6,7 @@ Commit: (working-tree, pre-initial-commit)
 
 ```
         /\
-       /e2e\          scripts/e2e-glm.sh
+       /e2e\          scripts/e2e-glm.sh（按真服务判层）
       /------\        真 LLM (glm5.2) 端到端，手动 / CI 触发
      /        \
     /integration\     crates/*/tests/*.rs
@@ -38,10 +38,10 @@ mod tests {
 
 ### 第 2 层：集成测试（integration）
 
-- **位置**：`crates/<crate>/tests/*.rs`
+- **位置**：`crates/<crate>/tests/*.rs`（含目录目标 `tests/<dir>/main.rs`）
 - **对象**：跨模块协作、持久化、Mock 驱动的业务流程
 - **要求**：用 `MockChatClient`（非真网络）、`tempdir`（非真文件系统）、`LibsqlStore::open_memory()`（非真数据库文件）
-- **示例**：`steer_followup.rs`、`recovery.rs`、`web_contract.rs`、`store_integration.rs`
+- **示例**：`steer_followup.rs`、`recovery.rs`、`web_contract.rs`、`store_integration/`；根包进程级形态：`tests/operator_e2e/`、`tests/dag_e2e/`（真二进制子进程 + loopback LLM 桩，零外部服务 → 仍判第 2 层）
 
 ```rust
 // crates/session/tests/steer_followup.rs
@@ -55,10 +55,11 @@ async fn steer_promotes_at_turn_boundary_and_resets_step() {
 
 ### 第 3 层：端到端测试（e2e）
 
-- **位置**：`scripts/e2e-glm.sh` 或 `tests/e2e/`
+- **判层标准**：是否依赖真外部服务（真 LLM API key、真网络依赖）；**不以路径名判层**——随常规 `cargo test` 运行、由 `MockChatClient` 驱动的 `tests/e2e/` 目录目标属第 2 层
+- **位置**：`scripts/e2e-glm.sh`（典型形态）
 - **对象**：真 LLM、真文件系统、完整用户流程
 - **要求**：需要 API key；标记为手动 / CI 专属；不在常规 `cargo test` 中运行
-- **示例**：glm5.2 写贪吃蛇 / 雷霆战机、resume 跨进程
+- **示例**：glm5.2 写贪吃蛇 / 雷霆战机、resume 跨进程；反例：`crates/control/tests/e2e/`（Mock 驱动、随 `cargo test` 运行 → 判第 2 层）
 
 ## 放置决策树
 
@@ -69,7 +70,7 @@ async fn steer_promotes_at_turn_boundary_and_resets_step() {
     ├── 否 → 第 2 层（tests/ 目录，用 Mock）
     └── 是 → 需要真外部服务吗？
         ├── 否 → 第 2 层（tests/ 目录，用 Mock + tempdir）
-        └── 是 → 第 3 层（scripts/ 或 tests/e2e/）
+        └── 是 → 第 3 层（判层看服务真伪、非路径名；典型如 `scripts/e2e-glm.sh`）
 ```
 
 ## 禁止行为
@@ -78,6 +79,12 @@ async fn steer_promotes_at_turn_boundary_and_resets_step() {
 - ❌ 在集成测试中调用真 LLM API（用 `MockChatClient`）
 - ❌ 把所有测试堆在一个巨型 `tests/main.rs` 里（按功能拆分文件）
 - ❌ 测试文件超过 400 行（拆分或提取 helper）
+
+## 具名测试取证规范
+
+- 独立测试**文件**（`tests/<file>.rs` 或目录目标 `tests/<dir>/`）必须按目标运行：`cargo test -p <crate> --test <file>`。按函数名过滤（`cargo test <name>`）在无同名函数时会对所有目标静默零命中（`0 passed; N filtered out`），不得当作通过证据。
+- 目录目标（`tests/<dir>/main.rs`）的用例名带模块前缀（`模块名::函数名`），按名过滤用尾部片段即可匹配。
+- 取证前先确认对象是「测试文件」还是「测试函数」；输出中没有 `test result:` 行即为无效取证。
 
 ## Mock 使用规范
 

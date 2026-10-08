@@ -1,0 +1,102 @@
+//! Step executors and their shared plumbing.
+
+pub mod agent;
+pub mod agent_runc;
+pub mod how_append;
+pub mod how_copy;
+pub mod logs;
+pub mod native;
+mod private_files;
+mod runc_events;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use opencoder_dag::{render_context, DagSpec, StepOutcome, StepOutputs, StepSpec, StepStates};
+use opencoder_store::Store;
+use serde_json::Value;
+
+/// Everything step execution needs that does not change per step (mirrors
+/// the node-task executor's `ExecDeps`).
+#[derive(Clone)]
+pub struct ExecDeps {
+    pub store: Arc<dyn Store>,
+    pub workdir: PathBuf,
+    pub config: opencoder_core::Config,
+}
+
+/// Guest-visible mount point of the node's read-only knowledge root.
+pub(crate) const KNOWLEDGE_MOUNT: &str = "/workspace/knowledge";
+
+/// Guest-visible mount point of a pinned, read-only agents pool
+/// (agent cards + four shared resource pools) in sandboxed sessions.
+pub(crate) const AGENTS_MOUNT: &str = "/workspace/agent";
+
+/// Pure per-step execution context handed to the executors.
+pub struct StepCtx {
+    pub run_id: String,
+    pub instance: Option<usize>,
+    pub instance_input: Option<Value>,
+    pub spec: DagSpec,
+    pub step: StepSpec,
+    pub states: StepStates,
+    pub outputs: StepOutputs,
+    pub workflow_root: PathBuf,
+    /// Run-scoped event sink for incremental agent transcript frames.
+    pub log: Option<crate::exec::logs::StepLog>,
+    /// Node-configured knowledge root (`dag.knowledge_root`): exposed
+    /// READ-ONLY to sandboxed steps at [`KNOWLEDGE_MOUNT`]. `None` = no
+    /// knowledge mount anywhere.
+    pub knowledge_root: Option<PathBuf>,
+}
+
+impl StepCtx {
+    pub fn dir(&self) -> Result<PathBuf, String> {
+        opencoder_dag::artifacts::execution_dir(
+            &self.workflow_root,
+            &self.run_id,
+            &self.step.name,
+            self.instance,
+        )
+    }
+    pub fn relative_dir(&self) -> String {
+        match self.instance {
+            Some(i) => format!("{}/instances/{i}", self.step.name),
+            None => self.step.name.clone(),
+        }
+    }
+    pub fn execution_key(&self) -> String {
+        match self.instance {
+            Some(i) => format!("instance-{}-{i}", self.step.name),
+            None => format!("step-{}", self.step.name),
+        }
+    }
+
+    /// The upstream `context` object delivered to the step (agent prompt
+    /// header; binary steps get the same object as a `context.json` file
+    /// whose path arrives via `OPENCODER_STEP_CONTEXT`). Only declared
+    /// upstream steps leak.
+    pub fn context(&self) -> Value {
+        render_context(&self.spec, &self.step.name, &self.states, &self.outputs)
+    }
+}
+
+/// Terminal result of one step execution.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct StepResult {
+    pub outcome: StepOutcome,
+    pub error: Option<String>,
+    /// Captured stdout / transcript tail (goes to `output.txt` + the
+    /// truncated `step_done` event snapshot).
+    pub output_text: String,
+    /// Parsed `output.json` when the step produced one.
+    pub output_json: Option<Value>,
+    /// Session id for agent steps (None for binary).
+    pub session_id: Option<String>,
+}
+
+/// Execute an `agent` step through the real session runner.
+pub use agent::execute_agent_step;
+
+/// Execute a Linux binary inside the shared DAG container.
+pub use native::binary::execute_binary_step_logged;

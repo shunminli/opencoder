@@ -36,8 +36,7 @@ async fn make_session(store: &Arc<dyn Store>, id: &str) {
         skill: None,
         task_type: None,
         requirement: None,
-        plan_snapshot: None,
-        plan_input_count: 0,
+        kind: None,
     };
     store.create_session(&meta).await.unwrap();
 }
@@ -369,4 +368,52 @@ async fn old_usage_event_payload_with_only_total_rebuilds_real_context() {
     assert_eq!(view.real_context_tokens, Some(42));
     assert_eq!(view.tokens_total, 42);
     let _ = dir;
+}
+/// The `memory` maintenance block is just another subagent block: its
+/// forwarded `SubagentChild(LlmUsage)` must fold into the parent view's
+/// lifetime `[tok cost]`, and `SubagentEnd` must stamp the block's
+/// `elapsed_ms` so the footer can render the timed duration.
+#[test]
+fn memory_block_cost_and_duration_land_in_parent_view() {
+    let mut view = opencoder_tui::chat::ChatView::default();
+    view.apply(&SessionEvent::SubagentStart {
+        id: "memory-x".into(),
+        kind: "memory".into(),
+        prompt: "p".into(),
+        child_session_id: "memory-x".into(),
+    });
+    view.apply(&SessionEvent::SubagentChild {
+        id: "memory-x".into(),
+        ev: Box::new(SessionEvent::LlmUsage {
+            total_tokens: 1234,
+            input_tokens: 600,
+            output_tokens: 634,
+        }),
+    });
+    view.apply(&SessionEvent::SubagentEnd {
+        id: "memory-x".into(),
+        ok: true,
+        cancelled: false,
+        summary: "(1s) done".into(),
+    });
+
+    assert_eq!(
+        view.tokens_total, 1234,
+        "the maintenance round's tokens fold into the parent's [tok cost]"
+    );
+    match view.blocks.iter().find(
+        |b| matches!(b, opencoder_tui::chat::ChatBlock::Subagent { id, .. } if id == "memory-x"),
+    ) {
+        Some(opencoder_tui::chat::ChatBlock::Subagent {
+            elapsed_ms,
+            summary,
+            done,
+            ..
+        }) => {
+            assert!(elapsed_ms.is_some(), "the block footer carries a duration");
+            assert!(done, "the block closed");
+            assert_eq!(summary, "(1s) done");
+        }
+        other => panic!("expected memory subagent block, got {other:?}"),
+    }
 }

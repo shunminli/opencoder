@@ -1,5 +1,5 @@
 //! Shared harness for the Phase-4 process-level e2e tests: a REAL
-//! `build_app` server (web=true, bearer token) bound to a random local port,
+//! `build_app` server (web=true, Bearer token) bound to a random local port,
 //! plus the small browser-side utilities (reqwest client, SSE line reader,
 //! poll helper) the flow/reconnect scenarios drive.
 
@@ -9,6 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::support::auth_header;
 use futures::StreamExt;
 use opencoder_llm::MockChatClient;
 use opencoder_store::LibsqlStore;
@@ -28,10 +29,15 @@ pub async fn spawn_server() -> Server {
     let store: Arc<dyn opencoder_store::Store> =
         Arc::new(LibsqlStore::open_memory().await.unwrap());
     let state = Arc::new(opencoder_web::AppState {
+        config_home: None,
+        brain: opencoder_web::api_brain::mock_brain(Arc::clone(&store)),
         store: Arc::clone(&store),
         workdir: std::env::temp_dir(),
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
         client_override: Some(Arc::new(MockChatClient::new())),
     });
     let app = opencoder_web::build_app(state, Some(TOKEN.to_string()), true);
@@ -64,7 +70,19 @@ impl Drop for Server {
 
 pub fn http() -> reqwest::Client {
     reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap()
+}
+
+/// Client for long-lived SSE reads: NO total-request timeout. A loaded box
+/// can keep a task's stream open for minutes; the default client's 30 s cap
+/// would amputate the stream mid-run and masquerade as frame loss.
+pub fn http_sse() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(30))
         .build()
         .unwrap()
 }
@@ -73,33 +91,63 @@ fn url(base: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
-/// Bearer-header GET returning JSON.
+/// Authenticated GET returning JSON.
 pub async fn get_json(base: &str, path: &str) -> (reqwest::StatusCode, Value) {
-    let r = http()
-        .get(url(base, path))
-        .bearer_auth(TOKEN)
-        .send()
-        .await
-        .unwrap();
+    let r = authed_raw("GET", base, path, None).send().await.unwrap();
     let status = r.status();
     let v = r.json::<Value>().await.unwrap_or(Value::Null);
     (status, v)
 }
 
-/// Bearer-header POST with an optional JSON body.
+/// Authenticated POST with an optional JSON body.
 pub async fn post_json(
     base: &str,
     path: &str,
     body: Option<Value>,
 ) -> (reqwest::StatusCode, Value) {
-    let mut b = http().post(url(base, path)).bearer_auth(TOKEN);
-    if let Some(j) = body {
-        b = b.json(&j);
+    let bytes = body
+        .as_ref()
+        .map(|j| serde_json::to_vec(j).unwrap())
+        .unwrap_or_default();
+    let mut b = authed_raw("POST", base, path, Some(bytes));
+    if body.is_none() {
+        b = b.header("content-type", "application/json");
     }
     let r = b.send().await.unwrap();
     let status = r.status();
     let v = r.json::<Value>().await.unwrap_or(Value::Null);
     (status, v)
+}
+
+/// Build one Bearer-authenticated reqwest request.
+fn authed_raw(
+    method: &str,
+    base: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+) -> reqwest::RequestBuilder {
+    let bytes = body.unwrap_or_default();
+    let (name, value) = auth_header(TOKEN);
+    http()
+        .request(
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+            url(base, path),
+        )
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(bytes)
+}
+
+fn authed_raw_sse(method: &str, base: &str, path: &str) -> reqwest::RequestBuilder {
+    let bytes: Vec<u8> = Vec::new();
+    let (name, value) = auth_header(TOKEN);
+    http_sse()
+        .request(
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+            url(base, path),
+        )
+        .header(name, value)
+        .body(bytes)
 }
 
 /// One SSE unit of the fleet API as the browser sees it: the event name plus
@@ -110,12 +158,11 @@ pub struct Frame {
     pub data: Value,
 }
 
-/// Open `GET path` (bearer header — the EventSource-equivalent auth) and
-/// yield parsed frames until the connection ends.
+/// Open `GET path` (EventSource cannot set Bearer headers, so the SPA uses
+/// fetch streaming) and yield parsed frames until
+/// the connection ends.
 pub async fn open_sse(base: &str, path: &str) -> impl futures::Stream<Item = Frame> {
-    let r = http()
-        .get(url(base, path))
-        .bearer_auth(TOKEN)
+    let r = authed_raw_sse("GET", base, path)
         .send()
         .await
         .expect("sse connect");
@@ -138,7 +185,10 @@ pub fn parse_sse_response(
                 }
                 continue; // keep-alive comment block
             }
-            match tokio::time::timeout(Duration::from_secs(15), body.next()).await {
+            // Budget generous enough to survive a loaded CI box: the machine
+            // may be running many builds/tests concurrently, and a silent
+            // frame-gap timeout here masquerades as "stream ended" (loss).
+            match tokio::time::timeout(Duration::from_secs(60), body.next()).await {
                 Ok(Some(Ok(bytes))) => buf.push_str(&String::from_utf8_lossy(bytes.as_ref())),
                 _ => return None, // timeout / end / transport error
             }
@@ -180,13 +230,14 @@ pub fn node_opts(
         claim_interval: Duration::from_millis(30),
         version: env!("CARGO_PKG_VERSION").to_string(),
         local_store_dir: Some(data.to_path_buf()),
+        dag: None,
     }
 }
 
-/// Pin autopilot off via the project domain file so a developer's global
-/// `~/.opencoder/ap.json` cannot append a review turn to the scripted mock
-/// round (same trick as `crates/node/tests`).
+/// Keep developer-wide autopilot and local-memory settings out of scripted
+/// worker rounds (same isolation as `crates/node/tests`).
 pub fn pin_autopilot_off(workdir: &std::path::Path) {
+    std::fs::write(workdir.join("opencoder.json"), r#"{"local_memory":false}"#).unwrap();
     std::fs::create_dir_all(workdir.join(".opencoder")).unwrap();
     std::fs::write(
         workdir.join(".opencoder").join("ap.json"),

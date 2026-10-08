@@ -1,14 +1,16 @@
 //! Integration tests for queueable control commands (/act, /plan,
-//! /act_clear_context).
+//! /act_clear_context, legacy /clear_context alias).
 //!
 //! Contracts:
-//! - idle_short_circuit: a bare "/plan" prompt switches mode with NO LLM call
+//! - idle_short_circuit: a bare "/plan" prompt switches agent with NO LLM
+//!   call
 //! - queue_drains_control_cmds: a queue of ["/plan", "real prompt", "/act"]
 //!   is fully drained FIFO in a single run — leading/trailing control
 //!   commands are applied without LLM turns and the real prompt gets a
 //!   turn; the run finishes (Done) with an empty queue
-//! - clear_context_survives_resume: after /act_clear_context, resume
-//!   reconstructs the fresh-start marker transcript
+//! - clear_context_survives_resume: plan mode preserves the newest plan as an
+//!   execution directive and converges to act; act mode keeps the neutral
+//!   continuity-seed contract.
 
 use std::sync::Arc;
 
@@ -64,7 +66,7 @@ fn mk_input(session_id: &str, delivery: Delivery, prompt: &str) -> SessionInput 
     }
 }
 
-/// Idle short-circuit: "/plan" switches mode immediately with zero LLM calls.
+/// Idle short-circuit: "/plan" switches agent immediately with zero LLM calls.
 #[tokio::test]
 async fn idle_short_circuit_switches_with_no_llm_call() {
     let store = mem_store().await;
@@ -114,7 +116,7 @@ async fn idle_short_circuit_switches_with_no_llm_call() {
 
     // Persisted to store.
     let meta = store.get_session("idle-sess").await.unwrap().unwrap();
-    assert_eq!(meta.agent.as_deref(), Some("plan"));
+    assert_eq!(meta.agent.as_deref(), Some("plan"), "/plan persists");
 }
 
 /// Queue drain: ["/plan", "do work", "/act"] is fully drained FIFO in a
@@ -215,7 +217,8 @@ async fn queue_drains_control_cmds_between_real_prompts() {
     assert_eq!(done_count, 1, "Done emitted exactly once");
 }
 
-/// ClearContext survives resume: the fresh-start marker is reconstructed.
+/// ClearContext survives resume: the plan directive is reconstructed and the
+/// converged act agent persists.
 #[tokio::test]
 async fn clear_context_survives_resume() {
     let store = mem_store().await;
@@ -248,13 +251,15 @@ async fn clear_context_survives_resume() {
     .with_store(store.clone())
     .mark_session_created();
     session.messages = msgs.clone();
-    // Phase-bounded snapshot `record` would have captured for the plan-mode
-    // assistant output.
-    session.plan_snapshot = Some("old answer".into());
 
+    // The seed path continues running: one scripted follow-up turn (the model
+    // sees the continuity context).
+    let mock =
+        Arc::new(MockChatClient::new().push_script(vec![done_turn("done")])) as Arc<dyn ChatStream>;
+    session.client = mock;
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ev_clone = events.clone();
-    run(&mut session, "/act_clear_context".into(), move |ev| {
+    run(&mut session, "/clear_context".into(), move |ev| {
         ev_clone.lock().unwrap().push(ev)
     })
     .await
@@ -264,15 +269,15 @@ async fn clear_context_survives_resume() {
     // (clippy::await_holding_lock).
     {
         let evs = events.lock().unwrap();
-        // After ClearContext + execution: [handoff_message, assistant_response]
+        // After ClearContext + LLM turn: [directive, assistant_response]
         assert_eq!(
             session.messages.len(),
             2,
-            "transcript = handoff marker + assistant execution response"
+            "transcript = directive + assistant response"
         );
-        assert_eq!(session.agent.name, "act", "switched to act");
+        assert_eq!(session.agent.name, "act");
         assert!(session.handoff_seq.is_some(), "handoff_seq set");
-        // The finalized plan ("old answer") was preserved, not blanked.
+        // The last assistant plan is the handoff display payload.
         assert_eq!(session.handoff_plan.as_deref(), Some("old answer"));
         assert!(
             evs.iter()
@@ -281,8 +286,12 @@ async fn clear_context_survives_resume() {
         );
         assert!(
             evs.iter()
-                .any(|e| matches!(e, SessionEvent::PlanHandoff(p) if p == "old answer")),
-            "PlanHandoff emitted carrying the preserved plan"
+                .any(|e| matches!(e, SessionEvent::AgentSwitch(name) if name == "act")),
+            "clear must switch to act, got {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e, SessionEvent::Done)),
+            "seed path falls through to an LLM turn (run completes)"
         );
     }
 
@@ -296,25 +305,28 @@ async fn clear_context_survives_resume() {
     )
     .await
     .unwrap();
-    // [reconstructed handoff marker, assistant execution response]
+    // [reconstructed directive, assistant response]
     assert_eq!(
         resumed.messages.len(),
         2,
-        "resume reconstructs handoff marker + assistant response"
+        "resume reconstructs directive + assistant response"
     );
     assert_eq!(resumed.agent.name, "act");
     let marker_text = resumed.messages[0].text();
     assert!(
         marker_text.contains("old answer"),
-        "marker text carries the preserved plan: {marker_text}"
+        "marker text carries the preserved reply: {marker_text}"
+    );
+    assert!(
+        marker_text.contains("Execute it now"),
+        "plan handoff uses an execution directive: {marker_text}"
     );
 }
 
-/// `/act_clear_context` with a prior assistant result must EXECUTE the
-/// preserved result — the LLM is called exactly once and the handoff
-/// message carrying the result appears in the request context.
+/// ClearContext with a preserved plan falls through to one act LLM turn with
+/// an explicit execution directive; the raw command string never leaks.
 #[tokio::test]
-async fn clear_context_executes_preserved_result() {
+async fn clear_context_plan_handoff_falls_through_to_act_turn() {
     let store = mem_store().await;
     seed(&store, "exec-sess", "plan").await;
 
@@ -339,42 +351,45 @@ async fn clear_context_executes_preserved_result() {
     .with_store(store.clone())
     .mark_session_created();
     session.messages = msgs.clone();
-    // Plan provenance: the plan was produced by a recorded plan-mode input.
-    // (An act-mode session with plan_input_count == 0 takes the sentinel
-    // path instead — see clear_context_regression.rs.)
-    session.plan_input_count = 1;
-    session.plan_snapshot = Some("I will implement X by...".into());
 
-    run(&mut session, "/act_clear_context".into(), |_| {})
+    run(&mut session, "/clear_context".into(), |_| {})
         .await
         .unwrap();
 
-    // The LLM was called exactly once (the execution turn).
+    // The LLM was called exactly once (the seed falls through to a turn).
     let requests = mock.requests();
     assert_eq!(
         requests.len(),
         1,
-        "one LLM call to execute the preserved result"
+        "one LLM call for the plan execution turn"
     );
 
-    // The preserved result text appears in the model context.
+    // The preserved plan appears in an explicit execution directive.
     let body = requests[0].to_body().to_string();
     assert!(
         body.contains("I will implement X by..."),
-        "preserved result must appear in the model context: {body}"
+        "preserved reply must appear in the model context: {body}"
     );
+    assert!(
+        body.contains("Execute it now"),
+        "execution directive must reach the model: {body}"
+    );
+    assert_eq!(session.agent.name, "act");
 
     // The raw command string must NOT leak to the model.
     assert!(
-        !body.contains("/act_clear_context"),
+        !body.contains("/clear_context"),
         "raw command string must not reach the model: {body}"
     );
 }
 
-/// ClearContext with no finalized plan falls back to a blank fresh-start that
+/// ClearContext with no assistant text falls back to a blank fresh-start that
 /// survives resume: resume reconstructs the sentinel fresh-start marker.
+/// Exercises the canonical `/act_clear_context` spelling with no assistant
+/// text — it must collapse to the blank fresh-start sentinel exactly like the
+/// legacy `/clear_context` alias (persisted inputs keep working).
 #[tokio::test]
-async fn clear_context_no_plan_survives_resume() {
+async fn clear_context_no_assistant_text_survives_resume() {
     let store = mem_store().await;
     seed(&store, "clear-noplan", "plan").await;
 
@@ -413,9 +428,10 @@ async fn clear_context_no_plan_survives_resume() {
             1,
             "transcript collapsed to 1 fresh-start marker"
         );
-        assert_eq!(session.agent.name, "act", "switched to act");
+        assert_eq!(session.agent.name, "act");
         assert!(session.handoff_seq.is_some(), "handoff_seq set");
-        // No plan -> blank sentinel stored so resume reconstructs fresh-start.
+        // No assistant text -> blank sentinel stored so resume reconstructs
+        // the fresh-start marker.
         // (CLEAR_CONTEXT_SENTINEL is pub(crate); assert the literal value.)
         assert_eq!(
             session.handoff_plan.as_deref(),
@@ -430,11 +446,9 @@ async fn clear_context_no_plan_survives_resume() {
                 .any(|e| matches!(e, SessionEvent::TranscriptReset(_))),
             "TranscriptReset emitted"
         );
-        assert!(
-            !evs.iter()
-                .any(|e| matches!(e, SessionEvent::PlanHandoff(_))),
-            "no PlanHandoff when there is no plan"
-        );
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, SessionEvent::AgentSwitch(name) if name == "act")));
     }
 
     // Resume reconstructs the blank fresh-start marker.
@@ -537,7 +551,7 @@ async fn steered_control_cmd_not_recorded_as_user_text() {
     );
 }
 
-/// After /act_clear_context the internal sentinel must never reach the model:
+/// After /clear_context the internal sentinel must never reach the model:
 /// the fresh-start marker is what travels, and no LLM request body contains
 /// the raw `<<OPENCODER_CLEAR_CONTEXT_MARKER>>` string (model context is
 /// rebuilt from messages only, never from handoff_plan metadata).
@@ -566,7 +580,7 @@ async fn clear_context_sentinel_never_reaches_model_context() {
     session.messages = vec![Message::user("u1", "old question")];
 
     // Clear the context (idle short-circuit: no LLM call).
-    run(&mut session, "/act_clear_context".into(), |_| {})
+    run(&mut session, "/clear_context".into(), |_| {})
         .await
         .unwrap();
     assert_eq!(session.messages.len(), 1, "transcript collapsed to marker");
@@ -583,8 +597,7 @@ async fn clear_context_sentinel_never_reaches_model_context() {
     );
     // The fresh-start marker is present in the model context (the first
     // message is the system prompt, so scan the user messages).
-    let has_marker = requests[0]
-        .messages
+    let has_marker = opencoder_llm::lower_messages(&requests[0].messages)
         .iter()
         .any(|m| m.to_string().contains("Context cleared"));
     assert!(
@@ -593,10 +606,10 @@ async fn clear_context_sentinel_never_reaches_model_context() {
     );
 }
 
-/// `/act_clear_context review` submitted as the idle prompt: clears context
-/// AND runs "review" as a real prompt in the fresh act-mode context. The
-/// trailing argument is recorded as a user message, not leaked as the raw
-/// command string.
+/// `/clear_context review` submitted as the idle prompt: clears context
+/// AND runs "review" as a real prompt in the fresh context. The trailing
+/// argument is recorded as a user message, not leaked as the raw command
+/// string.
 #[tokio::test]
 async fn clear_context_compound_runs_rest_as_prompt() {
     let store = mem_store().await;
@@ -623,12 +636,15 @@ async fn clear_context_compound_runs_rest_as_prompt() {
     .mark_session_created();
     session.messages = msgs.clone();
 
-    run(&mut session, "/act_clear_context review".into(), |_| {})
+    run(&mut session, "/clear_context review".into(), |_| {})
         .await
         .unwrap();
 
-    // Context was cleared and "review" recorded + executed.
-    assert_eq!(session.agent.name, "act", "switched to act");
+    // Context was cleared and "review" recorded + executed; the agent is kept.
+    assert_eq!(
+        session.agent.name, "act",
+        "agent unchanged by clear_context"
+    );
     // "review" was recorded as a real user prompt.
     let has_review = session
         .messages
@@ -646,7 +662,7 @@ async fn clear_context_compound_runs_rest_as_prompt() {
         .map(|m| m.text())
         .collect();
     assert!(
-        !user_texts.iter().any(|t| t.contains("/act_clear_context")),
+        !user_texts.iter().any(|t| t.contains("/clear_context")),
         "raw command must not leak as user text: {:?}",
         user_texts
     );
@@ -659,90 +675,11 @@ async fn clear_context_compound_runs_rest_as_prompt() {
     assert_eq!(assistant_turns, 1, "one assistant turn for 'review'");
 }
 
-/// `/act_clear_context` in plan mode keeps the plan even when the phase state
-/// was reset (counter=0, snapshot=None — e.g. after a manual switch back to
-/// plan mode): the handoff falls back to the newest plan-TAGGED assistant
-/// message in the transcript, so the context is not wiped.
+/// Anti-fabrication regression: a plain assistant answer survives a clear as
+/// a NEUTRAL seed (seed marker persisted, continuity wrapper in the message)
+/// — it is NEVER repackaged as an execution directive, and the agent is kept.
 #[tokio::test]
-async fn clear_context_plan_mode_keeps_plan_after_phase_reset() {
-    let store = mem_store().await;
-    seed(&store, "clear-reset", "plan").await;
-
-    // Transcript: an act-mode answer, then a plan-mode answer tagged `plan`.
-    let msgs = vec![
-        Message::user("u1", "do task X"),
-        {
-            let mut m = Message::assistant("a1");
-            m.blocks.push(ContentBlock::text("task done"));
-            m.agent = Some("act".into());
-            m
-        },
-        Message::user("u2", "plan feature Y"),
-        {
-            let mut m = Message::assistant("a2");
-            m.blocks
-                .push(ContentBlock::text("## Plan\n1. do X\n2. do Y"));
-            m.agent = Some("plan".into());
-            m
-        },
-    ];
-    store.append_messages("clear-reset", &msgs).await.unwrap();
-
-    // ClearContext with a preserved plan now EXECUTES it — push a mock
-    // response for the execution turn.
-    let mock =
-        Arc::new(MockChatClient::new().push_script(vec![done_turn("done")])) as Arc<dyn ChatStream>;
-    let dir = tempfile::tempdir().unwrap();
-    let mut session = SessionState::new(
-        "clear-reset",
-        resolve_agent("plan").unwrap(),
-        config(),
-        mock,
-        dir.path().to_path_buf(),
-    )
-    .with_store(store.clone())
-    .mark_session_created();
-    session.messages = msgs.clone();
-    // The phase state was reset by a manual switch back to plan mode:
-    // counter and snapshot are both cleared, yet the plan must survive.
-    session.reset_plan_phase();
-
-    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let ev_clone = events.clone();
-    run(&mut session, "/act_clear_context".into(), move |ev| {
-        ev_clone.lock().unwrap().push(ev)
-    })
-    .await
-    .unwrap();
-
-    {
-        let evs = events.lock().unwrap();
-        assert_eq!(session.agent.name, "act", "switched to act");
-        assert!(session.handoff_seq.is_some(), "handoff_seq set");
-        // The plan-tagged answer was handed forward — NOT the blank sentinel.
-        assert_eq!(
-            session.handoff_plan.as_deref(),
-            Some("## Plan\n1. do X\n2. do Y"),
-            "plan must be handed forward from the transcript fallback"
-        );
-        assert!(
-            session.messages[0].text().contains("## Plan"),
-            "transcript head carries the plan, not the fresh-start marker"
-        );
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, SessionEvent::PlanHandoff(p) if p.contains("## Plan"))),
-            "PlanHandoff emitted carrying the plan"
-        );
-    }
-}
-
-/// Anti-fabrication regression: in act mode with NO plan (only an act-tagged
-/// assistant answer in the transcript), `/act_clear_context` never mistakes
-/// the act-mode answer for a plan — it survives as a NEUTRAL seed (seed
-/// marker persisted, no PlanHandoff), not as the plan→act directive.
-#[tokio::test]
-async fn clear_context_act_mode_seeds_answer_never_plan_directive() {
+async fn clear_context_seeds_last_say_never_directive() {
     let store = mem_store().await;
     seed(&store, "clear-act", "act").await;
 
@@ -754,7 +691,7 @@ async fn clear_context_act_mode_seeds_answer_never_plan_directive() {
     }];
     store.append_messages("clear-act", &msgs).await.unwrap();
 
-    // The seed path continues running: one scripted execution turn.
+    // The seed path continues running: one scripted follow-up turn.
     let mock = Arc::new(MockChatClient::new().push_script(vec![done_turn("seeded reply")]))
         as Arc<dyn ChatStream>;
     let dir = tempfile::tempdir().unwrap();
@@ -771,7 +708,7 @@ async fn clear_context_act_mode_seeds_answer_never_plan_directive() {
 
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let ev_clone = events.clone();
-    run(&mut session, "/act_clear_context".into(), move |ev| {
+    run(&mut session, "/clear_context".into(), move |ev| {
         ev_clone.lock().unwrap().push(ev)
     })
     .await
@@ -782,12 +719,26 @@ async fn clear_context_act_mode_seeds_answer_never_plan_directive() {
         assert_eq!(
             session.handoff_plan.as_deref(),
             Some("<<OPENCODER_CLEAR_SEED>>task done"),
-            "act mode with no plan preserves the last say as a seed, not a plan"
+            "the last say is preserved as a seed, never as a directive"
+        );
+        assert_eq!(
+            session.agent.name, "act",
+            "ClearContext keeps the active agent"
+        );
+        // The synthetic seed message is neutral: no execution directive leaks.
+        let seed_body = session.messages[0].text();
+        assert!(
+            seed_body.contains("prior context, not a new instruction"),
+            "seed message must be neutral continuity context: {seed_body}"
+        );
+        assert!(
+            !seed_body.contains("Execute it now"),
+            "the autopilot handoff directive must never be synthesized here: {seed_body}"
         );
         assert!(
             !evs.iter()
-                .any(|e| matches!(e, SessionEvent::PlanHandoff(_))),
-            "no PlanHandoff when there is no plan-tagged answer"
+                .any(|e| matches!(e, SessionEvent::AgentSwitch(_))),
+            "no AgentSwitch on clear_context, got {evs:?}"
         );
     }
 }

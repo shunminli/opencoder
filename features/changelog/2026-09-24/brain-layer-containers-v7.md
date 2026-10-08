@@ -1,0 +1,5 @@
+Commit: 48f6127cb5456123c4d083b871cce8b3f7fc527c
+
+# 大脑里程碑容器与 schema 7 上线
+
+定向验证通过：Brain 领域 10 项、Control 分层 API 18 项、Worker 调度 8 项及嵌套/报告 3 项、CLI ontology 5 项、SPA 测试及构建；桌面与移动端画布实测通过。线上单层验收运行 `brain-v7-release-accept-20260924-1829` 完成，子 Agent 执行终态和里程碑评估均可查询。发布 `rel-48f6127cb5456123c4d083b871cce8b3f7fc527c` 的 15 分钟观察通过，171 个采样均通过；发布观察记录在 `/var/tmp/release-live-4d911aef1786c0e0`。

@@ -6,8 +6,21 @@ pub fn build_system(
     agent: &opencoder_core::Agent,
     working_dir: &Path,
     mcp_block: Option<&str>,
+    skill_body: Option<&str>,
 ) -> Message {
+    // Mirror `hide_build_subagent` through the shared core predicate: plan
+    // mode must never see the 'build' (implementation) delegation whatever
+    // prompt it carries (custom `--prompt-file` prompts included), and any
+    // mode strips while the task-plan skill drives plan-only turns. For the
+    // built-in plan prompt this replace is a no-op (stripped at
+    // construction); every other prompt passes through unchanged.
     let mut text = agent.prompt.clone();
+    if opencoder_core::build_delegation_hidden(
+        agent.kind,
+        crate::tools::latent::task_plan_active(skill_body),
+    ) {
+        text = opencoder_core::strip_build_delegation(&text);
+    }
 
     if let Some(instructions) = load_instructions(working_dir) {
         text.push_str("\n\n## Project instructions\n");
@@ -142,7 +155,7 @@ fn load_instructions(working_dir: &Path) -> Option<String> {
     let mut seen: Vec<PathBuf> = Vec::new();
 
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = opencoder_core::platform::home_dir() {
         candidates.push(home.join(".opencoder"));
     }
     if let Some(root) = find_git_root(working_dir) {
@@ -225,11 +238,10 @@ pub fn environment_block(working_dir: &Path, kind: AgentKind) -> String {
     s.push_str(&format!("- Platform: {platform}-{arch}\n"));
     s.push_str(&format!("- Date: {date}\n"));
     s.push_str("- You have file system and shell access via your tools. Run tools in parallel when independent.\n");
-    // In PLAN mode the environment block carries a read-only marker so the
-    // model is discouraged from attempting edits/writes (mutating bash is
-    // intercepted anyway). Omitted in ACT mode to save tokens.
+    // Plan alone gets an explicit mode row. ACT intentionally omits the row:
+    // execution is the default and needs no extra mode description.
     if kind == AgentKind::Plan {
-        s.push_str("- IN_PLAN_MODE: read-only — do not edit/write files; mutating bash is intercepted. Investigate read-only and output a plan only.\n");
+        s.push_str("- MODE: plan (read-only); IN_PLAN_MODE=true — do not edit or write files and do not execute implementation. Every state-changing operation is intercepted and returned in your context. If blocked, do not retry or find another write path; continue read-only analysis and output a focused plan only.\n");
     }
     s
 }
@@ -306,7 +318,9 @@ pub fn _ts() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{cap_instructions, mcp_section, truncate_bytes, AGENTS_MD_MAX_BYTES};
+    use std::path::Path;
+
+    use super::{build_system, cap_instructions, mcp_section, truncate_bytes, AGENTS_MD_MAX_BYTES};
     use crate::mcp::ConnStatus;
 
     #[test]
@@ -389,5 +403,25 @@ mod tests {
                 AGENTS_MD_MAX_BYTES / 1024
             )
         );
+    }
+
+    #[test]
+    fn build_system_strips_build_clause_for_plan_custom_prompt() {
+        // A `--prompt-file` prompt carries the standard tool preamble, which
+        // advertises the build delegation. The plan kind must never surface
+        // it, whatever prompt is stored on the agent.
+        let mut agent = opencoder_core::resolve_agent("plan").expect("plan agent registered");
+        agent.prompt = format!("Custom role prompt.\n\n{}", opencoder_core::tool_preamble());
+        let msg = build_system(&agent, Path::new("."), None, None);
+        assert!(!msg.text().contains(opencoder_core::BUILD_DELEGATION_CLAUSE));
+        assert!(msg.text().contains("Custom role prompt."));
+    }
+
+    #[test]
+    fn build_system_keeps_preamble_for_act_custom_prompt() {
+        let mut agent = opencoder_core::resolve_agent("act").expect("act agent registered");
+        agent.prompt = format!("Custom role prompt.\n\n{}", opencoder_core::tool_preamble());
+        let msg = build_system(&agent, Path::new("."), None, None);
+        assert!(msg.text().contains(opencoder_core::BUILD_DELEGATION_CLAUSE));
     }
 }

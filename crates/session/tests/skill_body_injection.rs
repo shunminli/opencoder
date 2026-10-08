@@ -1,18 +1,22 @@
-//! Persistent skill full-body injection — integration contract tests.
+//! Transient skill full-body delivery — integration contract tests.
 //!
 //! An activated skill (`> Source:`-prefixed body, as `body_with_source`
-//! stores) gets its path + body injected ONCE into the PERSISTENT transcript
-//! as a `synthetic=true` user message (`[skill loaded] <path>` marker) before
-//! the first LLM round that follows activation — eliminating the "model must
-//! `read` SKILL.md" tool-call round-trip. Bodies over ~20K tokens inject as a
-//! whole-line prefix plus an `[INCOMPLETE SKILL]` notice whose `offset=`
-//! aligns with the read tool (chain-continuation). The transient tail
-//! reminder remains the fallback pointer only.
+//! stores) ships its path + merged body as a TRANSIENT per-call payload
+//! message (`[skill loaded] <path>` marker block), appended after the
+//! transcript by `runner/llm_call.rs` for EVERY LLM round of the run that
+//! armed the skill — eliminating the "model must `read` SKILL.md" tool-call
+//! round-trip. The message is NEVER recorded to the transcript or the
+//! store, so run end (`skill_lifecycle::clear_on_run_end`) stops the
+//! submission entirely: subsequent runs start skill-less. Bodies over ~20K
+//! tokens ship as a whole-line prefix plus an `[INCOMPLETE SKILL]` notice
+//! whose `offset=` aligns with the read tool (chain-continuation); the
+//! tail reminder stays a fallback pointer for the degenerate empty-body
+//! case only.
 
 use std::sync::Arc;
 
-use opencoder_core::{resolve_agent, Config, Message, Role};
-use opencoder_llm::{LlmEvent, MockChatClient};
+use opencoder_core::{resolve_agent, Config};
+use opencoder_llm::{CompletedToolCall, LlmEvent, MockChatClient, Usage};
 use opencoder_session::{run, SessionState};
 use opencoder_store::{LibsqlStore, Store};
 
@@ -21,6 +25,20 @@ fn done_turn(text: &str) -> LlmEvent {
         text: text.into(),
         tool_calls: vec![],
         usage: None,
+    }
+}
+
+/// A tool-call turn so one run spans several LLM rounds (each round must
+/// re-derive the transient body while the skill stays armed).
+fn bash_turn(text: &str) -> LlmEvent {
+    LlmEvent::Completed {
+        text: text.into(),
+        tool_calls: vec![CompletedToolCall {
+            id: "tu1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({ "command": "true" }),
+        }],
+        usage: Some(Usage::default()),
     }
 }
 
@@ -52,7 +70,7 @@ fn session_on(
 
 /// System-message content of a request ("" when absent).
 fn system_content(req: &opencoder_llm::ChatRequest) -> String {
-    req.messages
+    opencoder_llm::lower_messages(&req.messages)
         .iter()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
@@ -60,13 +78,11 @@ fn system_content(req: &opencoder_llm::ChatRequest) -> String {
         .to_string()
 }
 
-/// Content of the LAST user-role message — where the transient tail
-/// reminder rides.
-fn last_user_content(req: &opencoder_llm::ChatRequest) -> String {
-    req.messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+/// Content of the LAST payload message: the slot the transient skill
+/// context occupies (nothing may ride after it).
+fn last_message_content(req: &opencoder_llm::ChatRequest) -> String {
+    opencoder_llm::lower_messages(&req.messages)
+        .last()
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
         .unwrap_or("")
         .to_string()
@@ -74,18 +90,20 @@ fn last_user_content(req: &opencoder_llm::ChatRequest) -> String {
 
 /// Whether any user-role payload message contains `needle`.
 fn any_user_contains(req: &opencoder_llm::ChatRequest, needle: &str) -> bool {
-    req.messages.iter().any(|m| {
-        m.get("role").and_then(|r| r.as_str()) == Some("user")
-            && m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|c| c.contains(needle))
-    })
+    opencoder_llm::lower_messages(&req.messages)
+        .iter()
+        .any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains(needle))
+        })
 }
 
 /// Non-overlapping occurrence count of `needle` across all user-role
 /// payload messages.
 fn count_user_occurrences(req: &opencoder_llm::ChatRequest, needle: &str) -> usize {
-    req.messages
+    opencoder_llm::lower_messages(&req.messages)
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
@@ -93,157 +111,166 @@ fn count_user_occurrences(req: &opencoder_llm::ChatRequest, needle: &str) -> usi
         .sum()
 }
 
-/// The persistent `[skill loaded] <path>` message in the in-memory
-/// transcript, if injected.
-fn injected<'a>(s: &'a SessionState, path: &str) -> Option<&'a Message> {
-    let marker = format!("[skill loaded] {path}\n");
-    s.messages
-        .iter()
-        .find(|m| m.synthetic && m.role == Role::User && m.text().starts_with(&marker))
-}
-
-/// Total `[skill loaded]` messages in the transcript (any path).
-fn injected_count(s: &SessionState) -> usize {
-    s.messages
-        .iter()
-        .filter(|m| m.synthetic && m.role == Role::User && m.text().starts_with("[skill loaded] "))
-        .count()
-}
-
-/// 1. Small skill: first turn's payload carries the full body as a `[skill
-/// loaded]` user message; the message is synthetic, lives in the persistent
-/// transcript AND the store; system prompt and transient tail stay clean.
+/// (a) The armed body ships EXACTLY ONCE for the whole activation: the
+/// FIRST LLM round's payload carries it as the TRAILING message (marker
+/// line + body, system prompt clean, fallback pointer suppressed), every
+/// LATER round of the same run carries NEITHER body NOR marker; (b) the
+/// message never lands in the in-memory transcript nor in the store; (c)
+/// once the run ends and the one-shot skill clears, the following plain
+/// run submits neither body nor `[active skill]` tail.
 #[tokio::test]
-async fn small_skill_body_rides_payload_and_persists() {
+async fn armed_body_ships_once_then_stops_and_is_never_persisted() {
     let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
+    // Run 1 spans TWO LLM rounds (tool call, then Done); run 2 is plain.
     let mock = Arc::new(
         MockChatClient::new()
-            .push_script(vec![done_turn("one")])
-            .push_script(vec![done_turn("two")]),
+            .push_script(vec![bash_turn("use the tool")])
+            .push_script(vec![done_turn("did it")])
+            .push_script(vec![done_turn("plain work")]),
     );
-    let (mut s, _wd) = session_on("inj-small", "act", mock.clone());
+    let (mut s, _wd) = session_on("inj-transient", "act", mock.clone());
     s.store = Some(store.clone());
     let path = "/skills/review/SKILL.md";
+    let marker = format!("[skill loaded] {path}");
     s.set_skill(Some(sourced_body(path, "REV-STEP-1\nREV-STEP-2")));
 
     run(&mut s, "do the thing".into(), |_| {}).await.unwrap();
 
-    let req = &mock.requests()[0];
-    assert!(
-        any_user_contains(req, &format!("[skill loaded] {path}")),
-        "marker message rides the payload"
-    );
-    assert!(
-        any_user_contains(req, "REV-STEP-1\nREV-STEP-2"),
-        "full body"
-    );
-    assert!(!system_content(req).contains("REV-STEP"), "system clean");
-    assert!(
-        !last_user_content(req).contains("REV-STEP"),
-        "tail reminder carries no body — it is only the fallback pointer"
-    );
-    assert!(last_user_content(req).contains("[active skill]"));
+    let run1 = mock.requests();
+    assert_eq!(run1.len(), 2, "tool round + done round");
 
-    let inj = injected(&s, path).expect("marker message recorded in transcript");
-    assert!(inj.synthetic, "synthetic flag set");
+    // Round 1 (delivery round): the body rides exactly once, trailing.
+    let req = &run1[0];
     assert_eq!(
-        inj.text(),
-        format!("[skill loaded] {path}\n\nREV-STEP-1\nREV-STEP-2")
+        count_user_occurrences(req, "REV-STEP-1"),
+        1,
+        "delivery round: body rides exactly once"
+    );
+    assert!(
+        any_user_contains(req, &marker),
+        "delivery round: marker line names the source path"
+    );
+    assert_eq!(
+        count_user_occurrences(req, &marker),
+        1,
+        "delivery round: one sorted marker block"
+    );
+    let last = last_message_content(req);
+    assert!(
+        last.starts_with(&marker),
+        "delivery round: body is the TRAILING payload message: {last:.120}"
+    );
+    assert!(
+        !system_content(req).contains("REV-STEP"),
+        "delivery round: system prompt stays clean"
+    );
+    assert!(
+        !any_user_contains(req, "[active skill]"),
+        "delivery round: fallback pointer suppressed while the body ships"
     );
 
-    // Durable: survives a store round-trip (resume can replay it).
+    // Round 2..N of the same run: NO skill body anywhere in the payload.
+    let req = &run1[1];
+    assert_eq!(
+        count_user_occurrences(req, "REV-STEP"),
+        0,
+        "round 2 carries no skill body — one-shot delivery is spent"
+    );
+    assert!(
+        !any_user_contains(req, &marker),
+        "round 2 carries no [skill loaded] marker"
+    );
+    assert!(
+        !system_content(req).contains("REV-STEP"),
+        "round 2: system prompt stays clean"
+    );
+    assert!(
+        !any_user_contains(req, "[active skill]"),
+        "round 2: fallback pointer still suppressed (body was delivered)"
+    );
+
+    // (b) Zero persistence: not in the transcript, not in the store.
+    assert!(
+        !s.messages.iter().any(|m| m.text().contains(&marker)),
+        "no [skill loaded] message in session.messages"
+    );
     let persisted = store.load_messages(&s.id).await.unwrap();
     assert!(
-        persisted.iter().any(|m| m.synthetic
-            && m.role == Role::User
-            && m.text().starts_with(&format!("[skill loaded] {path}"))),
-        "injection persisted to the store"
+        !persisted.iter().any(|m| m.text().contains(&marker)),
+        "no [skill loaded] message in store.load_messages"
     );
 
-    // Idempotent: a second turn must not re-inject.
-    run(&mut s, "again".into(), |_| {}).await.unwrap();
-    assert_eq!(injected_count(&s), 1, "one-shot per skill path");
-    let req2 = &mock.requests()[1];
-    assert_eq!(count_user_occurrences(req2, "REV-STEP-1"), 1);
-    // System bytes stable across the two turns (prefix-cache contract).
-    assert_eq!(system_content(req), system_content(req2));
+    // (c) The follow-up plain run: no body, no tail.
+    run(&mut s, "plain follow up".into(), |_| {}).await.unwrap();
+    let run2 = &mock.requests()[2];
+    assert_eq!(
+        count_user_occurrences(run2, "REV-STEP"),
+        0,
+        "post-clear run carries no body"
+    );
+    assert!(
+        !any_user_contains(run2, &marker) && !any_user_contains(run2, "[active skill]"),
+        "post-clear run carries neither marker nor tail"
+    );
+    assert!(s.skill_prompt_cloned().is_none(), "one-shot clear ran");
 }
 
-/// 2. Oversized skill (>20K tokens): injected as the largest whole-line
-/// prefix that fits plus an `[INCOMPLETE SKILL]` notice; `offset=` is the
-/// 1-based line right after the truncation point (read-tool alignment); the
-/// dropped lines never reach the payload.
+/// (e) Compound prompt (`$A $B`): ONE trailing message on the delivery
+/// round with a single sorted marker block, the merged body keeping B's
+/// inner `> Source:` annotation, each body shipping exactly once — and
+/// the second round of the run carries none of it.
 #[tokio::test]
-async fn oversized_skill_body_truncates_with_continuation_notice() {
-    // 5 lines x ~19K chars ≈ 23.7K tokens; 4 lines ≈ 19K fit.
-    let line = |n: usize| format!("BIG-{n:02} {}", "x".repeat(19_000));
-    let body = (0..5usize).map(line).collect::<Vec<_>>().join("\n");
-    assert!(opencoder_llm::estimate(&body) > 20_000);
-
-    let mock = Arc::new(MockChatClient::new().push_script(vec![done_turn("ok")]));
-    let (mut s, _wd) = session_on("inj-big", "act", mock.clone());
-    let path = "/skills/big/SKILL.md";
-    s.set_skill(Some(sourced_body(path, &body)));
-
-    run(&mut s, "go".into(), |_| {}).await.unwrap();
-
-    let inj = injected(&s, path).expect("truncated injection still recorded");
-    let text = inj.text();
-    assert!(
-        text.contains(&format!(
-            "[INCOMPLETE SKILL] truncated at ~20K tokens; 1 lines remain; \
-             read the rest with the read tool: read(path=\"{path}\", offset=5)."
-        )),
-        "notice names remaining lines + next offset: {}",
-        &text[text.len().saturating_sub(220)..]
-    );
-    let cut = text
-        .find("\n[INCOMPLETE SKILL]")
-        .expect("notice follows prefix");
-    assert!(
-        opencoder_llm::estimate(&text[..cut]) <= 20_000,
-        "marker + truncated prefix stays within budget"
-    );
-    assert!(text[..cut].contains("BIG-03"), "lines 0..=3 kept");
-    assert!(!text[..cut].contains("BIG-04"), "line 4 dropped");
-
-    let req = &mock.requests()[0];
-    assert!(any_user_contains(req, "BIG-03"));
-    assert!(
-        !any_user_contains(req, "BIG-04"),
-        "truncated-away lines never reach the payload"
-    );
-}
-
-/// 3. Switching skills appends a NEW injection (append-only transcript);
-/// both bodies ride later payloads, and the old one is never deleted.
-#[tokio::test]
-async fn switching_skills_injects_new_entry_keeps_old() {
+async fn compound_body_keeps_inner_annotation_and_one_sorted_marker_block() {
     let mock = Arc::new(
         MockChatClient::new()
-            .push_script(vec![done_turn("one")])
-            .push_script(vec![done_turn("two")]),
+            .push_script(vec![bash_turn("work")])
+            .push_script(vec![done_turn("done")]),
     );
-    let (mut s, _wd) = session_on("inj-switch", "act", mock.clone());
-    s.set_skill(Some(sourced_body("/skills/a/SKILL.md", "A-BODY")));
-    run(&mut s, "use A".into(), |_| {}).await.unwrap();
+    let (mut s, _wd) = session_on("inj-compound", "act", mock.clone());
+    s.set_skill(Some(format!(
+        "{}\n\n{}",
+        sourced_body("/skills/alpha/SKILL.md", "A-BODY"),
+        sourced_body("/skills/beta/SKILL.md", "B-BODY")
+    )));
 
-    s.set_skill(Some(sourced_body("/skills/b/SKILL.md", "B-BODY")));
-    run(&mut s, "now B".into(), |_| {}).await.unwrap();
+    run(&mut s, "compound work".into(), |_| {}).await.unwrap();
 
-    assert!(injected(&s, "/skills/a/SKILL.md").is_some());
-    assert!(injected(&s, "/skills/b/SKILL.md").is_some());
-    assert_eq!(injected_count(&s), 2);
-    let req2 = &mock.requests()[1];
-    assert!(any_user_contains(req2, "A-BODY"), "old entry preserved");
-    assert!(any_user_contains(req2, "B-BODY"), "new entry injected");
+    // Delivery round: one sorted block + merged body with inner annotation.
+    let req = &mock.requests()[0];
+    assert_eq!(
+        last_message_content(req),
+        "[skill loaded] /skills/alpha/SKILL.md\n\
+         [skill loaded] /skills/beta/SKILL.md\n\n\
+         A-BODY\n\n> Source: /skills/beta/SKILL.md\n\nB-BODY",
+        "delivery round: one sorted block + merged body with inner annotation"
+    );
+    assert_eq!(
+        count_user_occurrences(req, "[skill loaded]"),
+        2,
+        "delivery round: exactly the two marker lines"
+    );
+    assert_eq!(count_user_occurrences(req, "A-BODY"), 1);
+    assert_eq!(count_user_occurrences(req, "B-BODY"), 1);
+
+    // Round 2 of the same run: marker block and bodies fully absent.
+    let req = &mock.requests()[1];
+    assert_eq!(
+        count_user_occurrences(req, "[skill loaded]"),
+        0,
+        "round 2 carries no marker block"
+    );
+    assert_eq!(
+        count_user_occurrences(req, "-BODY"),
+        0,
+        "round 2 carries no body"
+    );
 }
 
-/// 4. Exclusions mirror `tail_reminder` gating: subagents (`explore`) and
-/// the todos scheduler (`workflow`, itself Primary-mode) never get the
-/// injection — transcript or payload.
+/// (f) Exclusions: subagents (`explore`) and the todos scheduler
+/// (`workflow`, itself Primary-mode) — and skill-less sessions — never get
+/// a body message in payload or transcript.
 #[tokio::test]
-async fn subagent_and_workflow_never_get_injection() {
+async fn excluded_agents_and_skill_less_sessions_get_no_body() {
     for agent in ["explore", "workflow"] {
         let mock = Arc::new(MockChatClient::new().push_script(vec![done_turn("ok")]));
         let (mut s, _wd) = session_on(&format!("inj-excl-{agent}"), agent, mock.clone());
@@ -251,55 +278,64 @@ async fn subagent_and_workflow_never_get_injection() {
 
         run(&mut s, "scoped".into(), |_| {}).await.unwrap();
 
-        assert_eq!(injected_count(&s), 0, "{agent}: no transcript injection");
-        let req = &mock.requests()[0];
         assert!(
-            !any_user_contains(req, "[skill loaded]"),
+            !s.messages
+                .iter()
+                .any(|m| m.text().contains("[skill loaded]")),
+            "{agent}: no transcript injection"
+        );
+        assert!(
+            !any_user_contains(&mock.requests()[0], "[skill loaded]"),
             "{agent}: no payload injection"
         );
     }
-}
 
-/// 5. Legacy bodies without a `> Source:` prefix carry no path, hence no
-/// injection — the transient `[active skill]` reminder doesn't fire either.
-#[tokio::test]
-async fn legacy_body_without_source_prefix_is_not_injected() {
+    // Skill-less Primary session: nothing to deliver.
     let mock = Arc::new(MockChatClient::new().push_script(vec![done_turn("ok")]));
-    let (mut s, _wd) = session_on("inj-legacy", "act", mock.clone());
-    s.set_skill(Some("LEGACY-BODY".into()));
-
-    run(&mut s, "go".into(), |_| {}).await.unwrap();
-
-    assert_eq!(injected_count(&s), 0);
-    assert!(!any_user_contains(&mock.requests()[0], "[skill loaded]"));
+    let (mut s, _wd) = session_on("inj-skillless", "act", mock.clone());
+    run(&mut s, "plain work".into(), |_| {}).await.unwrap();
+    assert!(
+        !any_user_contains(&mock.requests()[0], "[skill loaded]"),
+        "skill-less payload carries no marker"
+    );
+    assert!(!any_user_contains(&mock.requests()[0], "[active skill]"));
 }
 
-/// 6. Frontmatter-only skill → empty body: no marker-only `[skill loaded]`
-/// message is recorded or sent; the transient tail's path pointer remains
-/// the only trace of the skill.
+/// Degenerate armed skill with an EMPTY parsed body (frontmatter-only
+/// file): no body message is derived or sent, and the transient tail keeps
+/// its `[active skill]` fallback pointer to the source path — the only
+/// trace of the skill.
 #[tokio::test]
-async fn empty_body_skill_is_not_injected() {
+async fn empty_body_skill_ships_no_body_but_keeps_tail_pointer() {
     let mock = Arc::new(MockChatClient::new().push_script(vec![done_turn("ok")]));
     let (mut s, _wd) = session_on("inj-empty", "act", mock.clone());
     s.set_skill(Some(sourced_body("/skills/e/SKILL.md", "")));
 
     run(&mut s, "go".into(), |_| {}).await.unwrap();
 
-    assert_eq!(injected_count(&s), 0, "no marker-only transcript message");
-    let marker = "[skill loaded] /skills/e/SKILL.md";
+    let req = &mock.requests()[0];
     assert!(
-        !any_user_contains(&mock.requests()[0], marker),
-        "no payload injection (tail's generic marker mention excluded: {})",
-        last_user_content(&mock.requests()[0])
+        !any_user_contains(req, "[skill loaded] /skills/e/SKILL.md"),
+        "no marker-only body message (tail's generic marker mention excluded: {})",
+        last_message_content(req)
     );
-    // The transient tail's path pointer remains the only trace.
-    assert!(last_user_content(&mock.requests()[0]).contains("/skills/e/SKILL.md"));
+    let last = last_message_content(req);
+    assert!(
+        last.contains("[active skill]") && last.contains("/skills/e/SKILL.md"),
+        "fallback pointer names the source path: {last}"
+    );
+    assert!(
+        !s.messages
+            .iter()
+            .any(|m| m.text().contains("[skill loaded]")),
+        "nothing persisted"
+    );
 }
 
-/// 7. End-to-end BOM frontmatter: a SKILL.md saved as UTF-8 with BOM (plus
+/// End-to-end BOM frontmatter: a SKILL.md saved as UTF-8 with BOM (plus
 /// blank lines before the fence) parses its frontmatter, and only the
-/// post-fence body is injected — the `name:`/`description:` comment block
-/// never reaches the transcript or payload.
+/// post-fence body ships in the transient message — the
+/// `name:`/`description:` comment block never reaches the payload.
 #[tokio::test]
 async fn bom_frontmatter_end_to_end_injects_only_body() {
     let root = tempfile::tempdir().unwrap();
@@ -327,15 +363,17 @@ async fn bom_frontmatter_end_to_end_injects_only_body() {
     run(&mut s, "go".into(), |_| {}).await.unwrap();
 
     let path = skill.source.display().to_string();
-    let inj = injected(&s, &path).expect("body injected once parsed");
-    let text = inj.text();
-    assert!(text.contains("BOM-BODY-ONLY"), "{text}");
+    let last = last_message_content(&mock.requests()[0]);
     assert!(
-        !text.contains("name: bom-skill"),
-        "no frontmatter leak: {text}"
+        last.starts_with(&format!("[skill loaded] {path}\n\nBOM-BODY-ONLY")),
+        "body ships under the marker naming the real source file: {last:.200}"
     );
-    assert!(!text.contains("---"), "no fence leak: {text}");
-    let req = &mock.requests()[0];
-    assert!(any_user_contains(req, "BOM-BODY-ONLY"));
-    assert!(!any_user_contains(req, "name: bom-skill"));
+    assert!(
+        !any_user_contains(&mock.requests()[0], "name: bom-skill"),
+        "no frontmatter leak"
+    );
+    assert!(
+        !any_user_contains(&mock.requests()[0], "\n---\n"),
+        "no fence leak"
+    );
 }

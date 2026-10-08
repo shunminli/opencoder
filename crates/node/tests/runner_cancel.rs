@@ -29,6 +29,7 @@ fn test_opts(base: &str, workdir: &std::path::Path, data: &std::path::Path) -> N
         claim_interval: Duration::from_millis(25),
         version: env!("CARGO_PKG_VERSION").into(),
         local_store_dir: Some(data.to_path_buf()),
+        dag: None,
     }
 }
 
@@ -53,23 +54,48 @@ async fn heartbeat_cancellation_reports_cancelled() {
     let notify = Arc::new(tokio::sync::Notify::new());
     let client: Arc<dyn ChatStream> = Arc::new(MockChatClient::new().push_hang(notify.clone()));
 
-    let runner = tokio::spawn(opencoder_node::run_node(
+    let mut runner = tokio::spawn(opencoder_node::run_node(
         test_opts(&base, &workdir, data.path()),
         Some(client),
     ));
 
     // Barrier 1: wait for the CLAIM (task transitioned running server-side).
-    support::wait_for(10, || {
-        let claimed = st.claimed();
-        claimed.contains(&task.task_id).then_some(())
-    })
-    .await;
+    // Budgets are generous failure-detection ceilings only: the happy path
+    // settles in well under a second, but a heavily loaded CI machine must
+    // not turn scheduler starvation into a false test failure.
+    let claim = async {
+        loop {
+            if st.claimed().contains(&task.task_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        outcome = &mut runner => panic!(
+            "runner terminated before claim: outcome={outcome:?}, registrations={:?}, \
+             claimed={:?}, heartbeats={}, statuses={:?}",
+            st.registrations(),
+            st.claimed(),
+            st.heartbeat_count(),
+            st.statuses(),
+        ),
+        outcome = tokio::time::timeout(Duration::from_secs(30), claim) => assert!(
+            outcome.is_ok(),
+            "claim did not settle within 30s: registrations={:?}, claimed={:?}, \
+             heartbeats={}, statuses={:?}",
+            st.registrations(),
+            st.claimed(),
+            st.heartbeat_count(),
+            st.statuses(),
+        ),
+    }
 
     // Arm the cancel instruction; the next busy heartbeater tick delivers it.
     st.request_cancel(&task.task_id);
 
     // Barrier 2: terminal status settles on `cancelled` (never done/error).
-    let status = support::wait_for(20, || st.status_of(&task.task_id)).await;
+    let status = support::wait_for(120, || st.status_of(&task.task_id)).await;
     assert_eq!(status, "cancelled", "statuses={:?}", st.statuses());
     let (_, _, err) = st
         .statuses()

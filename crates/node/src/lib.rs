@@ -10,7 +10,9 @@
 //! session crate's canonical `sse_kind()`/`sse_data()` accessors.
 
 pub mod batcher;
+pub mod control;
 pub mod executor;
+pub mod fleet;
 pub mod runner;
 pub mod uplink;
 
@@ -21,6 +23,30 @@ use opencoder_llm::ChatStream;
 use tokio::sync::watch;
 
 pub use runner::{NodeOpts, DEFAULT_CLAIM_INTERVAL, DEFAULT_HEARTBEAT_INTERVAL, REGISTER_ATTEMPTS};
+
+/// Extension point the agent binary injects: claim + execute DAG runs.
+/// Keeps the node crate free of the VM/runc dependency chain — the loop
+/// here only knows the trait, the agent wires in the real scheduler
+/// (`opencoder-dag-runtime`) plus its session/LLM dependencies.
+#[async_trait::async_trait]
+// async_trait annotates futures that are already must-use on Rust 1.99.
+#[allow(clippy::double_must_use)]
+pub trait DagHook: Send + Sync {
+    /// Poll for the next due DAG run for this node (`None` = nothing due).
+    async fn claim(
+        &self,
+        node_id: &str,
+    ) -> anyhow::Result<Option<opencoder_dag::protocol::DagClaimedRun>>;
+
+    /// Execute one claimed run to a terminal status. `cancel_rx` carries the
+    /// same heartbeater/shutdown-fed flag as the prompt-task path (`true` =
+    /// abort); the implementation reports its own terminal status upstream.
+    async fn execute(
+        &self,
+        run: opencoder_dag::protocol::DagClaimedRun,
+        cancel_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()>;
+}
 
 /// Resolve once the watched boolean flag turns `true`. A dropped sender parks
 /// forever instead of synthesizing a flip: cancellation must come from an
@@ -64,6 +90,7 @@ mod tests {
             claim_interval: Duration::from_millis(1500),
             version: env!("CARGO_PKG_VERSION").into(),
             local_store_dir: None,
+            dag: None,
         };
         let err = opts.validate().unwrap_err().to_string();
         assert!(

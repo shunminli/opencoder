@@ -1,11 +1,20 @@
-//! Integration test: plan-mode bash write commands are blocked at the runner
-//! level by `bash_guard`, while read-only commands execute normally.
+//! Integration test: plan-mode interceptions return a model-visible error
+//! so the LLM learns the session is read-only and stops retrying writes.
 //!
 //! Contracts:
-//! - A `rm -rf` call in plan mode produces a ToolEnd with is_error=true and
-//!   output containing "Blocked in plan mode" — the command never executes.
+//! - A `rm -rf` call in plan mode produces a ToolEnd with is_error=true
+//!   and output containing "Blocked in plan mode" - the command never
+//!   executes, and the message points at `/agent act` as the way out.
+//! - A tool the plan schema never advertises (e.g. a hallucinated `edit`)
+//!   is refused with the same denial and NEVER executes - no silent writes.
 //! - A `ls` call in plan mode produces a ToolEnd with is_error=false.
+//! - `cd` navigation is read-only and executes; a blocked call routes context
+//!   gathering to the read-only 'explore' subagent instead of bash.
 //! - The act agent is unaffected (no guard).
+//! - bash classification happens in the call's effective workdir (the
+//!   `workdir` input, defaulting to the session working dir) — the same
+//!   directory the command runs in. Relative writes are blocked from both
+//!   `/tmp` and ordinary workdirs.
 
 use std::sync::Arc;
 
@@ -20,13 +29,34 @@ fn config() -> Config {
     }
 }
 
+/// A workdir OUTSIDE the /tmp release scope. The crate tree itself may sit
+/// under /tmp (which the shellguard releases wholesale), so tests that need
+/// a *plain* directory must not anchor on CARGO_MANIFEST_DIR.
+fn plain_workdir(prefix: &str) -> tempfile::TempDir {
+    let home = std::env::var("HOME").expect("$HOME set");
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(home)
+        .expect("writable $HOME for a non-released workdir")
+}
+
 fn bash_turn(cmd: &str) -> LlmEvent {
+    bash_turn_in(cmd, None)
+}
+
+/// A bash call with an explicit per-call `workdir` — exactly the shape the
+/// model can emit and the tool executes with (`bash -lc …` in that dir).
+fn bash_turn_in(cmd: &str, workdir: Option<&str>) -> LlmEvent {
+    let mut input = serde_json::json!({ "command": cmd });
+    if let Some(workdir) = workdir {
+        input["workdir"] = serde_json::json!(workdir);
+    }
     LlmEvent::Completed {
         text: "".into(),
         tool_calls: vec![CompletedToolCall {
             id: "bash-1".into(),
             name: "bash".into(),
-            input: serde_json::json!({"command": cmd}),
+            input,
         }],
         usage: Some(Usage {
             input_tokens: 5,
@@ -47,14 +77,26 @@ fn done_turn() -> LlmEvent {
 
 #[tokio::test]
 async fn plan_mode_blocks_write_command() {
+    // Use a cwd-relative target in a controlled plain directory. If the
+    // command ever ran, its effect would be observable inside this fixture.
+    let workdir = plain_workdir("sg-guard-block-");
     let mock = Arc::new(
         MockChatClient::new()
-            .push_script(vec![bash_turn("rm -rf /tmp/opencoder-test-guard")])
+            .push_script(vec![bash_turn_in(
+                "rm -rf ./opencoder-test-guard",
+                Some(workdir.path().to_str().unwrap()),
+            )])
             .push_script(vec![done_turn()]),
     );
     let dir = tempfile::tempdir().unwrap();
     let agent = resolve_agent("plan").unwrap();
-    let mut session = SessionState::new("guard-1", agent, config(), mock, dir.path().to_path_buf());
+    let mut session = SessionState::new(
+        "guard-1",
+        agent,
+        config(),
+        mock.clone(),
+        dir.path().to_path_buf(),
+    );
 
     let mut events = Vec::new();
     run(&mut session, "try to delete".into(), |ev| events.push(ev))
@@ -78,11 +120,28 @@ async fn plan_mode_blocks_write_command() {
             output.contains("Blocked in plan mode"),
             "output must explain the block, got: {output}"
         );
+        assert!(
+            output.contains("/agent act"),
+            "block must point at the real escape hatch (/agent act), got: {output}"
+        );
+        assert!(output.contains("output a plan only"), "got: {output}");
     }
+
+    // The ToolOutput is appended before the next model round: the model sees
+    // both the read-only mode and the instruction to stop implementation.
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let retry_context = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(retry_context.contains("Blocked in plan mode (read-only)"));
+    assert!(retry_context.contains("output a plan only"));
+    assert!(retry_context.contains("Do not retry"));
+    // The denial routes context gathering to the read-only explore subagent.
+    assert!(retry_context.contains("'explore' subagent (task tool)"));
 }
 
 #[tokio::test]
 async fn plan_mode_allows_read_only_command() {
+    // Plain read-only command, no release-set involvement: allowed anywhere.
     let mock = Arc::new(
         MockChatClient::new()
             .push_script(vec![bash_turn("ls -la")])
@@ -113,11 +172,89 @@ async fn plan_mode_allows_read_only_command() {
 }
 
 #[tokio::test]
-async fn act_mode_is_not_guarded() {
-    // The same write command in act mode should NOT be blocked by bash_guard.
+async fn plan_mode_allows_cd_navigation() {
+    // `cd` writes no state and the classifier re-aims its analysis cwd, so
+    // navigating must execute: any resolvable `cd` used to be intercepted.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
     let mock = Arc::new(
         MockChatClient::new()
-            .push_script(vec![bash_turn("mkdir -p /tmp/opencoder-test-act-guard")])
+            .push_script(vec![bash_turn("cd src && ls")])
+            .push_script(vec![done_turn()]),
+    );
+    let agent = resolve_agent("plan").unwrap();
+    let mut session =
+        SessionState::new("guard-cd", agent, config(), mock, dir.path().to_path_buf());
+
+    let mut events = Vec::new();
+    run(&mut session, "navigate".into(), |ev| events.push(ev))
+        .await
+        .unwrap();
+
+    let tool_end = events
+        .iter()
+        .find(|e| matches!(e, SessionEvent::ToolEnd { name, .. } if name == "bash"));
+    assert!(tool_end.is_some(), "expected a ToolEnd for bash");
+    if let SessionEvent::ToolEnd {
+        is_error, output, ..
+    } = tool_end.unwrap()
+    {
+        assert!(
+            !*is_error,
+            "cd navigation must not be blocked in plan mode, output: {output}"
+        );
+        assert!(!output.contains("Blocked in plan mode"), "got: {output}");
+    }
+}
+
+#[tokio::test]
+async fn plan_mode_blocks_unresolvable_cd_and_routes_to_explore() {
+    // Fail-closed stays: an unresolvable destination (an unset variable —
+    // `$HOME` expands statically, so it is judgeable and allowed) blocks,
+    // and the denial routes context gathering to the explore subagent.
+    let dir = tempfile::tempdir().unwrap();
+    let mock = Arc::new(
+        MockChatClient::new()
+            .push_script(vec![bash_turn("cd $UNSET_VAR_XYZ && ls")])
+            .push_script(vec![done_turn()]),
+    );
+    let agent = resolve_agent("plan").unwrap();
+    let mut session = SessionState::new(
+        "guard-cd-var",
+        agent,
+        config(),
+        mock,
+        dir.path().to_path_buf(),
+    );
+
+    let mut events = Vec::new();
+    run(&mut session, "go home".into(), |ev| events.push(ev))
+        .await
+        .unwrap();
+
+    let tool_end = events
+        .iter()
+        .find(|e| matches!(e, SessionEvent::ToolEnd { name, .. } if name == "bash"));
+    if let SessionEvent::ToolEnd {
+        is_error, output, ..
+    } = tool_end.expect("expected a ToolEnd for bash")
+    {
+        assert!(*is_error, "unresolvable cd must stay blocked");
+        assert!(output.contains("Blocked in plan mode"), "got: {output}");
+        assert!(output.contains("'explore' subagent"), "got: {output}");
+    }
+}
+
+#[tokio::test]
+async fn act_mode_is_not_guarded() {
+    // The same write command in act mode should NOT be blocked by bash_guard.
+    // NOTE: the command is cwd-relative on purpose — /tmp is in the plan
+    // release set, so a /tmp target would no longer distinguish guarded from
+    // unguarded modes. Relative paths resolve inside this test's tempdir
+    // session dir, so nothing outside the test's control is touched.
+    let mock = Arc::new(
+        MockChatClient::new()
+            .push_script(vec![bash_turn("mkdir -p ./opencoder-test-act-guard")])
             .push_script(vec![done_turn()]),
     );
     let dir = tempfile::tempdir().unwrap();
@@ -149,6 +286,8 @@ async fn act_mode_is_not_guarded() {
 #[tokio::test]
 async fn plan_mode_allows_devnull_redirect() {
     // A read-only redirect to /dev/null (common with find/grep) must pass.
+    // /dev/null is part of the declared plan release set (alongside /tmp),
+    // so discarding output stays permitted in plan mode.
     let mock = Arc::new(
         MockChatClient::new()
             .push_script(vec![bash_turn("find . -name '*.rs' 2>/dev/null | head")])
@@ -191,8 +330,9 @@ async fn plan_mode_allows_devnull_redirect() {
 #[tokio::test]
 async fn plan_mode_allows_subshell_fd_merge() {
     // `(cmd 2>&1)` and brace groups used to be blocked because the trailing
-    // `)` was folded into the redirect target. These are read-only and must
-    // run in plan mode.
+    // `)` was folded into the redirect target. These are read-only (an fd
+    // merge writes no file — no release-set involvement) and must run in
+    // plan mode.
     let mock = Arc::new(
         MockChatClient::new()
             .push_script(vec![bash_turn("(echo hi 2>&1) | head")])
@@ -235,8 +375,9 @@ async fn plan_mode_allows_subshell_fd_merge() {
 #[tokio::test]
 async fn plan_mode_allows_tee_to_devnull() {
     // `tee /dev/null` discards its copy and is read-only; it must not be
-    // blocked in plan mode. `tee <realfile>` is still blocked (covered by the
-    // unit tests in bash_guard).
+    // blocked in plan mode. /dev/null is part of the declared plan release
+    // set; `tee <realfile>` outside /tmp + /dev/null is still blocked (covered
+    // by the compat unit tests in bash_guard).
     let mock = Arc::new(
         MockChatClient::new()
             .push_script(vec![bash_turn("echo hi | tee /dev/null")])
@@ -268,6 +409,122 @@ async fn plan_mode_allows_tee_to_devnull() {
     }
 }
 
+/// A unique workdir under the literal `/tmp` release dir (the plan release
+/// set hardcodes `/tmp`, so the fixture must live beneath it, not under
+/// `TMPDIR`). RAII-cleaned by the returned guard.
+fn tmp_released_workdir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("sg-{tag}-"))
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn plan_mode_blocks_relative_write_in_tmp_call_workdir() {
+    // `/tmp` remains a shellguard sandbox release, but plan mode is stricter:
+    // it consumes the typed write-effect provenance and blocks the operation.
+    let workdir = tmp_released_workdir("tmp-workdir");
+    let mock = Arc::new(
+        MockChatClient::new()
+            .push_script(vec![bash_turn_in(
+                "touch sg-newfile",
+                Some(workdir.path().to_str().unwrap()),
+            )])
+            .push_script(vec![done_turn()]),
+    );
+    // The session working dir itself is a plain /tmp tempdir here; the
+    // release must come from the call's `workdir` input, not the session dir
+    // default — so the session dir is placed OUTSIDE the release set.
+    let session_dir = tempfile::Builder::new()
+        .prefix("sg-session-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .unwrap();
+    let agent = resolve_agent("plan").unwrap();
+    let mut session = SessionState::new(
+        "guard-workdir-tmp",
+        agent,
+        config(),
+        mock,
+        session_dir.path().to_path_buf(),
+    );
+
+    let mut events = Vec::new();
+    run(&mut session, "touch in tmp workdir".into(), |ev| {
+        events.push(ev)
+    })
+    .await
+    .unwrap();
+
+    let tool_end = events
+        .iter()
+        .find(|e| matches!(e, SessionEvent::ToolEnd { name, .. } if name == "bash"));
+    assert!(tool_end.is_some(), "expected a ToolEnd for bash");
+    if let SessionEvent::ToolEnd {
+        is_error, output, ..
+    } = tool_end.unwrap()
+    {
+        assert!(*is_error, "relative /tmp write must be blocked: {output}");
+        assert!(output.contains("Blocked in plan mode (read-only)"));
+        assert!(output.contains("output a plan only"));
+    }
+    assert!(
+        !workdir.path().join("sg-newfile").exists(),
+        "blocked /tmp write must never execute"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_blocks_write_in_plain_call_workdir() {
+    // Counterpart of the /tmp-workdir test: the IDENTICAL command from a
+    // plain (non-released) per-call workdir must be refused with the plan
+    // denial — nothing may execute.
+    let workdir = plain_workdir("sg-plain-workdir-");
+    let mock = Arc::new(
+        MockChatClient::new()
+            .push_script(vec![bash_turn_in(
+                "touch sg-newfile",
+                Some(workdir.path().to_str().unwrap()),
+            )])
+            .push_script(vec![done_turn()]),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let agent = resolve_agent("plan").unwrap();
+    let mut session = SessionState::new(
+        "guard-workdir-plain",
+        agent,
+        config(),
+        mock,
+        dir.path().to_path_buf(),
+    );
+
+    let mut events = Vec::new();
+    run(&mut session, "touch in plain workdir".into(), |ev| {
+        events.push(ev)
+    })
+    .await
+    .unwrap();
+
+    let tool_end = events
+        .iter()
+        .find(|e| matches!(e, SessionEvent::ToolEnd { name, .. } if name == "bash"));
+    assert!(tool_end.is_some(), "expected a ToolEnd for bash");
+    if let SessionEvent::ToolEnd {
+        is_error, output, ..
+    } = tool_end.unwrap()
+    {
+        assert!(*is_error, "plain-workdir write must be blocked");
+        assert!(
+            output.contains("Blocked in plan mode"),
+            "output must explain the block, got: {output}"
+        );
+    }
+    // The gate fired before execution: nothing was created.
+    assert!(
+        !workdir.path().join("sg-newfile").exists(),
+        "blocked command must never execute"
+    );
+}
+
 fn ev_name(e: &SessionEvent) -> &'static str {
     match e {
         SessionEvent::TextDelta(_) => "TextDelta",
@@ -277,4 +534,78 @@ fn ev_name(e: &SessionEvent) -> &'static str {
         SessionEvent::Error(_) => "Error",
         _ => "Other",
     }
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_unadvertised_tool_without_executing() {
+    // `edit` is not in the plan allowlist, so the model is never shown it.
+    // If a stale/hallucinated call still arrives it must be refused with the
+    // plan denial — the tool body must never run (no silent writes).
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim.txt");
+    std::fs::write(&victim, "aaa").unwrap();
+
+    let edit_turn = LlmEvent::Completed {
+        text: "".into(),
+        tool_calls: vec![CompletedToolCall {
+            id: "edit-1".into(),
+            name: "edit".into(),
+            input: serde_json::json!({
+                "path": victim.to_str().unwrap(),
+                "old_string": "aaa",
+                "new_string": "bbb",
+            }),
+        }],
+        usage: None,
+    };
+    let mock = Arc::new(
+        MockChatClient::new()
+            .push_script(vec![edit_turn])
+            .push_script(vec![done_turn()]),
+    );
+    let agent = resolve_agent("plan").unwrap();
+    let mut session = SessionState::new(
+        "guard-edit",
+        agent,
+        config(),
+        mock,
+        dir.path().to_path_buf(),
+    );
+
+    let mut events = Vec::new();
+    run(&mut session, "edit the file".into(), |ev| events.push(ev))
+        .await
+        .unwrap();
+
+    let denied = events
+        .iter()
+        .find(|e| matches!(e, SessionEvent::ToolEnd { name, .. } if name == "edit"));
+    assert!(
+        denied.is_some(),
+        "expected a ToolEnd for the refused edit, got: {:?}",
+        events.iter().map(ev_name).collect::<Vec<_>>()
+    );
+    if let SessionEvent::ToolEnd {
+        is_error, output, ..
+    } = denied.unwrap()
+    {
+        assert!(
+            *is_error,
+            "unadvertised tool must be an error for the model"
+        );
+        assert!(
+            output.contains("Blocked in plan mode"),
+            "denial must name the mode, got: {output}"
+        );
+        assert!(
+            output.contains("/agent act"),
+            "denial must point at the real escape hatch, got: {output}"
+        );
+    }
+    // The decisive assertion: the edit tool never executed.
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "aaa",
+        "plan mode must not let an unadvertised tool write"
+    );
 }

@@ -1,6 +1,6 @@
 //! Best-effort mirror of ts-owned sessions into the central ts registry.
 //!
-//! `opencode ts` sessions live in the cli registry (`<data_root>/ts.db`); the
+//! `opencoder ts` sessions live in the cli registry (`<data_root>/ts.db`); the
 //! TUI itself only persists to its per-workdir store. This wrapper sits between
 //! the TUI and that store and mirrors the durable index columns (title,
 //! preview) the cli needs for `ts -l`/`ts -r`. Plain `tui`/`run` sessions are
@@ -18,8 +18,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use opencoder_core::{Message, Role};
 use opencoder_store::{
-    Delivery, ImportReport, SessionEventRecord, SessionFilter, SessionInput, SessionListItem,
-    SessionMeta, SessionPatch, Store, SubagentTaskRecord, TsRecord, TsRegistry,
+    Delivery, ImportReport, InputAdmission, SessionEventRecord, SessionFilter, SessionInput,
+    SessionListItem, SessionMeta, SessionPatch, Store, SubagentTaskRecord, TsRecord, TsRegistry,
 };
 use tokio::sync::Mutex;
 
@@ -139,6 +139,31 @@ impl TsMirrorStore {
 
 #[async_trait]
 impl Store for TsMirrorStore {
+    async fn set_message_usage(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        usage: &opencoder_core::MessageUsage,
+    ) -> Result<()> {
+        self.inner
+            .set_message_usage(session_id, message_id, usage)
+            .await
+    }
+
+    async fn harness_runtime(
+        &self,
+        id: &str,
+    ) -> Result<Option<opencoder_core::harness::HarnessRuntime>> {
+        self.inner.harness_runtime(id).await
+    }
+    async fn set_harness_runtime(
+        &self,
+        id: &str,
+        runtime: &opencoder_core::harness::HarnessRuntime,
+    ) -> Result<()> {
+        self.inner.set_harness_runtime(id, runtime).await
+    }
+
     fn backend_name(&self) -> &'static str {
         self.inner.backend_name()
     }
@@ -218,6 +243,10 @@ impl Store for TsMirrorStore {
 
     async fn admit_input(&self, input: &SessionInput) -> Result<i64> {
         self.inner.admit_input(input).await
+    }
+
+    async fn admit_input_once(&self, input: &SessionInput) -> Result<InputAdmission> {
+        self.inner.admit_input_once(input).await
     }
 
     async fn pending_inputs(

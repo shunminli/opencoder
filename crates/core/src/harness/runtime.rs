@@ -1,0 +1,128 @@
+//! Private, versioned execution configuration; Agent cards contain references only.
+use super::CodexSettings;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Versioned<T> {
+    pub revision: u64,
+    pub settings: T,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeSettings {
+    pub profiles: BTreeMap<String, Versioned<CodexSettings>>,
+    /// Opaque historical fields round-trip through persisted execution snapshots.
+    /// Only profiles are interpreted by current execution code.
+    #[serde(flatten)]
+    pub archived: BTreeMap<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for RuntimeSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeSettings")
+            .field("profiles", &self.profiles)
+            .field("archived_field_count", &self.archived.len())
+            .finish()
+    }
+}
+
+/// Combine node-private profiles with the Server's frozen profile snapshot.
+/// A Server entry wins as a whole version; unspecified node entries remain local.
+impl RuntimeSettings {
+    pub fn with_server(&self, server: &Self) -> Self {
+        let mut combined = self.clone();
+        combined.profiles.extend(server.profiles.clone());
+        combined.archived.extend(server.archived.clone());
+        combined
+    }
+}
+
+/// Resolve only the explicitly selected profile. Missing references are errors.
+pub fn agent_settings<'a>(
+    config: &'a crate::Config,
+    agent: &str,
+) -> Result<Option<&'a CodexSettings>, String> {
+    match crate::agent::read_agent_meta(agent).and_then(|meta| meta.harness_profile) {
+        Some(name) => config
+            .agent
+            .runtime
+            .profiles
+            .get(&name)
+            .map(|profile| Some(&profile.settings))
+            .ok_or_else(|| format!("Codex profile {name} unavailable for agent {agent}")),
+        None => Ok(config.agent.codex.as_ref()),
+    }
+}
+
+pub fn pin_agent_settings(
+    runtime: &mut super::HarnessRuntime,
+    config: &crate::Config,
+    agent: &str,
+) -> Result<(), String> {
+    if runtime.harness == super::Harness::Codex
+        && runtime.codex.is_none()
+        && runtime.thread_id.is_none()
+        && runtime.last_input_id.is_none()
+    {
+        crate::agent::scope::with_root_sync(config.agent.agents_dir.clone(), || {
+            super::pin_settings(runtime, agent_settings(config, agent)?);
+            Ok::<_, String>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+    fn profile(revision: u64, model: &str) -> Versioned<CodexSettings> {
+        Versioned {
+            revision,
+            settings: CodexSettings {
+                model: Some(model.into()),
+                ..Default::default()
+            },
+        }
+    }
+    #[test]
+    fn server_profiles_win_whole_versions_and_node_private_profiles_survive() {
+        let node = RuntimeSettings {
+            profiles: BTreeMap::from([
+                ("node-private".into(), profile(1, "node-private")),
+                ("shared".into(), profile(4, "node-shared")),
+            ]),
+            ..Default::default()
+        };
+        let server = RuntimeSettings {
+            profiles: BTreeMap::from([
+                ("shared".into(), profile(2, "server-frozen")),
+                ("server-only".into(), profile(1, "server-only")),
+            ]),
+            ..Default::default()
+        };
+        let merged = node.with_server(&server);
+        assert_eq!(
+            merged.profiles["node-private"],
+            node.profiles["node-private"]
+        );
+        assert_eq!(merged.profiles["shared"], server.profiles["shared"]);
+        assert_eq!(
+            merged.profiles["server-only"],
+            server.profiles["server-only"]
+        );
+        assert_eq!(node.profiles.len(), 2);
+        assert_eq!(server.profiles.len(), 2);
+    }
+    #[test]
+    fn ordinary_empty_node_configuration_keeps_exact_server_behavior() {
+        let node = RuntimeSettings::default();
+        let server = RuntimeSettings {
+            profiles: BTreeMap::from([("shared".into(), profile(3, "existing"))]),
+            ..Default::default()
+        };
+        assert_eq!(node.with_server(&server), server);
+        assert_eq!(node.with_server(&RuntimeSettings::default()), node);
+    }
+}

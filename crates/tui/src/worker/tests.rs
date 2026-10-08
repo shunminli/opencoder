@@ -47,82 +47,50 @@ fn gate_switch_rejects_when_running() {
     assert_eq!(gate_switch(true), SwitchGate::SkipRunning);
 }
 
-// ── cmd-channel pressure hygiene (dedup + best-effort try_send) ─────────────
+// ── control-command worker semantics (pure prompt path) ─────────────────────
 
-#[test]
-fn dedup_switch_drops_consecutive_same_name() {
-    // Same target twice in a row: the second send carries no new state (the
-    // UI chip was already optimistically folded) — drop it.
-    assert!(dedup_switch(
-        Some(&UiCmd::SwitchAgent("plan".into())),
-        &UiCmd::SwitchAgent("plan".into())
-    ));
-}
-
-#[test]
-fn dedup_switch_allows_different_name() {
-    assert!(!dedup_switch(
-        Some(&UiCmd::SwitchAgent("act".into())),
-        &UiCmd::SwitchAgent("plan".into())
-    ));
-}
-
-#[test]
-fn dedup_switch_allows_first_send() {
-    // No predecessor recorded yet: always send.
-    assert!(!dedup_switch(None, &UiCmd::SwitchAgent("plan".into())));
-}
-
-#[test]
-fn dedup_switch_never_drops_switch_and_start() {
-    let and_start = UiCmd::SwitchAndStart("plan".into(), String::new());
-    // SwitchAndStart starts a turn — it is NOT an idempotent pure switch…
-    assert!(!dedup_switch(
-        Some(&UiCmd::SwitchAgent("plan".into())),
-        &and_start
-    ));
-    // …and a pure switch following a SwitchAndStart is never collapsed
-    // against it either (the helper only dedups SwitchAgent-vs-SwitchAgent).
-    assert!(!dedup_switch(
-        Some(&and_start),
-        &UiCmd::SwitchAgent("plan".into())
-    ));
+// The worker has no SwitchAgent/SwitchAndStart arms anymore: an agent switch
+// or a clear-context fold arrives as a plain `UiCmd::Prompt` carrying the
+// control-command text. `process_cmd` forwards it to `run_session`, whose
+// idle short-circuit applies the command (no LLM call) and emits the
+// lifecycle events the UI chip folds from.
+#[tokio::test]
+async fn prompt_control_cmd_switches_agent_without_llm_turn() {
+    let (evt_tx, mut evt_rx) = mpsc::channel::<UiEvent>(64);
+    let mut sess = test_session("switch-cmd");
+    let _ = process_cmd(
+        UiCmd::Prompt("/plan".into(), Vec::new()),
+        &mut sess,
+        &evt_tx,
+    )
+    .await;
+    assert_eq!(sess.agent.name, "plan", "pure prompt switches the agent");
+    let saw_switch = std::iter::from_fn(|| evt_rx.try_recv().ok())
+        .any(|e| matches!(e, UiEvent::Session(SessionEvent::AgentSwitch(ref n)) if n == "plan"));
+    assert!(saw_switch, "an AgentSwitch event must reach the UI bridge");
 }
 
 #[tokio::test]
-async fn try_send_idempotent_enqueues_when_capacity_remains() {
-    let (tx, mut rx) = mpsc::channel::<UiCmd>(1);
-    assert!(try_send_idempotent(&tx, UiCmd::SwitchAgent("plan".into())));
-    assert!(matches!(rx.recv().await, Some(UiCmd::SwitchAgent(_))));
-}
-
-#[tokio::test]
-async fn try_send_idempotent_drops_without_awaiting_when_full() {
-    let (tx, _rx) = mpsc::channel::<UiCmd>(1);
-    tx.send(UiCmd::Compact).await.unwrap(); // fill the only slot
-                                            // try_send is synchronous: a full channel drops the command instead of
-                                            // awaiting capacity (the app_loop-level test proves the loop unblocks).
+async fn prompt_clear_context_folds_transcript_and_emits_reset() {
+    use opencoder_core::{ContentBlock, Message};
+    let (evt_tx, mut evt_rx) = mpsc::channel::<UiEvent>(64);
+    let mut sess = test_session("clear-cmd");
+    let mut say = Message::assistant("a1");
+    say.blocks.push(ContentBlock::text("the latest say"));
+    sess.messages.push(say);
+    let _ = process_cmd(
+        UiCmd::Prompt(crate::clear_confirm::CLEAR_CONTEXT_CMD.into(), Vec::new()),
+        &mut sess,
+        &evt_tx,
+    )
+    .await;
+    assert_eq!(sess.messages.len(), 1, "transcript folds to one seed");
+    let saw_reset = std::iter::from_fn(|| evt_rx.try_recv().ok())
+        .any(|e| matches!(e, UiEvent::Session(SessionEvent::TranscriptReset(_))));
     assert!(
-        !try_send_idempotent(&tx, UiCmd::SwitchAgent("plan".into())),
-        "full channel must drop the idempotent command, not block"
+        saw_reset,
+        "a TranscriptReset event must reach the UI bridge"
     );
-}
-
-#[tokio::test]
-async fn try_send_idempotent_reports_closed_channel() {
-    let (tx, rx) = mpsc::channel::<UiCmd>(1);
-    drop(rx);
-    assert!(!try_send_idempotent(&tx, UiCmd::SwitchAgent("plan".into())));
-}
-
-// Gate failure must not swallow the composer input: without a handoff the
-// captured extra text is submitted as a normal act-mode prompt; with a
-// handoff (or nothing captured) the run starts with an empty prompt.
-#[test]
-fn handoff_run_prompt_only_runs_extra_without_handoff() {
-    assert_eq!(handoff_run_prompt(&None, "x".into()), "x");
-    assert_eq!(handoff_run_prompt(&Some("plan".into()), "x".into()), "");
-    assert_eq!(handoff_run_prompt(&None, String::new()), "");
 }
 
 // F1 + G1 guard: after a `/task` switch, all parent and child runtime
@@ -250,7 +218,7 @@ async fn reset_cancel_replaces_with_fresh_uncancelled_token() {
 
 // EditPlan rewrites the Text blocks of the last non-empty Assistant message
 // in-memory while preserving non-Text blocks (Reasoning/ToolUse/etc.). This
-// guards the plan-mode edit path: an edit that dropped Reasoning blocks or
+// guards the plan editor edit path: an edit that dropped Reasoning blocks or
 // failed to swap the text would break here. It must not break the loop.
 #[tokio::test]
 async fn edit_plan_replaces_text_and_preserves_non_text_blocks() {
@@ -267,7 +235,7 @@ async fn edit_plan_replaces_text_and_preserves_non_text_blocks() {
         std::env::temp_dir(),
     );
 
-    // Realistic plan-mode assistant shape: a Reasoning block followed by the
+    // Realistic plan editor assistant shape: a Reasoning block followed by the
     // plan Text block.
     let mut msg = Message::assistant("a1");
     msg.blocks = vec![
@@ -365,41 +333,87 @@ async fn edit_annotation_blank_clears_requirement() {
     );
 }
 
+/// 中途压缩(TranscriptReset)把消息列表整体替换后，完成回合的可靠
+/// AssistantFinal 仍须送达：修复地板要跟随重置后的消息数，而不是停留在
+/// 压缩前的越界下标（旧代码 `get(floor..)` 返回 None → 修复静默丢失，
+/// 被丢弃的 delta 行界就永久冻结）。
 #[tokio::test]
-async fn ordered_forwarder_drops_only_repairable_parent_text() {
-    let (tx, mut rx) = mpsc::channel::<UiEvent>(DELTA_MIN_CAPACITY + 1);
-    tx.send(UiEvent::TurnDone("sentinel".into())).await.unwrap();
-    assert_eq!(tx.capacity(), DELTA_MIN_CAPACITY);
-    let (pending, forwarder) = spawn_ui_event_forwarder(tx);
+async fn prompt_after_midrun_compaction_still_sends_completed_answer() {
+    use opencoder_llm::{LlmEvent, MockChatClient, Usage};
 
-    forward_event(&pending, SessionEvent::TextDelta("droppable".into()));
-    forward_event(
-        &pending,
-        SessionEvent::SubagentChild {
-            id: "s1".into(),
-            ev: Box::new(SessionEvent::TextDelta("child text".into())),
+    let mock = MockChatClient::new()
+        .push_script(vec![
+            LlmEvent::TextDelta("intermediate".into()),
+            LlmEvent::Completed {
+                text: "intermediate say".into(),
+                tool_calls: vec![opencoder_llm::CompletedToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": "echo x"}),
+                }],
+                usage: Some(Usage {
+                    input_tokens: 100_000,
+                    output_tokens: 1,
+                    total_tokens: 100_001,
+                    ..Default::default()
+                }),
+            },
+        ])
+        // 压缩摘要调用（small_model 走同一个 client）。
+        .push_script(vec![LlmEvent::Completed {
+            text: "compaction summary".into(),
+            tool_calls: Vec::new(),
+            usage: None,
+        }])
+        // 压缩后的最终回答。
+        .push_script(vec![LlmEvent::Completed {
+            text: "final answer".into(),
+            tool_calls: Vec::new(),
+            usage: None,
+        }]);
+    let mut sess = SessionState::new(
+        "compact-final",
+        opencoder_core::resolve_agent("act").unwrap(),
+        {
+            let mut cfg = opencoder_core::Config::default();
+            cfg.compaction.context_threshold = 50_000;
+            cfg
         },
+        Arc::new(mock),
+        std::env::temp_dir(),
     );
-    forward_event(&pending, SessionEvent::ReasoningDelta("thinking".into()));
-    forward_event(&pending, SessionEvent::TranscriptReset(Vec::new()));
-    drop(pending);
-    forwarder.await.unwrap();
+    // 预置一段长转录，使 run 开始时的 message_floor 远大于压缩后的消息数。
+    for i in 0..40 {
+        sess.messages.push(opencoder_core::Message::user(
+            "seed",
+            format!("seed message {i} {}", "x".repeat(80)),
+        ));
+    }
+    let (evt_tx, mut evt_rx) = mpsc::channel::<UiEvent>(256);
 
-    assert!(matches!(rx.recv().await, Some(UiEvent::TurnDone(agent)) if agent == "sentinel"));
-    assert!(matches!(
-        rx.recv().await,
-        Some(UiEvent::Session(SessionEvent::SubagentChild { ev, .. }))
-            if matches!(*ev, SessionEvent::TextDelta(ref text) if text == "child text")
-    ));
-    assert!(matches!(
-        rx.recv().await,
-        Some(UiEvent::Session(SessionEvent::ReasoningDelta(text))) if text == "thinking"
-    ));
-    assert!(matches!(
-        rx.recv().await,
-        Some(UiEvent::Session(SessionEvent::TranscriptReset(messages))) if messages.is_empty()
-    ));
-    assert!(rx.try_recv().is_err(), "parent TextDelta must be shed");
+    assert!(
+        !process_cmd(
+            UiCmd::Prompt("question".into(), Vec::new()),
+            &mut sess,
+            &evt_tx
+        )
+        .await
+    );
+    let mut saw_reset = false;
+    let mut final_answer: Option<String> = None;
+    while let Ok(event) = evt_rx.try_recv() {
+        match event {
+            UiEvent::Session(SessionEvent::TranscriptReset(_)) => saw_reset = true,
+            UiEvent::AssistantFinal(text) => final_answer = Some(text),
+            _ => {}
+        }
+    }
+    assert!(saw_reset, "test premise: compaction actually ran mid-run");
+    assert_eq!(
+        final_answer.as_deref(),
+        Some("final answer"),
+        "reliable completed answer must survive the mid-run compaction"
+    );
 }
 
 #[test]

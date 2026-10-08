@@ -154,7 +154,7 @@ pub fn rounded_block_line(title: &Line<'static>) -> Block<'static> {
 }
 
 /// [`rounded_block_line`] plus a session-lifetime `[tok cost]` label (and,
-/// when `turn_ms > 0`, a `·`-separated `[turn cost]` duration) on the bottom
+/// when `turn_ms > 0`, a `·`-separated `[call cost]` duration) on the bottom
 /// border's left corner — the fourth info corner of the body block (right-
 /// bottom holds the follow indicator). Both segments render in the warn
 /// colour — the same as the status bar's task timer and running-spinner
@@ -164,7 +164,7 @@ pub fn rounded_block_line(title: &Line<'static>) -> Block<'static> {
 /// guards narrow terminals with graded dropping: when the `[tok cost]`
 /// segment alone could collide with the right-bottom indicator (which
 /// reserves ~10 display columns at the right edge) the whole label is
-/// dropped; when only the `[turn cost]` addition would overflow, just the
+/// dropped; when only the `[call cost]` addition would overflow, just the
 /// tok segment is kept. `turn_ms == 0` omits the turn segment entirely.
 /// Pure builder — no globals.
 pub fn rounded_block_line_tok(
@@ -179,7 +179,7 @@ pub fn rounded_block_line_tok(
         crate::fmt::format_tokens_cost_m(tokens_total)
     );
     let turn = if turn_ms > 0 {
-        format!("[turn cost {}]", crate::fmt::format_run_duration(turn_ms))
+        format!("[call cost {}]", crate::fmt::format_run_duration(turn_ms))
     } else {
         String::new()
     };
@@ -263,12 +263,38 @@ pub fn context_meter(pct: u8) -> (String, Color) {
     (bar, color)
 }
 
-/// Agent chip foreground colour: warning colour in plan mode, accent otherwise.
+/// Agent chip foreground colour: warning colour in plan (read-only) mode,
+/// accent otherwise. `sidecar` gets its own magenta hue so the focused
+/// sidecar chip is distinguishable from both act and plan.
 pub fn agent_chip_fg(agent: &str) -> Color {
     if agent == "plan" {
         warn_color()
+    } else if agent == "sidecar" {
+        sidecar_color()
     } else {
         accent()
+    }
+}
+
+/// Sidecar accent hue (magenta): used by the `⇲ sidecar` block label and the
+/// `[sidecar]` mode chip while the sidecar box is focused. Distinct from the
+/// plan warn / act accent mapping so the three chips never collide.
+pub fn sidecar_color() -> Color {
+    Color::Magenta
+}
+
+/// Foreground of the parent status-bar mode dot + `[mode]` chip: the plain
+/// [`agent_chip_fg`] mapping, except the `act` chip lights up in the sandbox
+/// warning hue while the committed skill is `task-plan`. The yellow reverts
+/// when any other skill is committed, or a steer/queued input without a
+/// `$task-plan` token takes effect; a consumed input that does carry the
+/// token re-arms it (the runner newly activates that skill at the
+/// consumption boundary, matching an idle submit).
+pub fn status_chip_fg(mode: &str, plan_skill_active: bool) -> Color {
+    if mode == "act" && plan_skill_active {
+        warn_color()
+    } else {
+        agent_chip_fg(mode)
     }
 }
 
@@ -403,7 +429,33 @@ mod tests {
     #[test]
     fn agent_chip_fg_non_plan_is_accent() {
         assert_eq!(agent_chip_fg("act"), ACCENT);
+        // The interlude `sandbox` spelling must no longer map to the plan hue.
+        assert_eq!(agent_chip_fg("sandbox"), ACCENT);
         assert_eq!(agent_chip_fg(""), ACCENT);
+    }
+
+    #[test]
+    fn agent_chip_fg_sidecar_is_distinct_magenta() {
+        // The sidecar chip must be distinguishable from both act and plan,
+        // and must not leak into the plan_skill_active warn branch of
+        // `status_chip_fg` (that branch is act-only).
+        let sidecar = agent_chip_fg("sidecar");
+        assert_eq!(sidecar, sidecar_color());
+        assert_ne!(sidecar, agent_chip_fg("act"));
+        assert_ne!(sidecar, agent_chip_fg("plan"));
+        assert_eq!(status_chip_fg("sidecar", true), sidecar);
+    }
+
+    // -- status_chip_fg ----------------------------------------------------───────────
+
+    #[test]
+    fn status_chip_fg_act_lights_yellow_for_task_plan() {
+        assert_eq!(status_chip_fg("act", true), WARN);
+        assert_eq!(status_chip_fg("act", false), ACCENT);
+        // Only the act status changes hue; plan is already the warning colour.
+        assert_eq!(status_chip_fg("plan", true), WARN);
+        assert_eq!(status_chip_fg("plan", false), WARN);
+        assert_eq!(status_chip_fg("explore", true), ACCENT);
     }
 
     // ── user_color ────────────────────────────────────────────────────────

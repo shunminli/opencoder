@@ -1,14 +1,31 @@
-//! Bash command write-detection for plan-mode enforcement.
+//! Bash command write-detection for read-only session enforcement (plan
+//! mode and the sidecar bypass loop).
 //!
-//! In plan mode the agent must not modify the system. Rather than removing
-//! `bash` entirely (it's useful for `ls`, `cat`, `grep`, `find`), we classify
-//! each command as read-only or potentially-mutating and block the latter.
+//! In plan mode the agent must not modify the system, and the sidecar — a
+//! temporary Q&A loop over a snapshot of the main session — shares that
+//! invariant. Rather than removing `bash` entirely (it's useful for `ls`,
+//! `cat`, `grep`, `find`), we classify each command as read-only or
+//! potentially-mutating and block the latter.
 //!
-//! The classifier is heuristic: it parses the command string for known
-//! write patterns (file-writing redirects, mutating commands, package managers,
-//! git writes, in-place editors). False positives are acceptable (over-blocking in plan
-//! mode is safe); false negatives are the risk we minimize by covering the
-//! common patterns.
+//! The classifier is now a thin adapter over the [`opencoder-shellguard`]
+//! crate, which is derived from [rippy](https://github.com/mpecan/rippy)
+//! (MIT license, copyright the rippy authors). Plan/sidecar policy: block all
+//! risk-bearing writes. Shellguard still identifies sandbox-released `/tmp`
+//! writes, but the read-only sessions reject those too: only non-persistent
+//! device/fd redirects remain harmless. `Ask`/`Deny` and any state-writing
+//! `Allow` verdict block.
+//!
+//! Classification is cwd-relative (a bare `touch f` means "write `f` in the
+//! working directory"), so the cwd handed to [`classify_with_dir`] MUST be
+//! the directory the command will actually execute in — the per-call
+//! `workdir` input for bash, not the agent process's cwd. Classifying
+//! against any other directory is the B2 bypass: from a process cwd under
+//! `/tmp` a released verdict lets the write land in the real workdir.
+//!
+//! The command-parsing helpers below (`cmd_base`, `strip_wrappers` and their
+//! private support fns) are preserved verbatim from the previous hand-written
+//! classifier: [`crate::tools::ssh_pty`] reuses them to unwrap
+//! privilege-escalators before running commands on remote hosts.
 
 /// Verdict on whether a bash command may modify state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,438 +36,196 @@ pub enum BashVerdict {
     WriteBlocked(String),
 }
 
-/// Commands that unconditionally modify the filesystem or system state.
-/// Matched as the first token (before any arguments). Case-sensitive: these
-/// are conventionally lowercase.
-const MUTATING_COMMANDS: &[&str] = &[
-    "rm",
-    "rmdir",
-    "mv",
-    "cp",
-    "mkdir",
-    "touch",
-    "install",
-    "truncate",
-    "chmod",
-    "chown",
-    "ln",
-    "dd",
-    "mkfs",
-    "mount",
-    "umount",
-    "fdisk",
-    "parted",
-    "kill",
-    "pkill",
-    "killall",
-    "systemctl",
-    "service",
-    "shutdown",
-    "reboot",
-    "poweroff",
-    "halt",
-];
-
-/// Git subcommands that write state.
-const GIT_WRITE_SUBS: &[&str] = &[
-    "push",
-    "commit",
-    "merge",
-    "rebase",
-    "reset",
-    "clean",
-    "stash",
-    "tag",
-    "init",
-    "clone",
-    "fetch",
-    "pull",
-    "cherry-pick",
-    "revert",
-    "bisect",
-    "worktree",
-    "reflog",
-    "update-ref",
-    "symbolic-ref",
-];
-
-/// Package manager install/update commands.
-const PACKAGE_MANAGERS: &[&str] = &[
-    "apt", "apt-get", "yum", "dnf", "pacman", "zypper", "brew", "pip", "pip3", "pipx", "uv",
-    "conda", "npm", "pnpm", "yarn", "bun", "cargo", "go", "gem", "composer",
-];
-
-/// Shell interpreters that execute arbitrary code when given `-c` or `-s`.
-/// Matched as the first token (path-qualified names are handled via
-/// `cmd_base`). Blocking is conditional on the `-c`/`-s` flag so a bare
-/// `bash` or `sh` (e.g. checking `bash --version`) is not blocked.
-const SHELL_INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "fish"];
-
-/// Script interpreters that execute inline code via `-c`/`-e`/`-r`.
-/// Blocking is conditional on the flag so bare invocations are allowed.
-const SCRIPT_INTERPRETERS: &[&str] = &[
-    "python", "python3", "python2", "node", "ruby", "perl", "lua", "php", "php8",
-];
-
-/// Extract inner command strings from command/process substitution syntax:
-/// `$(...)`, backticks, `<(...)`, and `>(...)`.
+/// Classify a bash command for plan-mode enforcement by delegating to
+/// `opencoder_shellguard::classify` (derived from rippy, MIT). `Allow`
+/// passes; `Ask`/`Deny` block, carrying the classifier's human-readable
+/// reason (embedded verbatim in the tool error shown to the model).
 ///
-/// Uses balanced-paren matching for `$(...)` and `<(...)`/`>(...)`.
-/// Backticks use paired matching.
-fn extract_command_substitutions(cmd: &str) -> Vec<String> {
-    let chars: Vec<char> = cmd.chars().collect();
-    let mut results = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        // $(...)
-        if i + 1 < chars.len() && chars[i] == '$' && chars[i + 1] == '(' {
-            if let Some(end) = find_matching_paren(&chars, i + 1) {
-                let inner: String = chars[i + 2..end].iter().collect();
-                if !inner.trim().is_empty() {
-                    results.push(inner);
-                }
-                i = end + 1;
-                continue;
-            }
-        }
-        // <(...) or >(...)
-        if i + 1 < chars.len() && (chars[i] == '<' || chars[i] == '>') && chars[i + 1] == '(' {
-            if let Some(end) = find_matching_paren(&chars, i + 1) {
-                let inner: String = chars[i + 2..end].iter().collect();
-                if !inner.trim().is_empty() {
-                    results.push(inner);
-                }
-                i = end + 1;
-                continue;
-            }
-        }
-        // Backtick
-        if chars[i] == '`' {
-            if let Some(rel) = chars[i + 1..].iter().position(|&c| c == '`') {
-                let inner: String = chars[i + 1..i + 1 + rel].iter().collect();
-                if !inner.trim().is_empty() {
-                    results.push(inner);
-                }
-                i = i + 1 + rel + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    results
-}
-
-/// Find the index of the `)` that matches the `(` at position `start`.
-fn find_matching_paren(chars: &[char], start: usize) -> Option<usize> {
-    if chars.get(start) != Some(&'(') {
-        return None;
-    }
-    let mut depth = 0;
-    for (i, &c) in chars.iter().enumerate().skip(start) {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Classify a bash command string.
-///
-/// Handles compound commands (`a && b`, `a; b`, `a | b`) by checking each
-/// segment independently. If ANY segment is mutating, the whole command is
-/// blocked. A segment that is the right-hand side of a pipe and invokes an
-/// interpreter without a script file (`curl … | sh`) is blocked as well: the
-/// interpreter executes its piped stdin.
+/// Relative paths resolve against the *process* cwd. Production gating must
+/// use [`classify_with_dir`] with the directory the command will run in:
+/// the classification cwd must equal the execution cwd.
 pub fn classify(command: &str) -> BashVerdict {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return BashVerdict::ReadOnly;
-    }
-
-    // Check for file-writing redirect operators anywhere in the command.
-    // Read-only redirects (/dev/null, fd merges like 2>&1) are allowed; only
-    // redirects that write to a real file are blocked.
-    if let Some(reason) = has_unsafe_redirect(trimmed) {
-        return BashVerdict::WriteBlocked(reason);
-    }
-
-    // Recursively classify commands nested inside command/process
-    // substitution: `$(...)`, backticks, `<(...)`, `>(...)`. Without this,
-    // `echo "$(rm file)"` bypasses plan-mode because `echo` itself is
-    // read-only but the substitution runs `rm`.
-    for inner in extract_command_substitutions(trimmed) {
-        match classify(&inner) {
-            BashVerdict::WriteBlocked(reason) => {
-                return BashVerdict::WriteBlocked(format!("nested command substitution: {reason}"));
-            }
-            BashVerdict::ReadOnly => {}
-        }
-    }
-
-    // Split into segments by &&, ;, |, and check each.
-    for segment in split_segments(trimmed) {
-        if let Some(reason) = classify_segment(&segment.text) {
-            return BashVerdict::WriteBlocked(reason);
-        }
-        // The right-hand side of a pipe reads upstream output on stdin: an
-        // interpreter invoked there with no script-file argument (`curl … |
-        // sh`, `cat x.py | python -`) executes that input.
-        if segment.stdin_from_pipe {
-            if let Some(reason) = pipe_fed_interpreter_reason(&segment.text) {
-                return BashVerdict::WriteBlocked(reason);
-            }
-        }
-    }
-
-    BashVerdict::ReadOnly
+    map_verdict(opencoder_shellguard::classify(command))
 }
 
-/// Detect *unsafe* redirect operators — those that write to a real file.
-///
-/// Read-only redirects are allowed: discarding output to `/dev/null` and
-/// merging file descriptors (`2>&1`, `1>&2`) don't modify the filesystem.
-/// File-writing redirects (`> file`, `>> file`, `2> file`) are blocked.
-///
-/// Scans the entire command string (before compound-command splitting) so a
-/// dangerous redirect in any segment is caught.
-fn has_unsafe_redirect(cmd: &str) -> Option<String> {
-    let chars: Vec<char> = cmd.chars().collect();
-    let n = chars.len();
-    let mut i = 0;
-    while i < n {
-        if let Some(op_len) = match_redirect_op(&chars, i) {
-            let target_start = i + op_len;
-            let (ts, te) = read_redirect_target(&chars, target_start);
-            let target: String = chars[ts..te].iter().collect();
-            if !is_safe_redirect_target(&target) {
-                return Some("redirect operator (>/>>)".into());
-            }
-            i = te;
-        } else {
-            i += 1;
-        }
+/// Map shellguard's sandbox verdict to the stricter plan contract. A write
+/// under `/tmp` is an allowed sandbox effect but is still a write, so plan
+/// mode blocks it using the typed `writes_state` provenance.
+fn map_verdict(verdict: opencoder_shellguard::Verdict) -> BashVerdict {
+    use opencoder_shellguard::Decision;
+    match verdict.decision {
+        Decision::Allow if !verdict.writes_state => BashVerdict::ReadOnly,
+        Decision::Allow => BashVerdict::WriteBlocked(verdict.reason),
+        Decision::Ask | Decision::Deny => BashVerdict::WriteBlocked(verdict.reason),
     }
-    None
 }
 
-/// Try to match a redirect operator at position `i`.
-/// Returns the operator length (chars consumed) on success.
-fn match_redirect_op(chars: &[char], i: usize) -> Option<usize> {
-    let n = chars.len();
-    let c = chars[i];
-    // &> / &>> (redirect both stdout and stderr to a file)
-    if c == '&' && i + 1 < n && chars[i + 1] == '>' {
-        return Some(if i + 2 < n && chars[i + 2] == '>' {
-            3
-        } else {
-            2
-        });
-    }
-    // [12]>> / [12]> (fd-prefixed redirect)
-    if (c == '1' || c == '2') && i + 1 < n && chars[i + 1] == '>' {
-        return Some(if i + 2 < n && chars[i + 2] == '>' {
-            3
-        } else {
-            2
-        });
-    }
-    // >> / > (bare redirect)
-    if c == '>' {
-        return Some(if i + 1 < n && chars[i + 1] == '>' {
-            2
-        } else {
-            1
-        });
-    }
-    None
+/// [`classify`] against an explicit working directory: relative operands
+/// (`touch f`) resolve as if the shell were running in `cwd`. The caller
+/// must pass the exact directory the command will execute in — for the bash
+/// tool that is the per-call `workdir` input, defaulting to the session
+/// working dir (see `tools::bash`).
+pub fn classify_with_dir(command: &str, cwd: &std::path::Path) -> BashVerdict {
+    map_verdict(opencoder_shellguard::classify_in(command, cwd))
 }
 
-/// Read the target token following a redirect operator, starting at `start`.
-/// Skips leading whitespace; reads until a separator (whitespace, `;`, `|`,
-/// or `&&`). Returns `(token_start, token_end)`.
-fn read_redirect_target(chars: &[char], start: usize) -> (usize, usize) {
-    let n = chars.len();
-    let mut i = start;
-    while i < n && (chars[i] == ' ' || chars[i] == '\t') {
-        i += 1;
-    }
-    let ts = i;
-    // fd-merge form (`&N`, e.g. `2>&1`): capture exactly the `&` plus the
-    // following ASCII digits. A trailing shell metacharacter (`)`, `}`, ...)
-    // must NOT be folded into the target — otherwise `(echo 2>&1)` is read as
-    // the target `&1)` and misclassified as a write.
-    if i < n && chars[i] == '&' {
-        i += 1; // consume `&`
-        while i < n && chars[i].is_ascii_digit() {
-            i += 1;
-        }
-        return (ts, i);
-    }
-    // Path form: read until a shell delimiter. Besides whitespace and the
-    // compound separators, also stop at shell grouping / quoting / comment
-    // metacharacters so a redirect immediately before `)`, `}`, `]`, `#`
-    // terminates cleanly (e.g. `>/dev/null)`, `2>file}`).
-    while i < n {
-        let c = chars[i];
-        if c == ' '
-            || c == '\t'
-            || c == ';'
-            || c == '|'
-            || c == ')'
-            || c == '}'
-            || c == ']'
-            || c == '#'
-        {
-            break;
-        }
-        if c == '&' && i + 1 < n && chars[i + 1] == '&' {
-            break;
-        }
-        i += 1;
-    }
-    (ts, i)
-}
-
-/// Whether a redirect target is read-only (doesn't write a file).
-fn is_safe_redirect_target(target: &str) -> bool {
-    // fd merge (&N): duplicate to an existing file descriptor.
-    if let Some(rest) = target.strip_prefix('&') {
-        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
-    }
-    // /dev/null discards output — read-only.
-    target == "/dev/null"
-}
-
-/// One split command segment, plus whether its stdin is fed by a pipe
-/// (i.e. the segment is the right-hand side of a `|` or `|&`).
-struct Segment {
-    text: String,
-    stdin_from_pipe: bool,
-}
-
-/// Split a command string into individual segments by shell separators
-/// (`&&`, `||`, `;`, `|`, `&`, newline). Each segment is trimmed and
-/// remembers whether it follows a single `|` (pipe right-hand side).
-fn split_segments(cmd: &str) -> Vec<Segment> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut stdin_from_pipe = false;
-    let chars: Vec<char> = cmd.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        // Check for two-char operators
-        if i + 1 < chars.len() {
-            let pair = format!("{}{}", c, chars[i + 1]);
-            if pair == "&&" || pair == "||" {
-                push_segment(&mut segments, &mut current, stdin_from_pipe);
-                stdin_from_pipe = false;
-                i += 2;
-                continue;
-            }
-            // `|&` pipes both stdout and stderr — the tail still reads a pipe.
-            if pair == "|&" {
-                push_segment(&mut segments, &mut current, stdin_from_pipe);
-                stdin_from_pipe = true;
-                i += 2;
-                continue;
-            }
-        }
-        if c == ';' || c == '|' || c == '&' || c == '\n' {
-            push_segment(&mut segments, &mut current, stdin_from_pipe);
-            stdin_from_pipe = c == '|';
-            i += 1;
-            continue;
-        }
-        current.push(c);
-        i += 1;
-    }
-    push_segment(&mut segments, &mut current, stdin_from_pipe);
-    segments
-}
-
-/// Append a finished segment unless it is blank; always resets the
-/// accumulator so the next segment starts empty.
-fn push_segment(segments: &mut Vec<Segment>, current: &mut String, stdin_from_pipe: bool) {
-    let text = current.trim().to_string();
-    if !text.is_empty() {
-        segments.push(Segment {
-            text,
-            stdin_from_pipe,
-        });
-    }
-    current.clear();
-}
-
-/// Control-flow tokens that can lead a segment once the compound-command
-/// split has removed the separators: `if c; then rm x; fi` yields the
-/// segments `if c`, `then rm x`, `fi`. Classifying the bare token (`then`,
-/// `do`, …) as the command name would let the wrapped write through, so these
-/// are stripped first. `!` (pipeline negation) and leading `{` (brace group)
-/// are included for the same reason. Closer tokens (`fi`, `done`, `esac`,
-/// `}`) are segment-final and can never hide a command, so they are not
-/// listed.
-const CONTROL_LEADS: &[&str] = &[
-    "if", "then", "elif", "else", "do", "while", "until", "for", "!", "{",
+/// Tool names a plan session may execute, mirroring the `plan` agent's
+/// `ToolFilter::Allow` list. `question` still has to clear the latent-skill
+/// gate downstream; `bash` additionally passes the shellguard classifier.
+const PLAN_ADMITTED: &[&str] = &[
+    opencoder_core::platform::shell::tool_name(),
+    "task",
+    "question",
 ];
 
-/// Strip leading control-flow syntax from a segment so classification sees
-/// the actual command: `then rm x` → `rm x`, `do rm x` → `rm x`,
-/// `{ rm x` → `rm x`, `case $v in a) rm x` → `rm x`. Returns a slice of
-/// `segment`; no allocation.
-fn strip_leading_control(segment: &str) -> &str {
-    let mut rest = segment.trim_start();
-    loop {
-        let mut progressed = false;
-        // A leading `(` (or `((`) opens a subshell, not a command name.
-        let no_parens = rest.trim_start_matches('(');
-        if no_parens.len() != rest.len() {
-            rest = no_parens.trim_start();
-            progressed = true;
-        }
-        let Some(tok) = rest.split_whitespace().next() else {
-            return rest;
-        };
-        if CONTROL_LEADS.contains(&tok) {
-            rest = rest[tok.len()..].trim_start();
-            progressed = true;
-        } else if tok == "case" {
-            // `case subject in pattern) cmds` — drop the header so the first
-            // case-body command is inspected (labels are stripped on the next
-            // loop iteration).
-            let after_case = rest[tok.len()..].trim_start();
-            let Some(subject) = after_case.split_whitespace().next() else {
-                return after_case;
-            };
-            let after_subject = after_case[subject.len()..].trim_start();
-            rest = if after_subject.split_whitespace().next() == Some("in") {
-                after_subject["in".len()..].trim_start()
-            } else {
-                after_subject
-            };
-            progressed = true;
-        } else if is_case_pattern_label(tok) {
-            rest = rest[tok.len()..].trim_start();
-            progressed = true;
-        }
-        if !progressed {
-            return rest;
-        }
+/// Tool names a sidecar session may execute, mirroring the sidecar agent's
+/// `ToolFilter::Allow` list. Read-only inspection only: `bash` additionally
+/// passes the shellguard classifier.
+const SIDECAR_ADMITTED: &[&str] = &[
+    "read",
+    "search",
+    "ls",
+    opencoder_core::platform::shell::tool_name(),
+];
+
+/// Canonical model-facing denial for a plan-mode interception (candidate
+/// wording, verbatim). The contract: name the mode, state the read-only
+/// invariant, tell the model to stop implementation attempts, route context
+/// gathering to a read-only `explore` subagent instead of bash, focus on a
+/// plan, and point at the real escape hatch — switch to act via `/agent act`.
+pub fn plan_denial(tool: &str, detail: &str) -> String {
+    if tool == "bash" {
+        format!(
+            "Blocked in plan mode (read-only): this bash command modifies state ({detail}) \
+             and was not executed. Do not retry or attempt another write. To gather context, \
+             delegate read-only investigation to an 'explore' subagent (task tool) instead \
+             of bash. Focus on analysis and output a plan only; do not execute implementation. \
+             To make changes, switch to the act agent (/agent act)."
+        )
+    } else {
+        format!(
+            "Blocked in plan mode (read-only): `{tool}` was not executed - {detail}. \
+             Do not retry or attempt another write. To gather context, delegate read-only \
+             investigation to an 'explore' subagent (task tool). Focus on analysis and \
+             output a plan only; do not execute implementation. To make changes, switch \
+             to the act agent (/agent act)."
+        )
     }
 }
 
-/// A `case` pattern label at the start of a segment: a glob/alternation word
-/// terminated by `)` — `a)`, `*)`, `linux|darwin)`. Tokens containing `(`
-/// (subshells, `foo()` function definitions) are not labels.
-fn is_case_pattern_label(tok: &str) -> bool {
-    tok.ends_with(')') && !tok.contains('(')
+/// Canonical model-facing denial for a sidecar interception. Same shape as
+/// [`plan_denial`] but scoped to the read-only Q&A loop: name the session,
+/// state the invariant, forbid retries and alternate write paths, and point
+/// at the real escape hatch — the main session.
+pub fn sidecar_denial(tool: &str, detail: &str) -> String {
+    if tool == "bash" {
+        format!(
+            "Blocked in sidecar (read-only Q&A): this bash command modifies state ({detail}) \
+             and was not executed. Do not retry or attempt another write. Gather what you need \
+             with read-only commands (read, search, git log) or answer directly from the snapshot \
+             context. This sidecar cannot make changes; to make changes, return to the main session."
+        )
+    } else {
+        format!(
+            "Blocked in sidecar (read-only Q&A): `{tool}` was not executed - {detail}. \
+             Do not retry or attempt another write. Answer from the snapshot context; \
+             read-only inspection only. To make changes, return to the main session."
+        )
+    }
+}
+
+/// Admitted-tool table plus denial context: (allowed tools, reason for an
+/// unadmitted tool, per-tool denial message builder). Both tables are
+/// compile-time constants, hence 'static.
+type GateRule = (
+    &'static [&'static str],
+    &'static str,
+    fn(&str, &str) -> String,
+);
+
+/// Read-only execution gate for one tool call: `Some(denial)` refuses the
+/// call with the model-visible [`plan_denial`] / [`sidecar_denial`], `None`
+/// lets it proceed. Gated sessions: plan mode and the sidecar loop; every
+/// other session (including other `Subagent`-kind agents) passes through.
+///
+/// `workdir` is the directory the call will execute in — for bash the
+/// per-call `workdir` input, else the session working dir (resolved by the
+/// caller exactly like `tools::bash` does). The bash branch classifies the
+/// command against it, because the classification cwd must equal the
+/// execution cwd: a relative write judged against any other directory is
+/// the B2 conditional-bypass (a process cwd under `/tmp` would release
+/// `touch f` while the write lands in the real workdir).
+///
+/// Two layers, both fail-closed:
+/// - the session is read-only but the tool is not admitted (a hallucinated or
+///   remembered builtin like `edit`, or an unadvertised MCP tool): refuse so
+///   a write can never slip through a tool the model was never shown;
+/// - `bash` is admitted but the shellguard classifier flags the command as
+///   mutating: refuse with the classifier's reason.
+pub fn gate(
+    kind: &opencoder_core::AgentKind,
+    agent_name: &str,
+    tool: &str,
+    command: Option<&str>,
+    workdir: &std::path::Path,
+) -> Option<String> {
+    let (admitted, unadmitted_detail, denial): GateRule =
+        if *kind == opencoder_core::AgentKind::Plan {
+            (
+                PLAN_ADMITTED,
+                "this tool is not available in plan mode",
+                plan_denial,
+            )
+        } else if agent_name == "sidecar" {
+            (
+                SIDECAR_ADMITTED,
+                "this tool is not available in the sidecar",
+                sidecar_denial,
+            )
+        } else {
+            return None;
+        };
+    if !admitted.contains(&tool) {
+        return Some(denial(tool, unadmitted_detail));
+    }
+    if cfg!(windows) && tool == "powershell" {
+        return Some(denial(
+            tool,
+            "PowerShell requires asynchronous AST inspection",
+        ));
+    }
+    if tool == "bash" {
+        if let BashVerdict::WriteBlocked(reason) = classify_with_dir(command.unwrap_or(""), workdir)
+        {
+            return Some(denial("bash", &reason));
+        }
+    }
+    None
+}
+
+/// PowerShell has its own parser; Bash classification must never inspect it.
+pub async fn gate_async(
+    kind: &opencoder_core::AgentKind,
+    agent_name: &str,
+    tool: &str,
+    command: Option<&str>,
+    workdir: &std::path::Path,
+) -> Option<String> {
+    let read_only = *kind == opencoder_core::AgentKind::Plan || agent_name == "sidecar";
+    if cfg!(windows) && tool == "powershell" && read_only {
+        return crate::tools::command::powershell::read_only(command.unwrap_or(""), workdir)
+            .await
+            .err()
+            .map(|error| {
+                let denial = if agent_name == "sidecar" {
+                    sidecar_denial
+                } else {
+                    plan_denial
+                };
+                denial(tool, &error.to_string())
+            });
+    }
+    gate(kind, agent_name, tool, command, workdir)
 }
 
 // ---------------------------------------------------------------------------
@@ -585,204 +360,323 @@ pub(crate) fn strip_wrappers(cmd: &str) -> &str {
     }
 }
 
-/// Block interpreters that read code from stdin fed by a pipe:
-/// `curl … | sh` or `cat x.py | python -`. Without a script-file argument the
-/// interpreter executes its piped input, so read-only-looking upstream
-/// commands become arbitrary code execution. An interpreter with an explicit
-/// script-file argument (`python script.py`) keeps the existing (allowed)
-/// policy — as does a bare `sh` that is not the right-hand side of a pipe.
-fn pipe_fed_interpreter_reason(segment: &str) -> Option<String> {
-    let stripped = strip_wrappers(segment);
-    let base = cmd_base(stripped);
-    if !SHELL_INTERPRETERS.contains(&base) && !SCRIPT_INTERPRETERS.contains(&base) {
-        return None;
-    }
-    let words: Vec<&str> = stripped.split_whitespace().collect();
-    // No script-file argument: everything after the interpreter (if anything)
-    // is an option, including the `-` read-stdin convention (`python -`).
-    let has_script_arg = words[1..].iter().any(|w| !is_option_token(w));
-    if has_script_arg {
-        return None;
-    }
-    Some(format!("indirect execution: {base} (piped stdin)"))
-}
-
-/// Classify a single command segment (no separators).
-fn classify_segment(segment: &str) -> Option<String> {
-    // Compound-command splitting leaves control-flow tokens at the start of a
-    // segment (`if c; then rm x; fi` → `then rm x`, `{ rm x`, `a) rm x`).
-    // Strip them first so the real command — not `then`/`do`/the case label —
-    // is classified.
-    let unled = strip_leading_control(segment);
-    // `exec`/`eval`/`source`/`.` can run arbitrary mutating commands. Inspect
-    // the leading token (after sudo/doas) *before* wrapper stripping: `exec` is
-    // itself a wrapper that `strip_wrappers` would peel away, so checking it up
-    // front preserves its dedicated verdict regardless of what follows.
-    let sudo_stripped = strip_leading_sudo(unled);
-    let first_base = cmd_base(sudo_stripped);
-    if matches!(first_base, "exec" | "eval" | "source" | ".") {
-        return Some(format!("indirect execution: {first_base}"));
-    }
-
-    // Strip wrapper commands (`env`, `nohup`, `timeout`, `nice`, `command`,
-    // `strace`, `time`, `stdbuf`, `setsid`, …) and leading `sudo`/`doas` to
-    // reveal the real command. Without this, plan-mode writes wrapped as
-    // `env rm file`, `nohup rm`, or `timeout 5 rm -rf x` are misclassified as
-    // read-only and bypass the guard.
-    let stripped = strip_wrappers(unled);
-    let cmd_words: Vec<&str> = stripped.split_whitespace().collect();
-    if cmd_words.is_empty() {
-        return None;
-    }
-    let cmd_base = cmd_base(stripped);
-
-    // Post-wrapper indirect execution check: `env eval 'rm file'` survives
-    // the pre-wrapper check (base was `env`, not `eval`) because `eval` is
-    // not a wrapper command. After stripping `env`, we must re-check.
-    if matches!(cmd_base, "eval" | "source" | ".") {
-        return Some(format!("indirect execution via wrapper: {cmd_base}"));
-    }
-
-    // Check mutating commands
-    if MUTATING_COMMANDS.contains(&cmd_base) {
-        return Some(format!("mutating command: {cmd_base}"));
-    }
-
-    // `tee` is conditionally mutating: it duplicates stdin to its file
-    // arguments. Writing to `/dev/null` (or no file argument at all) is
-    // read-only; any other path argument is a real write and is blocked.
-    if cmd_base == "tee" {
-        let writes_real_file = cmd_words[1..]
-            .iter()
-            .any(|w| !w.starts_with('-') && *w != "/dev/null");
-        if writes_real_file {
-            return Some("tee (writes to file)".into());
-        }
-        return None;
-    }
-
-    // Check git writes
-    if cmd_base == "git" || cmd_base == "hub" {
-        if let Some(sub) = cmd_words.get(1) {
-            if GIT_WRITE_SUBS.contains(sub) {
-                return Some(format!("git {sub}"));
-            }
-            // "git checkout --" discards changes
-            if *sub == "checkout" && cmd_words.contains(&"--") {
-                return Some("git checkout --".into());
-            }
-        }
-    }
-
-    // Check package managers (only install/update/remove actions)
-    if PACKAGE_MANAGERS.contains(&cmd_base) {
-        if let Some(sub) = cmd_words.get(1) {
-            let sub_lower = sub.to_lowercase();
-            if matches!(
-                sub_lower.as_str(),
-                "install" | "update" | "upgrade" | "remove" | "uninstall" | "add" | "create"
-            ) {
-                return Some(format!("{cmd_base} {sub}"));
-            }
-        }
-        // cargo with no subcommand but --install or similar flags
-        if cmd_base == "cargo" && cmd_words.iter().any(|w| w == &"install") {
-            return Some("cargo install".into());
-        }
-    }
-
-    // Check in-place editors: sed -i, awk -i inplace, perl -i
-    if cmd_base == "sed"
-        && cmd_words.iter().any(|w| {
-            // `-i` may carry an attached backup suffix (`-i.bak`); the GNU
-            // long form is `--in-place` / `--in-place=.bak`.
-            w.starts_with("-i") || *w == "--in-place" || w.starts_with("--in-place=")
-        })
-    {
-        return Some("sed -i (in-place edit)".into());
-    }
-    if cmd_base == "awk" && cmd_words.iter().any(|w| w == &"-i" || w == &"--inplace") {
-        return Some("awk -i (in-place edit)".into());
-    }
-    if cmd_base == "perl"
-        && cmd_words.iter().any(|w| {
-            // perl's `-i` (in-place edit) may be combined with other short flags
-            // in a single token, e.g. `-pi`, `-nip`. No other lowercase perl
-            // short flag contains 'i', so detecting it within a combined group is
-            // unambiguous. `-I` (include path) is uppercase and excluded.
-            w.starts_with('-') && !w.starts_with("--") && w.chars().skip(1).any(|c| c == 'i')
-        })
-    {
-        return Some("perl -i (in-place edit)".into());
-    }
-
-    // Shell interpreters with -c/-s: `bash -c 'rm file'` etc.
-    if SHELL_INTERPRETERS.contains(&cmd_base)
-        && cmd_words[1..].iter().any(|w| *w == "-c" || *w == "-s")
-    {
-        return Some(format!("indirect execution: {cmd_base} -c/-s"));
-    }
-
-    // Script interpreters with -c/-e/-r: `python3 -c 'import os; os.remove(...)'` etc.
-    // For perl, `-e` may be combined into a short-flag group like `-pe`, so
-    // also scan combined flags (same logic as the `-i` check above).
-    if SCRIPT_INTERPRETERS.contains(&cmd_base) {
-        let has_exec_flag = if cmd_base == "perl" {
-            cmd_words[1..].iter().any(|w| {
-                *w == "-c"
-                    || *w == "-e"
-                    || (w.starts_with('-')
-                        && !w.starts_with("--")
-                        && w.chars().skip(1).any(|c| c == 'e'))
-            })
-        } else {
-            cmd_words[1..]
-                .iter()
-                .any(|w| *w == "-c" || *w == "-e" || *w == "-r")
-        };
-        if has_exec_flag {
-            return Some(format!("indirect execution: {cmd_base} interpreter"));
-        }
-    }
-
-    // `xargs` runs arbitrary commands — block unconditionally.
-    if cmd_base == "xargs" {
-        return Some("indirect execution: xargs".into());
-    }
-
-    // `find` with -exec/-execdir/-delete/-ok/-okdir can mutate state, as can
-    // the file-writing print actions -fprint/-fprint0/-fprintf/-fls (unlike
-    // -print/-printf, which only write to stdout).
-    if cmd_base == "find"
-        && cmd_words.iter().any(|w| {
-            matches!(
-                *w,
-                "-exec"
-                    | "-execdir"
-                    | "-delete"
-                    | "-ok"
-                    | "-okdir"
-                    | "-fprint"
-                    | "-fprint0"
-                    | "-fprintf"
-                    | "-fls"
-            )
-        })
-    {
-        return Some("indirect execution: find (-exec/-delete/-fprint)".into());
-    }
-
-    None
+/// A workdir OUTSIDE the /tmp release scope. The crate tree itself may sit
+/// under /tmp (which the shellguard releases wholesale), so tests that need
+/// a *plain* directory must not anchor on CARGO_MANIFEST_DIR or the process
+/// cwd.
+#[cfg(test)]
+pub(crate) fn plain_dir() -> tempfile::TempDir {
+    // Windows temporary paths are outside shellguard's Unix /tmp release.
+    // Unix uses /var/tmp without depending on HOME or the checkout location.
+    #[cfg(windows)]
+    let parent = std::env::temp_dir();
+    #[cfg(not(windows))]
+    let parent = std::path::PathBuf::from("/var/tmp");
+    tempfile::Builder::new()
+        .prefix("sg-plain-")
+        .tempdir_in(&parent)
+        .expect("writable stable parent for a non-released workdir")
 }
 
 #[cfg(test)]
-#[path = "bash_guard_tests.rs"]
-mod tests;
+#[path = "bash_guard_compat_tests.rs"]
+mod compat_tests;
 
 #[cfg(test)]
-#[path = "bash_guard_security_tests.rs"]
-mod security_tests;
+#[path = "bash_guard_compat_tests2.rs"]
+mod compat_tests2;
 
 #[cfg(test)]
-#[path = "bash_guard_bypass_regression.rs"]
-mod bypass_regression_tests;
+mod tests {
+    use super::{classify, cmd_base, strip_wrappers, BashVerdict};
+
+    #[test]
+    fn read_only_passes() {
+        assert_eq!(classify("ls -la"), BashVerdict::ReadOnly);
+    }
+
+    #[test]
+    fn tmp_write_is_blocked_by_strict_plan_policy() {
+        assert!(matches!(
+            classify("echo x > /tmp/a.log"),
+            BashVerdict::WriteBlocked(_)
+        ));
+    }
+
+    #[test]
+    fn destructive_command_blocked_with_reason() {
+        match classify("rm -rf /var/x") {
+            BashVerdict::WriteBlocked(reason) => assert!(!reason.is_empty()),
+            other => panic!("expected WriteBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cwd_is_not_released() {
+        assert!(matches!(
+            classify("echo x > ./f"),
+            BashVerdict::WriteBlocked(_)
+        ));
+    }
+
+    #[test]
+    fn script_execution_blocked() {
+        assert!(matches!(
+            classify("bash /tmp/x.sh"),
+            BashVerdict::WriteBlocked(_)
+        ));
+    }
+
+    #[test]
+    fn strip_wrappers_reveals_env_wrapped_command() {
+        assert!(strip_wrappers("env rm -rf /").starts_with("rm"));
+    }
+
+    #[test]
+    fn cmd_base_takes_trailing_component() {
+        assert_eq!(cmd_base("/usr/bin/rm"), "rm");
+    }
+
+    #[test]
+    fn denial_names_mode_forbids_retry_points_at_act() {
+        let msg = super::plan_denial("edit", "this tool is not available in plan mode");
+        assert!(msg.contains("Blocked in plan mode"), "got: {msg}");
+        assert!(msg.contains("read-only"), "got: {msg}");
+        assert!(msg.contains("`edit`"), "got: {msg}");
+        assert!(msg.contains("output a plan only"), "got: {msg}");
+        assert!(msg.contains("Do not retry"), "got: {msg}");
+        // Context gathering must be routed to the read-only explore
+        // subagent, not retried through bash.
+        assert!(msg.contains("'explore' subagent"), "got: {msg}");
+        // The escape hatch must name the real path: the act agent.
+        assert!(
+            msg.contains("switch to the act agent (/agent act)"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bash_denial_routes_context_gathering_to_explore() {
+        let msg = super::plan_denial("bash", "cd to /etc");
+        assert!(msg.contains("'explore' subagent (task tool)"), "got: {msg}");
+        assert!(msg.contains("instead of bash"), "got: {msg}");
+        assert!(msg.contains("Do not retry"), "got: {msg}");
+    }
+
+    #[test]
+    fn cd_navigation_is_read_only() {
+        // `cd` writes nothing and the analyzer re-aims its analysis cwd, so
+        // navigation must not trip the plan gate (previously it asked).
+        for cmd in [
+            "cd src",
+            "cd ..",
+            "cd /etc",
+            "cd -P src",
+            "cd -- /var",
+            "cd /tmp && ls",
+        ] {
+            assert_eq!(
+                classify(cmd),
+                BashVerdict::ReadOnly,
+                "{cmd} must classify as read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn cd_does_not_weaken_write_detection_after_it() {
+        // The destination re-aim must keep later operands judgeable: a write
+        // after `cd` is still blocked, with the write (not the cd) as reason.
+        for cmd in [
+            "cd /tmp && touch f",
+            "cd src && touch f",
+            "cd .. && rm -rf x",
+        ] {
+            assert!(
+                matches!(classify(cmd), BashVerdict::WriteBlocked(_)),
+                "{cmd} must stay blocked"
+            );
+        }
+        // Unresolvable destinations stay fail-closed (`$HOME` expands
+        // statically to a literal path, so it is judgeable and allowed).
+        for cmd in ["cd $UNSET_VAR_XYZ", "cd ~", "cd"] {
+            assert!(
+                matches!(classify(cmd), BashVerdict::WriteBlocked(_)),
+                "{cmd} must stay blocked (unresolvable destination)"
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_set_matches_plan_agent_tool_filter() {
+        let plan = opencoder_core::resolve_agent("plan").expect("plan agent");
+        for name in super::PLAN_ADMITTED {
+            assert!(
+                plan.tools.allows(name),
+                "gate admits {name} but the plan ToolFilter does not"
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_set_matches_sidecar_agent_tool_filter() {
+        let sidecar = opencoder_core::resolve_agent("sidecar").expect("sidecar agent");
+        for name in super::SIDECAR_ADMITTED {
+            assert!(
+                sidecar.tools.allows(name),
+                "gate admits {name} but the sidecar ToolFilter does not"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_passes_non_plan_kinds_through() {
+        use opencoder_core::{resolve_agent, AgentKind};
+        let anywhere = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in ["act", "explore"] {
+            let agent = resolve_agent(name).unwrap();
+            assert_eq!(
+                super::gate(&agent.kind, &agent.name, "edit", Some("x"), anywhere),
+                None,
+                "{name} must not be gated"
+            );
+        }
+        // Explicit non-plan kind is equally untouched.
+        assert_eq!(
+            super::gate(&AgentKind::Act, "act", "bash", Some("rm -rf /"), anywhere),
+            None
+        );
+    }
+
+    #[test]
+    fn gate_refuses_unadmitted_tool_in_plan() {
+        use opencoder_core::resolve_agent;
+        let agent = resolve_agent("plan").unwrap();
+        let anywhere = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for tool in ["edit", "bg", "mcp__fs__write"] {
+            let denial = super::gate(&agent.kind, &agent.name, tool, None, anywhere)
+                .unwrap_or_else(|| panic!("{tool} must be refused"));
+            assert!(denial.contains("Blocked in plan mode"), "got: {denial}");
+        }
+        // Admitted tools pass the first layer untouched.
+        for tool in super::PLAN_ADMITTED {
+            if *tool == opencoder_core::platform::shell::tool_name() {
+                continue; // covered by the classifier tests below
+            }
+            assert_eq!(
+                super::gate(&agent.kind, &agent.name, tool, None, anywhere),
+                None,
+                "{tool} admitted"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gate_blocks_mutating_bash_in_plan() {
+        use opencoder_core::resolve_agent;
+        let agent = resolve_agent("plan").unwrap();
+        // A plain (non-released) workdir.
+        let plain_dir = super::plain_dir();
+        let plain = plain_dir.path();
+        assert!(super::gate(&agent.kind, &agent.name, "bash", Some("ls -la"), plain).is_none());
+        let denial = super::gate(&agent.kind, &agent.name, "bash", Some("rm -rf ./f"), plain)
+            .expect("blocked");
+        assert!(denial.contains("Blocked in plan mode"), "got: {denial}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gate_blocks_writes_in_released_and_plain_call_workdirs() {
+        use opencoder_core::resolve_agent;
+        let agent = resolve_agent("plan").unwrap();
+        // The command is identical in both legs. Shellguard reports different
+        // provenance, but strict plan policy blocks both write effects.
+        let tmp = std::path::Path::new("/tmp");
+        let tmp_denial = super::gate(&agent.kind, &agent.name, "bash", Some("touch ./f"), tmp)
+            .expect("relative write under /tmp is still a write in plan mode");
+        assert!(tmp_denial.contains("output a plan only"));
+        let plain = super::plain_dir();
+        let denial = super::gate(
+            &agent.kind,
+            &agent.name,
+            "bash",
+            Some("touch ./f"),
+            plain.path(),
+        )
+        .unwrap_or_else(|| panic!("same command must be blocked from a plain workdir"));
+        assert!(denial.contains("Blocked in plan mode"), "got: {denial}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gate_blocks_mutating_bash_in_sidecar() {
+        use opencoder_core::resolve_agent;
+        let agent = resolve_agent("sidecar").unwrap();
+        // The sidecar is a Subagent-kind session: gating keys on the agent
+        // name, so a bare AgentKind check would let writes through.
+        assert_eq!(agent.kind, opencoder_core::AgentKind::Subagent);
+        let plain_dir = super::plain_dir();
+        let plain = plain_dir.path();
+        assert!(super::gate(&agent.kind, &agent.name, "bash", Some("ls -la"), plain).is_none());
+        assert!(super::gate(
+            &agent.kind,
+            &agent.name,
+            "bash",
+            Some("git log --oneline -5"),
+            plain
+        )
+        .is_none());
+        for cmd in ["rm -rf ./f", "touch ./f"] {
+            let denial = super::gate(&agent.kind, &agent.name, "bash", Some(cmd), plain)
+                .unwrap_or_else(|| panic!("{cmd} must be blocked"));
+            assert!(denial.contains("Blocked in sidecar"), "got: {denial}");
+        }
+    }
+
+    #[test]
+    fn gate_refuses_unadmitted_tool_in_sidecar() {
+        use opencoder_core::resolve_agent;
+        let agent = resolve_agent("sidecar").unwrap();
+        let anywhere = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for tool in ["edit", "task", "question"] {
+            let denial = super::gate(&agent.kind, &agent.name, tool, None, anywhere)
+                .unwrap_or_else(|| panic!("{tool} must be refused"));
+            assert!(denial.contains("Blocked in sidecar"), "got: {denial}");
+        }
+        // Admitted read-only tools pass the first layer untouched.
+        for tool in ["read", "search", "ls"] {
+            assert_eq!(
+                super::gate(&agent.kind, &agent.name, tool, None, anywhere),
+                None,
+                "{tool} admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_with_dir_resolves_relative_paths_against_the_given_cwd() {
+        use super::classify_with_dir;
+        // Shellguard marks /tmp as sandbox-released, but the plan adapter
+        // preserves the typed write effect and refuses it.
+        assert!(matches!(
+            classify_with_dir("touch f", std::path::Path::new("/tmp")),
+            BashVerdict::WriteBlocked(_)
+        ));
+        let plain = super::plain_dir();
+        assert!(matches!(
+            classify_with_dir("touch f", plain.path()),
+            BashVerdict::WriteBlocked(_)
+        ));
+    }
+
+    #[test]
+    fn helpers_are_idempotent_on_plain_commands() {
+        let plain = "grep -r pattern .";
+        assert_eq!(strip_wrappers(plain), plain);
+        assert_eq!(cmd_base(plain), "grep");
+        // Re-applying either helper to its own output is a no-op.
+        assert_eq!(strip_wrappers(strip_wrappers(plain)), plain);
+        assert_eq!(cmd_base(cmd_base(plain)), cmd_base(plain));
+    }
+}

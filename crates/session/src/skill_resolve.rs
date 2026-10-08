@@ -16,9 +16,7 @@
 use std::collections::HashSet;
 
 use opencoder_core::message::now_ms;
-use opencoder_core::{
-    body_with_source, discover_skills, extract_skill_tokens, AgentKind, Message, Skill,
-};
+use opencoder_core::{body_with_source, extract_skill_tokens, Message, Skill};
 use opencoder_store::SessionPatch;
 
 use crate::runner::new_id;
@@ -28,7 +26,7 @@ use crate::SessionState;
 /// but a skill was activated (e.g. `/plan $review` or a pure `$review` queue
 /// item). Mirrors the idle path's pure-skill trigger so the model begins
 /// executing the active skill (surfaced via the `[active skill]` tail
-/// reminder). The plan-mode read-only tag is deliberately NOT applied to
+/// reminder). Read-only tagging is deliberately NOT applied to
 /// this trigger, matching the idle path. One-shot: the skill this trigger
 /// announces is cleared at the end of the run that consumed the token
 /// (`skill_lifecycle`), so it never announces a stale skill on a later run.
@@ -39,7 +37,7 @@ pub const SKILL_TRIGGER: &str = "The active skill is now in effect. Begin execut
 /// `skill_persist::persist_skill`: best-effort — store errors are swallowed
 /// because the in-memory write keeps the in-flight turn correct — and a
 /// `None -> Some` transition only writes `skill`, never `clear_skill` (skill
-/// *clearing* is owned by the explicit clear paths — control_cmd, plan
+/// *clearing* is owned by the explicit clear paths — control_cmd, autopilot
 /// handoff, the TUI `$` menu — plus the run-end auto-clear in
 /// `skill_lifecycle::clear_on_run_end`; this function never clears).
 ///
@@ -117,39 +115,65 @@ pub fn resolve_inline_skills_with(
     (clean, unresolved)
 }
 
-/// Discover skills from `~/.opencoder/skills` and resolve inline `$name`
+/// Discover the session's skills (its agent's private pools FIRST, then
+/// `~/.opencoder/skills` — first-wins shadowing) and resolve inline `$name`
 /// tokens in `text`, activating resolved skills on the session. Returns the
 /// cleaned text (tokens stripped); unresolved names are silently ignored.
 pub fn resolve_inline_skills(session: &SessionState, text: &str) -> String {
-    let clean = resolve_inline_skills_with(session, text, &discover_skills()).0;
+    let clean = resolve_inline_skills_with(
+        session,
+        text,
+        &crate::agent_pools::discover_session_skills(session),
+    )
+    .0;
     // Expand `@path` mentions to absolute paths before the message is
     // recorded (direct-prompt path; steer/queue get the same treatment
     // via the head hook in `record_compound`).
-    crate::mention_resolve::expand_mentions(&clean, &session.working_dir)
+    if !session.harness.literal_mentions {
+        crate::mention_resolve::expand_mentions(&clean, &session.working_dir)
+    } else {
+        clean
+    }
 }
 
 /// Record a prompt as a synthetic user message after resolving inline
-/// `$skill` tokens and applying the plan-mode read-only tag. Used by the
-/// queue-drain and steer paths for both compound commands (`/plan review`)
+/// `$skill` tokens. Used by the queue-drain and steer paths for both compound
+/// commands (`/plan review`)
 /// and plain prompts (`$review do it`) so both get consistent skill handling.
 ///
 /// When THIS input resolved at least one `$skill` token and the stripping
 /// empties the text (e.g. `/plan $review`), injects [`SKILL_TRIGGER`]
 /// instead — mirroring the idle path's pure-skill behavior — and skips the
-/// plan-mode tag. The condition is scoped to tokens resolved by this very
+/// read-only tag. The condition is scoped to tokens resolved by this very
 /// call, NOT the session's already-active skill: a queue/steer restart with
 /// a stale active skill must not re-inject a trigger for a skill the item
 /// never mentioned (that amplified the drain self-continuation loop).
 /// Activations made here are one-shot: the run consuming this input clears
 /// them at its end (`skill_lifecycle`).
 pub async fn record_compound(session: &mut SessionState, rest: &str, images: &[String]) {
+    record_compound_with_display(session, rest, images, None).await;
+}
+
+pub(crate) async fn record_compound_with_display(
+    session: &mut SessionState,
+    rest: &str,
+    images: &[String],
+    display: Option<&str>,
+) {
     // Expand `@path` mentions to absolute paths first so the recorded user
     // message (and the model request) carry full paths — the steer/queue
     // twin of the tail hook in `resolve_inline_skills`.
-    let rest = &crate::mention_resolve::expand_mentions(rest, &session.working_dir);
-    let skills = discover_skills();
+    let expanded = if !session.harness.literal_mentions {
+        crate::mention_resolve::expand_mentions(rest, &session.working_dir)
+    } else {
+        rest.to_owned()
+    };
+    let rest = &expanded;
+    // Session-agent-aware discovery (agent pools shadow the global skills
+    // dir): the steer/queue twin of `resolve_inline_skills` above.
+    let skills = crate::agent_pools::discover_session_skills(session);
     let prev_skill = session.skill_prompt_cloned();
-    let (mut text, unresolved) = resolve_inline_skills_with(session, rest, &skills);
+    let (text, unresolved) = resolve_inline_skills_with(session, rest, &skills);
     persist_active_skill(session, &prev_skill).await;
     // "Resolved now": THIS input carried at least one `$name` token that
     // extraction found and discovery matched (so it was stripped and
@@ -161,24 +185,25 @@ pub async fn record_compound(session: &mut SessionState, rest: &str, images: &[S
         .iter()
         .any(|name| skills.iter().any(|s| &s.name == name) && !unresolved.contains(name));
     // Pure-skill: tokens consumed all text AND at least one resolved here.
-    // Inject the trigger so the model acts on the skill body (no plan-mode
-    // tag, matching the idle path).
+    // Inject the trigger so the model acts on the skill body.
     if text.trim().is_empty() && images.is_empty() {
         if resolved_now {
             let mut msg = Message::user(new_id(), SKILL_TRIGGER);
             msg.synthetic = true;
+            // Echo contract: replay surfaces show the verbatim input (the
+            // `$name` token included), never the injected trigger body.
+            msg.display = Some(display.unwrap_or(rest).to_owned());
             session.record(msg).await;
         }
         return;
     }
-    session.maybe_tag_plan_prompt(&mut text);
-    let m = Message::user_with_images(new_id(), text, images);
+    let m = Message::user_with_display(
+        new_id(),
+        text,
+        Some(display.unwrap_or(rest).to_owned()),
+        images,
+    );
     session.record(m).await;
-    // Keep the persisted plan-phase counter in step with the increment that
-    // just happened (queue/steer twin of the idle path in runner::run).
-    if session.agent.kind == AgentKind::Plan {
-        session.persist_plan_phase().await;
-    }
 }
 
 #[cfg(test)]
@@ -293,7 +318,6 @@ mod tests {
     async fn record_compound_records_cleaned_text() {
         let mut s = make_session();
         s.agent = resolve_agent("plan").unwrap();
-        // First plan input (count 0) -> no read-only tag appended.
         record_compound(&mut s, "review the code", &[]).await;
         assert_eq!(s.messages.len(), 1);
         assert!(
@@ -304,7 +328,6 @@ mod tests {
             s.messages[0].text().contains("review the code"),
             "cleaned text recorded"
         );
-        assert_eq!(s.plan_input_count, 1, "plan input counter incremented");
     }
 
     #[tokio::test]
@@ -325,8 +348,52 @@ mod tests {
             s.skill_prompt_cloned().is_some(),
             "skill activated by the token"
         );
-        // plan_input_count NOT incremented (trigger skips the plan tag).
-        assert_eq!(s.plan_input_count, 0, "trigger skips plan-mode counter");
+    }
+
+    /// Echo contract: the recorded message keeps the verbatim input (token
+    /// included) as `display`; `text()` carries only the cleaned prompt.
+    #[tokio::test]
+    async fn record_compound_display_is_verbatim_input() {
+        let mut s = make_session();
+        s.agent = resolve_agent("plan").unwrap();
+        {
+            let _guard = lock_home(tempfile::tempdir().unwrap().path());
+            opencoder_core::seed_builtin_skills();
+            record_compound(&mut s, "$review fix the bug", &[]).await;
+        }
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(
+            s.messages[0].text().trim(),
+            "fix the bug",
+            "text() is the clean prompt the LLM consumes"
+        );
+        assert_eq!(
+            s.messages[0].display.as_deref(),
+            Some("$review fix the bug"),
+            "display is the verbatim echo"
+        );
+        assert!(!s.messages[0].text().contains("$review"));
+    }
+
+    /// Pure-skill queue/steer submit: the injected SKILL_TRIGGER carries the
+    /// verbatim token as display so replay surfaces show the user's input.
+    #[tokio::test]
+    async fn record_compound_pure_skill_display_is_verbatim_token() {
+        let mut s = make_session();
+        s.agent = resolve_agent("plan").unwrap();
+        {
+            let _guard = lock_home(tempfile::tempdir().unwrap().path());
+            opencoder_core::seed_builtin_skills();
+            record_compound(&mut s, "$review", &[]).await;
+        }
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0].text(), SKILL_TRIGGER);
+        assert!(s.messages[0].synthetic);
+        assert_eq!(
+            s.messages[0].display.as_deref(),
+            Some("$review"),
+            "trigger replays as the user's own `$review`"
+        );
     }
 
     #[tokio::test]
@@ -405,8 +472,6 @@ mod tests {
 
     // ---- HOME isolation for discover_skills (mirrors tests/drain_mode.rs) ----
 
-    static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct HomeGuard {
         prev_home: Option<std::ffi::OsString>,
         prev_xdg: Option<std::ffi::OsString>,
@@ -414,7 +479,7 @@ mod tests {
     }
 
     fn lock_home(home: &std::path::Path) -> HomeGuard {
-        let _lock = HOME_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::env_lock();
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("HOME", home);

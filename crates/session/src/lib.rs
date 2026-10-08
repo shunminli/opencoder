@@ -1,3 +1,4 @@
+pub mod agent_pools;
 pub mod autopilot;
 pub mod bash_guard;
 pub mod compaction;
@@ -5,10 +6,11 @@ pub mod control_cmd;
 pub mod dangling_tools;
 pub mod event_sink;
 pub mod fork;
+pub mod handoff;
+pub mod harness;
 pub mod mcp;
 pub mod mention_resolve;
-pub mod plan_handoff;
-pub mod plan_phase;
+pub mod process;
 pub mod prompt;
 pub mod resume;
 pub mod resume_helpers;
@@ -18,16 +20,24 @@ pub mod skill_lifecycle;
 pub mod skill_resolve;
 pub mod streamline;
 pub mod subagent_steer_gate;
+#[cfg(test)]
+pub(crate) mod test_env;
 pub mod tool_guard;
 pub mod tools;
 
 pub use control_cmd::{
-    apply as apply_control_cmd, clear_seed_text, is_clear_context_handoff, is_clear_context_seed,
-    parse as parse_control_cmd, seed_message, split_control_prefix, ControlCmd,
+    apply as apply_control_cmd, clear_seed_text, consumed_echo_text, is_clear_context_handoff,
+    is_clear_context_seed, parse as parse_control_cmd, seed_message, split_control_prefix,
+    ControlCmd,
 };
-pub use event_sink::{run_flusher, spawn_event_flusher, EventSink};
+pub use event_sink::{run_flusher, spawn_checked_event_flusher, spawn_event_flusher, EventSink};
 pub use resume::{generate_title, resume, resume_and_replay};
-pub use runner::{run, run_once, run_with_images, SessionEvent};
+pub use runner::{run, run_once, run_with_images, run_with_registry, SessionEvent};
+// Sidecar (TUI `/sidecar`): temporary Q&A loop over a context snapshot.
+// Zero persistence; cost flows to the parent as bare `LlmUsage` events.
+pub use runner::sidecar::{
+    new_conv, new_conv_from, parse_sidecar_question, run_sidecar_turn, SidecarConv, SidecarTurn,
+};
 pub use subagent_steer_gate::{SteerReservation, SubagentSteerGate};
 pub use tools::question::QuestionHub;
 
@@ -36,7 +46,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use opencoder_core::{message::now_ms, Agent, AgentKind, ApMode, Config, Message, Role};
+use opencoder_core::{message::now_ms, Agent, ApMode, Config, Message, Role};
 use opencoder_llm::ChatStream;
 use opencoder_store::{SessionMeta, Store};
 use tokio_util::sync::CancellationToken;
@@ -125,6 +135,7 @@ pub fn fire_turn_cancel(token: &SharedCancel) {
 }
 
 pub struct SessionState {
+    pub harness: opencoder_core::harness::HarnessRuntime,
     pub id: String,
     pub messages: Vec<Message>,
     pub agent: Agent,
@@ -137,18 +148,46 @@ pub struct SessionState {
     pub working_dir: PathBuf,
     pub config: Config,
     pub client: Arc<dyn ChatStream>,
+    /// Agent-private tool dirs for the CURRENT agent (file-based agents'
+    /// `current.tools` pool, or every pool under `ToolsScope::All`). Empty
+    /// for builtin agents. Snapshot of [`crate::agent_pools::tools_path_for`];
+    /// refreshed wherever the session agent or config changes (see
+    /// [`crate::agent_pools::refresh`]). The runner hands a colon-joined
+    /// copy to the bash tool so agent-private executables resolve on PATH.
+    pub tools_path: Vec<PathBuf>,
+    /// Agent-private skill-pool roots for the CURRENT agent (0–1 entries,
+    /// empty for builtins). Snapshot of [`crate::agent_pools::skill_roots_for`];
+    /// the live-session skill choke points (`skill_resolve`, autopilot)
+    /// discover these BEFORE the global skills dir so a `/agent`-switched
+    /// session uses its own agent's skills (first-wins shadowing).
+    pub skill_roots: Vec<PathBuf>,
     pub last_usage: opencoder_llm::Usage,
+    /// Extra `KEY=VALUE` env pairs the runner forwards into every tool
+    /// process (`ToolContext::extra_env`). Workflow-orchestrated sessions
+    /// (DAG agent steps) set step-scoped contract vars here — e.g.
+    /// `OPENCODER_HOW_APPEND` carries the workflow-author-declared how.md
+    /// append payload. Interactive sessions keep it empty.
+    pub env_passthrough: Vec<(String, String)>,
     /// Optional durable store. When set, `record` persists each new message.
     pub store: Option<Arc<dyn Store>>,
-    /// Active skill instructions. NOT part of the system prompt — a
-    /// transient tail reminder (`skill_context::tail_reminder`) surfaces the
-    /// skill at LLM-call time; bodies carrying the `body_with_source`
-    /// `> Source:` prefix yield the `[active skill]` path reminder (the
-    /// model lazily reads the SKILL.md). `None` means no skill is active.
+    /// Active skill instructions. NOT part of the system prompt — the LLM
+    /// call ships the body ONCE per activation instead: `skill_context::
+    /// deliver_body_once` attaches a `[skill loaded]` payload message to the
+    /// FIRST LLM round that observes the skill and flips
+    /// `skill_body_delivered`, so rounds 2..N carry no body (the marker's
+    /// source path lets the model `read` the SKILL.md again when needed).
+    /// `skill_context::tail_reminder` surfaces the `[active skill]` source
+    /// path when no body could ship. `None` means no skill is active.
     /// Set from the TUI `$` picker. One-shot lifetime: an activation lives
     /// only for the run that triggered it — `skill_lifecycle` clears it
     /// (memory + store) when that run ends, so later runs start skill-less.
     pub skill_prompt: Arc<Mutex<Option<String>>>,
+    /// One-shot body delivery ledger: flipped by
+    /// `skill_context::deliver_body_once` the first time the armed body
+    /// rides an LLM payload, so rounds 2..N of the run carry no skill body.
+    /// Reset by every `set_skill` (new activation -> new delivery) and by
+    /// the run-end clear, so a resumed/pre-set skill re-delivers once.
+    skill_body_delivered: Arc<Mutex<bool>>,
     /// Names of skills currently activated via `$name` tokens. Used to
     /// unlock latent tools (ssh_pty) in the runner filter. Shares the
     /// one-shot lifetime of `skill_prompt` (cleared together at run end).
@@ -196,19 +235,15 @@ pub struct SessionState {
     /// store. The authoritative copy lives in the store; this field is used
     /// only for in-memory bookkeeping symmetry with `summary`/`summary_seq`.
     pub summary_images: Vec<String>,
-    /// Plan→act handoff boundary: number of store messages predating the
-    /// handoff (the plan-mode history). On resume these are trimmed and the
-    /// handoff plan instruction is re-attached. `None` = no handoff occurred.
+    /// Transcript handoff boundary: number of store messages predating the
+    /// reset (autopilot ACT handoff, clear-context, legacy plan boundaries).
+    /// On resume these are trimmed and the boundary marker message is
+    /// re-attached. `None` = no handoff occurred.
     pub handoff_seq: Option<i64>,
-    /// Display text of the handoff plan (plan + optional extra). Used to
-    /// reconstruct the synthetic plan instruction on resume and to render the
-    /// plan card.
+    /// Display text persisted at the handoff boundary (directive payload,
+    /// clear-context sentinel or seed marker). Used to reconstruct the
+    /// synthetic boundary message on resume and to render the handoff card.
     pub handoff_plan: Option<String>,
-    /// Requirements submitted in the current plan-mode phase (lifecycle in
-    /// [`crate::plan_phase`]). When > 0, plan prompts get a read-only tag.
-    pub plan_input_count: usize,
-    /// Pre-compaction plan snapshot; see [`crate::plan_phase`].
-    pub plan_snapshot: Option<String>,
     /// User-edited task description text, persisted via the /requirement
     /// slash command so it survives session resume.
     pub requirement: Option<String>,
@@ -226,7 +261,25 @@ impl SessionState {
         working_dir: PathBuf,
     ) -> Self {
         let model = config.model_id().to_string();
+        let mut harness = opencoder_core::harness::HarnessRuntime {
+            harness: opencoder_core::agent::scope::with_root_sync(
+                config.agent.agents_dir.clone(),
+                || opencoder_core::harness::agent_harness(&agent.name),
+            ),
+            ..Default::default()
+        };
+        // Fallible validation is performed by harness::prepare before execution.
+        let _ = opencoder_core::harness::pin_agent_settings(&mut harness, &config, &agent.name);
+        let (tools_path, skill_roots) =
+            opencoder_core::agent::scope::with_root_sync(config.agent.agents_dir.clone(), || {
+                (
+                    crate::agent_pools::tools_path_for(&config, &agent.name),
+                    crate::agent_pools::skill_roots_for(&agent.name),
+                )
+            });
         SessionState {
+            harness,
+            env_passthrough: Vec::new(),
             id: id.into(),
             messages: Vec::new(),
             agent,
@@ -235,9 +288,12 @@ impl SessionState {
             working_dir,
             config,
             client,
+            tools_path,
+            skill_roots,
             last_usage: opencoder_llm::Usage::default(),
             store: None,
             skill_prompt: Arc::new(Mutex::new(None)),
+            skill_body_delivered: Arc::new(Mutex::new(false)),
             active_skill_names: Arc::new(Mutex::new(HashSet::new())),
             persisted_count: 0,
             session_created: false,
@@ -254,8 +310,6 @@ impl SessionState {
             handoff_seq: None,
             handoff_plan: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
             question_hub: QuestionHub::new(),
         }
     }
@@ -286,7 +340,7 @@ impl SessionState {
         self
     }
 
-    /// Mark this session as ts-owned (e.g. launched via `opencode ts`, which
+    /// Mark this session as ts-owned (e.g. launched via `opencoder ts`, which
     /// allocates an id without seeding a session row). On the first `persist`
     /// the session row is written with `agent: None` / `model: None`, the
     /// ts-ownership marker that distinguishes it from normal sessions.
@@ -312,9 +366,11 @@ impl SessionState {
         self
     }
 
-    /// Set the active skill instructions (surfaced as a transient tail
-    /// reminder by `skill_context::tail_reminder`; `body_with_source`-
-    /// prefixed bodies yield the `[active skill]` path reminder).
+    /// Set the active skill instructions (delivered ONCE per activation on
+    /// the first LLM payload by `skill_context::deliver_body_once`;
+    /// `body_with_source`-prefixed bodies ship their full body, bodyless
+    /// ones fall back to the `[active skill]` path pointer via
+    /// `tail_reminder`).
     pub fn with_skill(self, skill_prompt: String) -> Self {
         *self.skill_prompt.lock().unwrap() = Some(skill_prompt);
         self
@@ -341,48 +397,70 @@ impl SessionState {
     /// Update the active skill instructions in place. `None` clears the
     /// skill. One-shot semantics: whatever is set here is cleared at the end
     /// of the run that observes it (`skill_lifecycle::clear_on_run_end`).
+    /// Every write also resets the one-shot body-delivery gate
+    /// (`skill_context::deliver_body_once`), so a fresh activation ships its
+    /// body once again on the next LLM round.
     pub fn set_skill(&self, body: Option<String>) {
         *self.skill_prompt.lock().unwrap() = body;
+        *self.skill_body_delivered.lock().unwrap() = false;
+    }
+
+    /// Whether the armed skill's body has already ridden an LLM payload
+    /// during this activation (`skill_context::deliver_body_once` ledger).
+    pub fn skill_body_delivered(&self) -> bool {
+        *self.skill_body_delivered.lock().unwrap()
+    }
+
+    /// Flip the one-shot body-delivery ledger (runner-side only; see
+    /// `skill_context::deliver_body_once`).
+    pub fn set_skill_body_delivered(&self, delivered: bool) {
+        *self.skill_body_delivered.lock().unwrap() = delivered;
     }
 
     /// Apply a hot-reloaded config: swap the client, model, and config in
     /// place. The caller builds `new_client` (e.g. from the new base_url/key)
     /// so this module stays decoupled from the concrete `ChatClient`. Used by
     /// the TUI `/model` menu via `UiCmd::ReloadConfig` at the turn boundary.
+    /// Also refreshes the agent pool snapshots — a reload may flip
+    /// `agent.tools_scope`, move the agents root, or change the pools on disk.
     pub fn apply_config_reload(&mut self, new_cfg: Config, new_client: Arc<dyn ChatStream>) {
         self.client = new_client;
         self.model = new_cfg.model_id().to_string();
         self.config = new_cfg;
+        crate::harness::resources::invalidate_native(self);
+        crate::agent_pools::refresh(self);
     }
 
     /// Apply a hot-reloaded config but keep the existing client. Used when
     /// the new endpoint/client cannot be constructed (e.g. missing api_key)
     /// so that at least the `model` and `config` fields stay consistent with
     /// the on-disk config — the live session keeps the old client until the
-    /// next successful reload.
+    /// next successful reload. Refreshes the agent pool snapshots all the
+    /// same (see [`Self::apply_config_reload`]).
     pub fn apply_config_reload_keep_client(&mut self, new_cfg: Config) {
         self.model = new_cfg.model_id().to_string();
         self.config = new_cfg;
+        crate::harness::resources::invalidate_native(self);
+        crate::agent_pools::refresh(self);
     }
 
     /// Push a message to the in-memory transcript AND persist it if a store is
     /// attached. Best-effort: persistence errors are logged, not fatal, so a
     /// store hiccup never kills an agent run.
-    ///
-    /// While the plan agent is active, every real assistant text also updates
-    /// the phase-bounded `plan_snapshot` (and mirrors it to the store): the
-    /// plan→act handoff reads ONLY that snapshot, so it can never fabricate a
-    /// "plan" out of an earlier act-phase answer when the plan turn failed or
-    /// was cancelled before producing any output (see `plan_handoff::handoff`).
     pub async fn record(&mut self, msg: Message) {
-        if let Some(snapshot) = crate::plan_phase::plan_snapshot_update(&self.agent.kind, &msg) {
-            self.plan_snapshot = Some(snapshot);
-            self.persist_plan_phase().await;
-        }
         self.messages.push(msg.clone());
         if let Err(e) = self.persist(&msg).await {
             tracing::warn!(session_id = %self.id, error = %e, "persist message failed");
         }
+    }
+
+    pub async fn record_checked(&mut self, msg: Message) -> Result<()> {
+        self.messages.push(msg.clone());
+        if let Err(error) = self.persist(&msg).await {
+            self.messages.pop();
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn persist(&mut self, msg: &Message) -> Result<()> {
@@ -393,6 +471,7 @@ impl SessionState {
         if !self.session_created {
             let now = now_ms();
             let meta = SessionMeta {
+                kind: None,
                 id: self.id.clone(),
                 title: first_user_text(self.messages.as_slice()),
                 agent: if self.ts_origin {
@@ -417,10 +496,14 @@ impl SessionState {
                 skill: self.skill_prompt_cloned(),
                 task_type: None,
                 requirement: None,
-                plan_snapshot: self.plan_snapshot.clone(),
-                plan_input_count: self.plan_input_count as i64,
             };
             store.create_session(&meta).await?;
+            if self.harness.harness == opencoder_core::harness::Harness::Codex
+                || self.harness.resource_root.is_some()
+                || !self.harness.envs.is_empty()
+            {
+                store.set_harness_runtime(&self.id, &self.harness).await?;
+            }
             self.session_created = true;
         }
         store.append_message(&self.id, msg).await?;
@@ -430,7 +513,7 @@ impl SessionState {
 
     /// Count of messages persisted to the store, accounting for any in-memory-only
     /// synthetic summary at the head. Mirrors the accounting in compaction and
-    /// plan_handoff: if a prior compaction set summary_seq, the synthetic
+    /// handoff: if a prior compaction set summary_seq, the synthetic
     /// summary message is NOT in the store, so the store count is
     /// summary_seq + (messages.len() - 1).
     pub fn store_message_count(&self) -> usize {
@@ -466,8 +549,8 @@ impl SessionState {
         self.last_usage = opencoder_llm::Usage::default();
     }
 
-    /// Update bookkeeping after a plan→act handoff. Records the handoff
-    /// boundary (so resume can trim the plan-mode history) and clears any
+    /// Update bookkeeping after an execution handoff. Records the handoff
+    /// boundary (so resume can trim the discarded history) and clears any
     /// compaction state — handoff is the dominant reset, replacing the whole
     /// transcript.
     pub fn after_handoff(&mut self, handoff_seq: i64, handoff_plan: String) {
@@ -483,36 +566,6 @@ impl SessionState {
         // killed the run with "compaction failed: transcript exceeds context
         // window but compaction found nothing to summarize".
         self.last_usage = opencoder_llm::Usage::default();
-        // Plan phase ended (lifecycle: `crate::plan_phase`).
-        self.plan_input_count = 0;
-        self.plan_snapshot = None;
-    }
-
-    /// When in plan mode and this is not the first requirement in the current
-    /// plan phase, append a read-only reminder so the model stays focused on
-    /// planning across multi-turn plan conversations. The tag also carries an
-    /// ask-first clause: any doubt that would shape the plan must go through
-    /// the `question` tool before the plan is emitted. Also increments the
-    /// counter so the next call knows this requirement already occurred.
-    ///
-    /// Recording a new requirement also RETIRES any `plan_snapshot` carried
-    /// from an earlier phase (the `ecce7b0` guard): the snapshot survives the
-    /// plain act→plan switch, but once a new requirement is submitted the old
-    /// plan is stale — if this turn then fails or is cancelled before the
-    /// model answers, `handoff` must not hand the old plan forward as if it
-    /// answered the new requirement. A successful turn re-captures a fresh
-    /// snapshot via `record`. Callers persist the mirror right after this
-    /// (`runner::run_with_registry` and `skill_resolve::record_compound`).
-    pub fn maybe_tag_plan_prompt(&mut self, text: &mut String) {
-        if self.agent.kind == AgentKind::Plan {
-            if self.plan_input_count > 0 {
-                text.push_str(
-                    "\n（当前处于只读的 plan 模式，聚焦计划生成；存在影响计划的疑问必须先用 question 工具提问再输出计划）",
-                );
-            }
-            self.plan_input_count += 1;
-            self.plan_snapshot = None;
-        }
     }
 }
 
@@ -537,3 +590,6 @@ pub(crate) fn cache_salt_for(session: &SessionState) -> Option<String> {
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod lib_tests;
+pub mod loop_registry;
+
+pub mod extensions;

@@ -42,13 +42,12 @@ async fn slash_action_compact_idle_starts_turn() {
     let mut model_menu = None;
     let mut mcp_menu: Option<crate::mcp_menu::McpMenu> = None;
     let mut cache_salt_menu = None;
-    let mut input = String::new();
-    let mut cursor_idx = 0usize;
     let mut config = Config::default();
     let workdir = std::path::Path::new(".");
     let mut mode_flash: Option<(String, u32)> = None;
     let mut sys_tokens = 0u64;
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCmd>(64);
+    let (sidecar_tx, _sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
     let mut cancel = CancellationToken::new();
 
     let flow = dispatch_slash_action(
@@ -56,6 +55,7 @@ async fn slash_action_compact_idle_starts_turn() {
         &cmd_tx,
         &mut cancel,
         &mut chat,
+        &sidecar_tx,
         &mut running,
         &mut follow,
         &store,
@@ -66,16 +66,15 @@ async fn slash_action_compact_idle_starts_turn() {
         &mut None,
         &mut None,
         &mut None,
-        &mut None,
         &mut cache_salt_menu,
         "act",
-        &mut input,
-        &mut cursor_idx,
         &mut config,
         workdir,
         &mut mode_flash,
         0,
         &mut sys_tokens,
+        &mut None,
+        &mut None,
         &mut None,
         &mut None,
     )
@@ -107,13 +106,12 @@ async fn slash_action_compact_running_pushes_busy_marker() {
     let mut model_menu = None;
     let mut mcp_menu: Option<crate::mcp_menu::McpMenu> = None;
     let mut cache_salt_menu = None;
-    let mut input = String::new();
-    let mut cursor_idx = 0usize;
     let mut config = Config::default();
     let workdir = std::path::Path::new(".");
     let mut mode_flash: Option<(String, u32)> = None;
     let mut sys_tokens = 0u64;
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCmd>(64);
+    let (sidecar_tx, _sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
     let mut cancel = CancellationToken::new();
 
     let flow = dispatch_slash_action(
@@ -121,6 +119,7 @@ async fn slash_action_compact_running_pushes_busy_marker() {
         &cmd_tx,
         &mut cancel,
         &mut chat,
+        &sidecar_tx,
         &mut running,
         &mut follow,
         &store,
@@ -131,16 +130,15 @@ async fn slash_action_compact_running_pushes_busy_marker() {
         &mut None,
         &mut None,
         &mut None,
-        &mut None,
         &mut cache_salt_menu,
         "act",
-        &mut input,
-        &mut cursor_idx,
         &mut config,
         workdir,
         &mut mode_flash,
         0,
         &mut sys_tokens,
+        &mut None,
+        &mut None,
         &mut None,
         &mut None,
     )
@@ -176,13 +174,12 @@ async fn slash_action_skill_parses_and_opens_toggle_menu() {
     let mut mcp_menu: Option<crate::mcp_menu::McpMenu> = None;
     let mut cache_salt_menu = None;
     let mut skill_toggle_menu: Option<crate::skill_menu::SkillMenu> = None;
-    let mut input = String::new();
-    let mut cursor_idx = 0usize;
     let mut config = Config::default();
     let workdir = std::path::Path::new(".");
     let mut mode_flash: Option<(String, u32)> = None;
     let mut sys_tokens = 0u64;
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCmd>(64);
+    let (sidecar_tx, _sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
     let mut cancel = CancellationToken::new();
 
     assert_eq!(crate::command::parse("/skill"), Some(SlashAction::Skill));
@@ -193,6 +190,7 @@ async fn slash_action_skill_parses_and_opens_toggle_menu() {
         &cmd_tx,
         &mut cancel,
         &mut chat,
+        &sidecar_tx,
         &mut running,
         &mut follow,
         &store,
@@ -201,18 +199,17 @@ async fn slash_action_skill_parses_and_opens_toggle_menu() {
         &mut model_menu,
         &mut mcp_menu,
         &mut None,
-        &mut None,
         &mut skill_toggle_menu,
         &mut None,
         &mut cache_salt_menu,
         "act",
-        &mut input,
-        &mut cursor_idx,
         &mut config,
         workdir,
         &mut mode_flash,
         0,
         &mut sys_tokens,
+        &mut None,
+        &mut None,
         &mut None,
         &mut None,
     )
@@ -246,14 +243,13 @@ async fn slash_action_ap_parses_and_opens_mode_menu() {
     let mut mcp_menu: Option<crate::mcp_menu::McpMenu> = None;
     let mut cache_salt_menu = None;
     let mut ap_menu: Option<crate::ap_menu::ApMenu> = None;
-    let mut input = String::new();
-    let mut cursor_idx = 0usize;
     let mut config = Config::default();
     config.autopilot.mode = opencoder_core::ApMode::Review;
     let workdir = std::path::Path::new(".");
     let mut mode_flash: Option<(String, u32)> = None;
     let mut sys_tokens = 0u64;
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCmd>(64);
+    let (sidecar_tx, _sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
     let mut cancel = CancellationToken::new();
 
     assert_eq!(crate::command::parse("/ap"), Some(SlashAction::Ap));
@@ -263,6 +259,7 @@ async fn slash_action_ap_parses_and_opens_mode_menu() {
         &cmd_tx,
         &mut cancel,
         &mut chat,
+        &sidecar_tx,
         &mut running,
         &mut follow,
         &store,
@@ -272,17 +269,16 @@ async fn slash_action_ap_parses_and_opens_mode_menu() {
         &mut mcp_menu,
         &mut None,
         &mut None,
-        &mut None,
         &mut ap_menu,
         &mut cache_salt_menu,
         "act",
-        &mut input,
-        &mut cursor_idx,
         &mut config,
         workdir,
         &mut mode_flash,
         0,
         &mut sys_tokens,
+        &mut None,
+        &mut None,
         &mut None,
         &mut None,
     )
@@ -298,5 +294,150 @@ async fn slash_action_ap_parses_and_opens_mode_menu() {
     assert!(
         cmd_rx.try_recv().is_err(),
         "opening the modal must not send a UiCmd"
+    );
+}
+
+/// `/sidecar` dispatched while idle opens the (fresh) panel: a placeholder
+/// block is pushed and focused, `follow` flips on for the body swap, and a
+/// `SidecarCmd::Reset` reaches the actor (entry destroys the previous
+/// conversation). The turn state is untouched.
+#[tokio::test]
+async fn slash_action_sidecar_idle_opens_fresh_panel() {
+    let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
+    let mut chat = ChatView {
+        agent: "act".into(),
+        ..Default::default()
+    };
+    let mut running = false;
+    let mut follow = false;
+    let mut task_picker = None;
+    let mut model_menu = None;
+    let mut mcp_menu: Option<crate::mcp_menu::McpMenu> = None;
+    let mut cache_salt_menu = None;
+    let mut config = Config::default();
+    let workdir = std::path::Path::new(".");
+    let mut mode_flash: Option<(String, u32)> = None;
+    let mut sys_tokens = 0u64;
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCmd>(64);
+    let (sidecar_tx, mut sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
+    let mut cancel = CancellationToken::new();
+
+    let flow = dispatch_slash_action(
+        SlashAction::Sidecar,
+        &cmd_tx,
+        &mut cancel,
+        &mut chat,
+        &sidecar_tx,
+        &mut running,
+        &mut follow,
+        &store,
+        "test",
+        &mut task_picker,
+        &mut model_menu,
+        &mut mcp_menu,
+        &mut None,
+        &mut None,
+        &mut None,
+        &mut cache_salt_menu,
+        "act",
+        &mut config,
+        workdir,
+        &mut mode_flash,
+        0,
+        &mut sys_tokens,
+        &mut None,
+        &mut None,
+        &mut None,
+        &mut None,
+    )
+    .await;
+
+    assert!(matches!(flow, LoopFlow::Proceed));
+    assert!(!running, "opening the panel must not start a turn");
+    assert!(chat.sidecar_focus, "panel is focused");
+    let p = chat
+        .sidecar
+        .as_ref()
+        .expect("fresh panel is stored on the view");
+    assert!(p.id.is_empty(), "placeholder panel has an empty id");
+    assert!(
+        matches!(
+            sidecar_rx.try_recv(),
+            Ok(crate::sidecar_ui::SidecarCmd::Reset)
+        ),
+        "entry must send Reset to the actor"
+    );
+    assert!(cmd_rx.try_recv().is_err(), "no UiCmd is sent");
+    assert!(
+        mode_flash.is_none(),
+        "panel entry needs no help flash — the empty panel title carries the nav, got {mode_flash:?}"
+    );
+    assert!(follow, "body follows the panel");
+}
+
+/// `/sidecar` dispatched MID-TURN still opens the panel: the sidecar bypasses
+/// the parent's steer/queue paths entirely, so the running gate does not
+/// apply and the running turn is untouched (no ResetCancel, no UiCmd).
+#[tokio::test]
+async fn slash_action_sidecar_running_still_opens_panel() {
+    let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
+    let mut chat = ChatView {
+        agent: "act".into(),
+        ..Default::default()
+    };
+    let mut running = true;
+    let mut follow = false;
+    let mut task_picker = None;
+    let mut model_menu = None;
+    let mut mcp_menu: Option<crate::mcp_menu::McpMenu> = None;
+    let mut cache_salt_menu = None;
+    let mut config = Config::default();
+    let workdir = std::path::Path::new(".");
+    let mut mode_flash: Option<(String, u32)> = None;
+    let mut sys_tokens = 0u64;
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCmd>(64);
+    let (sidecar_tx, mut sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
+    let mut cancel = CancellationToken::new();
+
+    let flow = dispatch_slash_action(
+        SlashAction::Sidecar,
+        &cmd_tx,
+        &mut cancel,
+        &mut chat,
+        &sidecar_tx,
+        &mut running,
+        &mut follow,
+        &store,
+        "test",
+        &mut task_picker,
+        &mut model_menu,
+        &mut mcp_menu,
+        &mut None,
+        &mut None,
+        &mut None,
+        &mut cache_salt_menu,
+        "act",
+        &mut config,
+        workdir,
+        &mut mode_flash,
+        0,
+        &mut sys_tokens,
+        &mut None,
+        &mut None,
+        &mut None,
+        &mut None,
+    )
+    .await;
+
+    assert!(matches!(flow, LoopFlow::Proceed));
+    assert!(running, "the parent turn keeps running");
+    assert!(chat.sidecar_focus, "panel opened despite the running turn");
+    assert!(matches!(
+        sidecar_rx.try_recv(),
+        Ok(crate::sidecar_ui::SidecarCmd::Reset)
+    ));
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "no parent UiCmd is sent (bypass path)"
     );
 }

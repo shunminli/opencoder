@@ -1,0 +1,304 @@
+//! Node-local artifact directory contract (pure path/slug/truncation
+//! helpers — no IO; the runtime applies them).
+//!
+//! Layout under the dated DAG parent directory on the execution node:
+//!
+//! ```text
+//! YYYY-MM-DD/<dag_id>/<run_id>/
+//!   workspace/                       <- merged view mounted at /workspace
+//!   upper/                           <- node-local copy-on-write files
+//!   <step-slug>/output.json           <- machine-readable step output (optional)
+//!   <step-slug>/output.txt            <- captured stdout / transcript tail
+//!   <step-slug>/meta.json             <- runtime-written step metadata
+//!   <step-slug>/session.json          <- live sub-session pointer (agent steps)
+//! ```
+//!
+//! The SERVER never touches these files: browsers only ever see truncated
+//! snapshots carried inside `step_done` events. Slugs are validated before
+//! any path is built so a hostile spec cannot traverse out of the run dir.
+
+use std::path::{Path, PathBuf};
+
+use serde_json::{json, Value};
+
+/// Cap for output text carried inside `step_done` event payloads (UI
+/// preview only; full artifacts stay on the node).
+pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024;
+
+pub fn validate_dag_id(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+}
+
+pub fn reserved_step_name(name: &str) -> bool {
+    matches!(
+        name,
+        "workspace"
+            | "upper"
+            | "work"
+            | "bundle"
+            | "private"
+            | "runc-state"
+            | "rootfs-upper"
+            | "rootfs-work"
+            | "resources"
+    )
+}
+
+/// `[a-z0-9][a-z0-9-]{0,63}` — also the artifact directory name.
+pub fn validate_step_slug(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    let rest: Vec<char> = chars.collect();
+    rest.len() <= 63
+        && rest
+            .iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+}
+
+pub fn validate_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id.len() <= 64
+        && run_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `/workflow/<run_id>`
+pub fn run_root(workflow_root: &Path, run_id: &str) -> Result<PathBuf, String> {
+    if !validate_run_id(run_id) {
+        return Err(format!("illegal run id {run_id:?}"));
+    }
+    Ok(workflow_root.join(run_id))
+}
+
+/// `/workflow/<run_id>/<step>` — slug-gated.
+pub fn step_dir(workflow_root: &Path, run_id: &str, step: &str) -> Result<PathBuf, String> {
+    if !validate_step_slug(step) {
+        return Err(format!("illegal step slug {step:?}"));
+    }
+    Ok(run_root(workflow_root, run_id)?.join(step))
+}
+
+/// Validated path for an execution instance; logical step slugs remain unchanged.
+pub fn execution_dir(
+    root: &Path,
+    run: &str,
+    step: &str,
+    index: Option<usize>,
+) -> Result<PathBuf, String> {
+    let dir = step_dir(root, run, step)?;
+    match index {
+        Some(i) if i < crate::dynamic::MAX_INSTANCES => {
+            Ok(dir.join("instances").join(i.to_string()))
+        }
+        Some(_) => Err("instance index exceeds limit".into()),
+        None => Ok(dir),
+    }
+}
+
+/// The runc sandbox mounts THIS directory at `/workspace/context` (rw) with
+/// the container rootfs readonly: step code reads upstream outputs at
+/// `/workspace/context/<upstream>/output.json` and writes its own to
+/// `/workspace/context/<self>/output.json`.
+pub fn context_dir(workflow_root: &Path, run_id: &str) -> Result<PathBuf, String> {
+    run_root(workflow_root, run_id)
+}
+
+/// Truncate an output snapshot to [`MAX_SNAPSHOT_BYTES`] on a char boundary,
+/// marking the cut so the UI can say "truncated".
+pub fn output_snapshot(text: &str) -> String {
+    if text.len() <= MAX_SNAPSHOT_BYTES {
+        return text.to_string();
+    }
+    let mut cut = MAX_SNAPSHOT_BYTES;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n[truncated]", &text[..cut])
+}
+
+/// The runtime-written `meta.json` body for one step.
+pub fn meta_value(
+    step: &str,
+    outcome: &str,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+    error: Option<&str>,
+) -> Value {
+    meta_value_with_session(step, outcome, started_at_ms, finished_at_ms, error, None)
+}
+
+/// [`meta_value`] plus the optional `session_id` of the sub-session that
+/// executed the step. The field is additive and OPTIONAL: readers must treat
+/// a missing `session_id` as "this step ran without a session" (older runs and
+/// step kinds that never had one), never as a parse failure.
+pub fn meta_value_with_session(
+    step: &str,
+    outcome: &str,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+    error: Option<&str>,
+    session_id: Option<&str>,
+) -> Value {
+    json!({
+        "step": step,
+        "outcome": outcome,
+        "started_at_ms": started_at_ms,
+        "finished_at_ms": finished_at_ms,
+        "error": error,
+        "session_id": session_id,
+    })
+}
+
+/// `<step>/session.json` — the live pointer to a step's sub-session, written
+/// THE MOMENT the session is created so a remote console can attach while the
+/// step is still running (`meta.json` only carries `session_id` once the step
+/// finishes). Path is derived from the validated [`step_dir`].
+pub fn session_file(step_dir: &Path) -> PathBuf {
+    step_dir.join("session.json")
+}
+
+/// `session.json` body: `{"session_id":"<ulid>"}`.
+pub fn session_value(session_id: &str) -> Value {
+    json!({ "session_id": session_id })
+}
+
+/// Inverse of [`session_value`]: the session id in a parsed `session.json`,
+/// or `None` for a malformed/empty body (callers fall back to `meta.json`).
+pub fn parse_session_id(value: &Value) -> Option<String> {
+    value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_rules() {
+        for ok in ["a", "a1", "fetch-2", "0x", &"x".repeat(64)] {
+            assert!(validate_step_slug(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "A",
+            "-a",
+            "a_b",
+            "a b",
+            "a/b",
+            "../etc",
+            &"x".repeat(65),
+            "é",
+        ] {
+            assert!(!validate_step_slug(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn run_id_rejects_traversal() {
+        assert!(validate_run_id("01JARUN"));
+        assert!(validate_run_id("run-1_x"));
+        for bad in ["", "..", "a/b", "a b", &"x".repeat(65), "."] {
+            assert!(!validate_run_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn paths_are_rooted_and_slug_gated() {
+        let root = Path::new("/workflow");
+        assert_eq!(run_root(root, "01R").unwrap(), Path::new("/workflow/01R"));
+        assert_eq!(
+            step_dir(root, "01R", "fetch").unwrap(),
+            Path::new("/workflow/01R/fetch")
+        );
+        assert_eq!(
+            context_dir(root, "01R").unwrap(),
+            run_root(root, "01R").unwrap()
+        );
+        // Traversal attempts fail BEFORE any path is built.
+        assert!(step_dir(root, "01R", "../escape").is_err());
+        assert!(run_root(root, "../etc").is_err());
+    }
+
+    #[test]
+    fn snapshot_truncates_on_char_boundary_with_marker() {
+        let short = "hello";
+        assert_eq!(output_snapshot(short), "hello");
+        let long = "ä".repeat(MAX_SNAPSHOT_BYTES); // 2-byte chars
+        let snap = output_snapshot(&long);
+        assert!(snap.ends_with("[truncated]"));
+        assert!(snap.len() <= MAX_SNAPSHOT_BYTES + "\n[truncated]".len() + 1);
+    }
+
+    #[test]
+    fn meta_shape() {
+        let v = meta_value("fetch", "done", 1, 2, None);
+        assert_eq!(v["step"], "fetch");
+        assert_eq!(v["outcome"], "done");
+        assert_eq!(v["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn meta_carries_an_optional_session_id() {
+        let plain = meta_value("fetch", "done", 1, 2, None);
+        assert!(plain["session_id"].is_null());
+        let with = meta_value_with_session("fetch", "done", 1, 2, None, Some("01JSESSION"));
+        assert_eq!(with["session_id"], "01JSESSION");
+        // Every other field is byte-identical: the addition is purely additive.
+        for key in [
+            "step",
+            "outcome",
+            "started_at_ms",
+            "finished_at_ms",
+            "error",
+        ] {
+            assert_eq!(plain[key], with[key], "{key} drifted");
+        }
+    }
+
+    #[test]
+    fn session_file_sits_in_the_validated_step_dir() {
+        let root = Path::new("/workflow");
+        let dir = step_dir(root, "01R", "fetch").unwrap();
+        assert_eq!(
+            session_file(&dir),
+            Path::new("/workflow/01R/fetch/session.json")
+        );
+    }
+
+    #[test]
+    fn session_value_roundtrips_through_parse_session_id() {
+        let value = session_value("01JSESSION");
+        assert_eq!(parse_session_id(&value).as_deref(), Some("01JSESSION"));
+        assert_eq!(parse_session_id(&json!({})), None);
+        assert_eq!(parse_session_id(&json!({"session_id": ""})), None);
+        assert_eq!(parse_session_id(&json!({"session_id": 7})), None);
+        assert_eq!(parse_session_id(&Value::Null), None);
+        // A parsed file body behaves the same as the in-memory value.
+        let parsed: Value = serde_json::from_str(&value.to_string()).unwrap();
+        assert_eq!(parse_session_id(&parsed).as_deref(), Some("01JSESSION"));
+    }
+
+    #[test]
+    fn legacy_meta_json_still_parses_and_reports_no_session() {
+        // A meta.json written before `session_id` existed must stay readable.
+        let legacy: Value = serde_json::from_str(
+            r#"{"step":"fetch","outcome":"done","started_at_ms":1,"finished_at_ms":2,"error":null}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy["step"], "fetch");
+        assert!(legacy.get("session_id").is_none());
+    }
+}

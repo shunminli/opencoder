@@ -1,0 +1,172 @@
+"""Acceptance fixtures must prove process continuity and real scheduling."""
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from live import chain
+from fixture import release_native_gate
+from metrics import check_continuity, summarize, verify, verify_ready
+from transitions import command
+from types import SimpleNamespace
+
+
+class AcceptanceTests(unittest.TestCase):
+    def test_late_admission_keeps_its_release_gate_without_touching_other_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sibling = root / 'dag' / 'other'
+            sibling.mkdir(parents=True)
+            run = root / 'dag' / 'own'
+            def admit():
+                time.sleep(.02)
+                run.mkdir()
+                (run / 'execution.json').write_text(json.dumps({'annotations': {'dag_parent': str(root / 'runs' / '2026-09-30')}}))
+                actual = root / 'runs/2026-09-30/own'
+                actual.mkdir(parents=True)
+                (actual / 'container.json').write_text(json.dumps({'id': 'container-own'}))
+            writer = threading.Thread(target=admit)
+            writer.start()
+            with patch('fixture.subprocess.run', return_value=SimpleNamespace(returncode=0)) as execute:
+                release_native_gate(root, 'own', seconds=2)
+            writer.join()
+            self.assertEqual(execute.call_args.args[0][:5], ['runc', '--root',
+                str(root / 'runs/2026-09-30/own/runc-state'), 'exec', 'container-own'])
+            self.assertFalse((root / 'runs/2026-09-30/own/workspace').exists())
+            self.assertFalse((sibling / 'release').exists())
+            (run / 'hold').mkdir()
+            (run / 'hold' / 'context.json').write_text('{}')
+            with patch('fixture.subprocess.run', return_value=SimpleNamespace(returncode=0)):
+                release_native_gate(root, 'own')
+
+    def test_unconfirmed_admission_does_not_create_an_orphan_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(TimeoutError, 'unconfirmed'):
+                release_native_gate(root, 'absent', seconds=0)
+            self.assertFalse((root / 'dag' / 'absent').exists())
+
+    def test_signal_acceptance_uses_operator_cli_for_publish_and_rollback(self):
+        args = SimpleNamespace(config=Path('/config.json'), bundle=Path('/bundle'), signal=True)
+        self.assertEqual(command(args)[-3:], ['--signal', '--bundle', '/bundle'])
+        self.assertEqual(command(args, rollback=True)[-2:], ['--signal', '--rollback'])
+        args.signal = False
+        self.assertNotIn('--signal', command(args))
+
+    def test_model_scripts_wait_for_release_and_enforce_the_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = chain(root)
+            self.assertEqual(spec['todos'][1]['depends_on'], ['first'])
+            for todo in spec['todos']:
+                self.assertIn(f'cat {root / (todo["id"] + ".done")}', todo['instructions'])
+                self.assertIn('只补做只读文件核验', todo['instructions'])
+            process = subprocess.Popen([sys.executable, str(root / 'first.py')],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 5
+                while not (root / 'model-shell.pid').exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.01)
+                self.assertEqual(int((root / 'model-shell.pid').read_text()), process.pid)
+                self.assertIsNone(process.poll())
+                self.assertFalse((root / 'first.done').exists())
+                early = subprocess.run([sys.executable, str(root / 'second.py')], capture_output=True)
+                self.assertNotEqual(early.returncode, 0)
+                self.assertFalse((root / 'second.done').exists())
+            finally:
+                (root / 'release').touch()
+                output, error = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, error)
+            self.assertEqual(output, b'first dependency completed\n\n')
+            second = subprocess.run([sys.executable, str(root / 'second.py')], capture_output=True, check=True)
+            self.assertEqual(second.stdout, b'second consumed first dependency\n\n')
+
+    def test_continuity_distinguishes_queue_wait_from_a_scheduling_pause(self):
+        traffic = [{'id': 'dag-a', 'at': 0, 'seconds': .1},
+            {'id': 'dag-b', 'at': .2, 'seconds': .1}]
+        executions = [{'created_at_ms': 0, 'started_at_ms': 5000},
+            {'created_at_ms': 200, 'started_at_ms': 5200}]
+        metrics = summarize(traffic, executions)
+        self.assertAlmostEqual(metrics['max_accept_gap_seconds'], .2)
+        self.assertEqual(metrics['max_scheduling_gap_seconds'], .2)
+        self.assertEqual(metrics['max_scheduling_delay_seconds'], 5)
+        with self.assertRaisesRegex(AssertionError, 'at least two'):
+            summarize([], [])
+
+    def test_public_readiness_measures_availability_independently_of_tail_latency(self):
+        samples = [{'started_at': i * .2, 'completed_at': i * .2 + .05}
+                   for i in range(20)]
+        traffic = [{'id': str(i), 'at': i * .2, 'seconds': .2} for i in range(20)]
+        traffic[5]['seconds'] = 32.3
+        executions = [{'created_at_ms': i * 200, 'started_at_ms': i * 200 + 100}
+                      for i in range(20)]
+        self.assertEqual(summarize(traffic, executions)['p95_accept_seconds'], .2)
+        metrics = summarize(traffic, executions)
+        with self.assertRaisesRegex(AssertionError, 'max_accept_seconds'):
+            check_continuity(metrics)
+        check_continuity(metrics, 'p95')
+        traffic[4]['seconds'] = 31.3
+        with self.assertRaisesRegex(AssertionError, 'P95 admission'):
+            check_continuity(summarize(traffic, executions), 'p95')
+        self.assertLess(verify_ready(samples, [])['max_gap_seconds'], 1)
+        samples[10:] = [{**row, 'started_at': row['started_at'] + 31.2,
+                         'completed_at': row['completed_at'] + 31.2} for row in samples[10:]]
+        with self.assertRaisesRegex(AssertionError, 'readiness gap'):
+            verify_ready(samples, [])
+        with self.assertRaisesRegex(AssertionError, 'readiness failed'):
+            verify_ready(samples[:10], ['HTTP 503'])
+
+    def test_continuity_accepts_thirty_seconds_and_rejects_only_over_budget(self):
+        keys = ('max_accept_seconds', 'max_accept_gap_seconds', 'max_scheduling_gap_seconds')
+        metrics = {key: 6.81 for key in (*keys, 'p95_accept_seconds')}
+        check_continuity(metrics)
+        check_continuity(metrics, 'p95')
+        for key in keys:
+            with self.subTest(key=key):
+                check_continuity({**metrics, key: 30})
+                with self.assertRaisesRegex(AssertionError, 'exceeded 30 seconds'):
+                    check_continuity({**metrics, key: 30.001})
+        check_continuity({**metrics, 'p95_accept_seconds': 30}, 'p95')
+        with self.assertRaisesRegex(AssertionError, 'exceeded 30 seconds'):
+            check_continuity({**metrics, 'p95_accept_seconds': 30.001}, 'p95')
+        samples = [{'started_at': 0, 'completed_at': 0},
+                   {'started_at': 30, 'completed_at': 30}]
+        self.assertEqual(verify_ready(samples, [])['max_gap_seconds'], 30)
+        with self.assertRaisesRegex(AssertionError, 'exceeded 30 seconds'):
+            verify_ready([samples[0], {'started_at': 30, 'completed_at': 30.001}], [])
+
+    def test_durable_metrics_reject_duplicate_owners_and_scheduling_gaps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traffic = [{'id': 'dag-a', 'at': 0, 'seconds': .1},
+                {'id': 'dag-b', 'at': .2, 'seconds': .1}]
+
+            def save(runtime, identifier, started):
+                run = root / runtime / 'dag' / identifier
+                actual = root / runtime / 'runs/2026-09-30' / identifier
+                (actual / 'execute').mkdir(parents=True, exist_ok=True)
+                run.mkdir(parents=True, exist_ok=True)
+                (run / 'execution.json').write_text(json.dumps({'assignment': {'index': {'created_at': 0}}, 'annotations': {'dag_parent': str(actual.parent)}}))
+                (actual / 'execute/meta.json').write_text(json.dumps({'outcome': 'done', 'started_at_ms': started}))
+
+            save('r1', 'dag-a', 100)
+            save('r2', 'dag-b', 300)
+            runtimes = [root / 'r1', root / 'r2']
+            self.assertEqual(verify(runtimes, traffic)['metrics']['max_scheduling_gap_seconds'], .2)
+            save('r2', 'dag-b', 31100)
+            with self.assertRaisesRegex(AssertionError, 'scheduling_gap'):
+                verify(runtimes, traffic)
+            save('r2', 'dag-a', 100)
+            with self.assertRaisesRegex(AssertionError, 'exactly one Runtime'):
+                verify(runtimes, traffic)
+
+
+if __name__ == '__main__':
+    unittest.main()

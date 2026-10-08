@@ -48,8 +48,7 @@ fn session_meta(id: &str, agent: &str) -> SessionMeta {
         skill: None,
         task_type: None,
         requirement: None,
-        plan_snapshot: None,
-        plan_input_count: 0,
+        kind: None,
     }
 }
 
@@ -86,6 +85,8 @@ async fn replay_skips_cancelled_task_with_existing_tool_result() {
 
     // Assistant turn with a task tool_use.
     let assistant_msg = Message {
+        provider_state: None,
+        display: None,
         id: "a1".into(),
         role: Role::Assistant,
         blocks: vec![
@@ -111,6 +112,8 @@ async fn replay_skips_cancelled_task_with_existing_tool_result() {
 
     // The timeout already recorded a tool_result for this task_use.
     let tool_msg = Message {
+        provider_state: None,
+        display: None,
         id: "t1".into(),
         role: Role::Tool,
         blocks: vec![ContentBlock::ToolResult {

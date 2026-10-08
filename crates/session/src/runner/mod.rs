@@ -25,7 +25,9 @@ mod event;
 mod execute;
 mod input_recovery;
 mod llm_call;
+mod local_memory;
 mod registry;
+pub(crate) mod sidecar;
 mod steer;
 mod subagent;
 #[cfg(test)]
@@ -58,145 +60,8 @@ fn emit(sink: &Sink<'_>, ev: SessionEvent) {
     }
 }
 
-pub async fn run(
-    session: &mut SessionState,
-    user_text: String,
-    on_event: impl FnMut(SessionEvent) + Send,
-) -> Result<()> {
-    let registry = build_full_registry(session).await;
-    run_with_registry(session, user_text, Vec::new(), &registry, on_event).await
-}
-
-/// Like [`run`] but attaches `images` (data URIs or URLs) as `Image` content
-/// blocks to the first user message, enabling multimodal/vision prompts from
-/// the headless CLI (`opencode run "..." --image ./a.png`).
-pub async fn run_with_images(
-    session: &mut SessionState,
-    user_text: String,
-    images: Vec<String>,
-    on_event: impl FnMut(SessionEvent) + Send,
-) -> Result<()> {
-    let registry = build_full_registry(session).await;
-    run_with_registry(session, user_text, images, &registry, on_event).await
-}
-
-pub async fn run_with_registry(
-    session: &mut SessionState,
-    mut user_text: String,
-    mut images: Vec<String>,
-    registry: &HashMap<String, ToolArc>,
-    on_event: impl FnMut(SessionEvent) + Send,
-) -> Result<()> {
-    let mut on_event = on_event;
-    // True when a ClearContext with a preserved plan OR seed was applied and
-    // the transcript now holds a synthetic message awaiting an LLM execution
-    // turn (user_text was cleared). This keeps `drain_mode` false so run_loop
-    // makes the execution call instead of going idle. Both preserved flavours
-    // must continue running; only the blank sentinel (nothing preserved)
-    // stops without an LLM turn.
-    let mut handoff_pending = false;
-    // Control commands (/act, /plan) short-circuit without an LLM turn. A
-    // compound input (/plan review) switches then runs the rest. EXCEPTION:
-    // /act_clear_context with a preserved result falls through to run_loop.
-    if let Some((cmd, rest)) = crate::control_cmd::split_control_prefix(&user_text) {
-        crate::control_cmd::apply(session, &cmd, &mut on_event).await?;
-        // ClearContext with a preserved result (plan handoff or last-say
-        // seed) falls through to run_loop to execute it; blank sentinel path
-        // (nothing preserved) stops as before.
-        if matches!(cmd, crate::control_cmd::ControlCmd::ClearContext)
-            && !crate::control_cmd::is_clear_context_handoff(
-                session.handoff_plan.as_deref().unwrap_or(""),
-            )
-        {
-            handoff_pending = true;
-            match rest {
-                // Compound (/act_clear_context review) with a preserved plan:
-                // keep the request so it is recorded as a real user prompt and
-                // executed alongside the plan handoff message (not discarded).
-                Some(rest) => user_text = rest,
-                None => {
-                    user_text.clear();
-                    images.clear();
-                }
-            }
-        } else if let Some(rest) = rest {
-            // Compound (/plan review): switch done; fall through to recording
-            // which resolves `$skill` tokens and records user_text as prompt.
-            user_text = rest;
-        } else {
-            on_event(SessionEvent::Done);
-            return Ok(());
-        }
-    }
-    // F2: recover promoted-but-unrecorded inputs before entry_drain_mode polls.
-    input_recovery::recover_orphaned_inputs(session).await;
-    // Replay cancelled subagent tasks from a prior interrupted run BEFORE the
-    // new input enters the loop: resume each child, backfill the parent
-    // tool_result, flip to Completed. No-op for children (no `task` tool).
-    // The TUI passes prompts directly (not via store Delivery), so when the
-    // user typed new input, cancelled subagents are abandoned, not replayed.
-    let has_new_input = !user_text.is_empty() || !images.is_empty();
-    crate::resume::replay_cancelled_tasks(session, has_new_input).await;
-    // Safety net: any `tool_use` id left dangling by a prior interrupted batch
-    // is answered with a synthetic error tool_result, avoiding the provider's
-    // "unanswered tool_call" HTTP 400. Idempotent; runs before recording input.
-    crate::dangling_tools::reconcile_dangling_tool_uses(session).await;
-    // Resolve inline `$skill` tokens from the raw user text (headless path —
-    // the TUI resolves before calling run). Covers both compound commands
-    // (`/plan $review do it`) and plain prompts (`$review do it`). After
-    // stripping, text may be empty if only `$skill` tokens were provided.
-    let prev_skill = session.skill_prompt_cloned();
-    user_text = crate::skill_resolve::resolve_inline_skills(session, &user_text);
-    // Consumption-time activation must also reach the store (queue/steer
-    // drains persist inside record_compound; this is the direct-prompt
-    // twin), so a resume after this turn replays the resolved skill.
-    crate::skill_resolve::persist_active_skill(session, &prev_skill).await;
-    // A non-empty prompt records a real user message. An empty prompt means
-    // "drain mode": the web drain relies on admitted steers/queues being
-    // claimed at turn boundaries to supply the actual user input (trigger
-    // injection + pending-first priority: see drain::entry_drain_mode).
-    let has_text = !user_text.trim().is_empty();
-    let has_images = !images.is_empty();
-    if has_text || has_images {
-        session.maybe_tag_plan_prompt(&mut user_text);
-        let user = Message::user_with_images(new_id(), user_text, &images);
-        session.record(user).await;
-        // Persist the incremented plan-phase counter so a restart keeps the
-        // plan→act handoff armed (TUI Shift+Tab, /act_clear_context gate).
-        if session.agent.kind == AgentKind::Plan {
-            session.persist_plan_phase().await;
-        }
-    }
-    let drain_mode = entry_drain_mode(session, has_text, has_images, handoff_pending).await;
-    if let Err(run_err) = run_loop_one_shot(session, registry, &mut on_event, drain_mode).await {
-        // F3: a failed run must not strand inputs admitted during it — best-effort
-        // bounded re-absorb, never masking the original error.
-        let _ = reabsorb_tail(session, registry, &mut on_event).await;
-        return Err(run_err);
-    }
-
-    // P1-4: bounded re-absorb of steers/queues admitted during run_loop's
-    // idle window (see drain::reabsorb_tail).
-    reabsorb_tail(session, registry, &mut on_event).await?;
-
-    // Autopilot mode dispatch: after the initial task completes, `ap` hands
-    // control to the PLAN -> ACT -> VERIFY self-driving loop, `review` runs a
-    // one-shot review pass (no ACT/VERIFY), and `off` does nothing. A
-    // session-scoped override (`effective_ap_mode`) wins over the config.
-    // The review pass is act-only: a review assesses EXECUTED work, so it is
-    // dispatched solely for primary sessions running the act agent — plan
-    // mode (or any other non-act primary) falls through to the no-op `off`.
-    match session.effective_ap_mode() {
-        opencoder_core::ApMode::Ap => {
-            crate::autopilot::drive(session, registry, &mut on_event).await?;
-        }
-        opencoder_core::ApMode::Review if session.agent.kind == AgentKind::Act => {
-            crate::autopilot::review_pass(session, registry, &mut on_event).await?;
-        }
-        opencoder_core::ApMode::Off | opencoder_core::ApMode::Review => {}
-    }
-    Ok(())
-}
+mod entry;
+pub use entry::{run, run_with_images, run_with_registry};
 
 pub(crate) async fn run_loop(
     session: &mut SessionState,
@@ -224,6 +89,10 @@ pub(crate) async fn run_loop(
         if let Some(c) = &session.cancel {
             if c.is_cancelled() {
                 on_event(SessionEvent::Status("interrupted".into()));
+                // Terminal frame: without `Done` the SSE stream never closes
+                // and the web console stays stuck in `streaming…` (busy) until
+                // a manual reload — found by real-browser acceptance.
+                on_event(SessionEvent::Done);
                 break;
             }
         }
@@ -300,6 +169,45 @@ pub(crate) async fn run_loop(
             }
         }
 
+        crate::harness::prepare(session).await?;
+        if session.harness.harness == opencoder_core::harness::Harness::Codex {
+            reset_turn_cancel(session);
+            if crate::harness::codex::run_turn(session, on_event).await? {
+                drain_mode = true;
+                continue;
+            }
+            match idle_drain(session, on_event, steer_epoch).await? {
+                IdleAction::Continue => continue,
+                IdleAction::SkipLlm => {
+                    skip_llm = true;
+                    continue;
+                }
+                IdleAction::Done => {
+                    on_event(SessionEvent::Done);
+                    break;
+                }
+            }
+        }
+
+        // Hard-limit gate for manual compaction: with `compaction.auto`
+        // off nothing will shrink the transcript, so a request past the
+        // model's context window is a guaranteed 400/degradation. Abort the
+        // run with an actionable hint instead. (Auto mode is handled below.)
+        // Sidecar is exempt: its transcript is a borrowed parent snapshot
+        // with auto-compaction deliberately forced off (runner/sidecar.rs),
+        // so this gate would fail every question near the parent's window
+        // with an unexecutable "/compact" hint - let a genuine provider
+        // context-length error surface honestly instead.
+        if session.agent.name != "sidecar"
+            && !session.config.compaction.auto
+            && compaction::exceeds_hard_limit(session)
+        {
+            on_event(SessionEvent::Error(
+                compaction::MANUAL_COMPACT_HINT.to_string(),
+            ));
+            return Err(anyhow!(compaction::MANUAL_COMPACT_HINT));
+        }
+
         if compaction::should_compact(session) {
             // Retry compaction a few times (transient LLM failures like rate
             // limits are common) before giving up. On final failure return Err
@@ -320,7 +228,7 @@ pub(crate) async fn run_loop(
                         // summarize: an empty or single-message transcript.
                         // Two causes are possible: a stale reported usage
                         // from before a transcript collapse (clear-context /
-                        // plan→act handoff now reset it), or a single message
+                        // handoff now reset it), or a single message
                         // so large that the estimate alone crosses the
                         // compaction budget.
                         //
@@ -366,10 +274,6 @@ pub(crate) async fn run_loop(
             bash_timeout_first = None;
         }
 
-        // Skill full-body injection: idempotent persistent `[skill loaded]`
-        // message so the model never burns a tool call reading the SKILL.md.
-        crate::skill_context::ensure_full_body_loaded(session).await;
-
         on_event(SessionEvent::LlmRoundStart {
             started_at_ms: now_ms(),
         });
@@ -398,9 +302,19 @@ pub(crate) async fn run_loop(
         }
         if session.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
             on_event(SessionEvent::LlmRoundEnd);
+            // Status("interrupted") came from run_one_llm_call; still owe the
+            // terminal `Done` frame — without it the SSE stream never closes
+            // and the console stays busy forever (real-browser acceptance).
+            on_event(SessionEvent::Done);
             break;
         }
-        let (text, reasoning, tool_calls, usage) = turn;
+        let llm_call::LlmTurn {
+            text,
+            reasoning,
+            tool_calls,
+            usage,
+            provider_state,
+        } = turn;
         // Streamline the completed assistant text before it is persisted and
         // re-sent as context. The live TextDelta stream already delivered the
         // verbatim original to the UI, so this only trims the stored +
@@ -411,12 +325,15 @@ pub(crate) async fn run_loop(
         }
 
         let mut blocks: Vec<ContentBlock> = Vec::new();
+        // Responses summaries remain visible on replay independently of the
+        // Chat Completions interleaved-thinking option.
         // Interleaved thinking: persist reasoning_content into the assistant
         // message so it's sent back on subsequent requests. Only needed on
         // tool-call turns (DeepSeek-V4 requires this and returns 400 if
         // omitted; non-tool reasoning is ignored by the API anyway).
         let it_on = session.config.interleaved_thinking.unwrap_or(true);
-        if it_on && !tool_calls.is_empty() && !reasoning.is_empty() {
+        if !reasoning.is_empty() && (provider_state.is_some() || (it_on && !tool_calls.is_empty()))
+        {
             blocks.push(ContentBlock::Reasoning { text: reasoning });
         }
         if !text.is_empty() {
@@ -433,9 +350,16 @@ pub(crate) async fn run_loop(
         assistant.model = Some(session.model.clone());
         assistant.agent = Some(session.agent.name.clone());
         assistant.blocks = blocks;
+        assistant.provider_state = provider_state;
         assistant.usage = usage.as_ref().map(core_usage).unwrap_or_default();
         assistant.created_at = now_ms();
-        session.record(assistant).await;
+        if let Err(error) = session.record_checked(assistant).await {
+            on_event(SessionEvent::LlmRoundEnd);
+            on_event(SessionEvent::Error(format!(
+                "persist assistant response: {error:#}"
+            )));
+            return Err(error);
+        }
         if let Some(u) = &usage {
             on_event(SessionEvent::LlmUsage {
                 total_tokens: u.total_tokens,
@@ -516,6 +440,8 @@ pub(crate) async fn run_loop(
                         })
                         .collect();
                     let doom_msg = Message {
+                        provider_state: None,
+                        display: None,
                         id: new_id(),
                         role: Role::Tool,
                         blocks: doom_blocks,
@@ -678,6 +604,8 @@ pub(crate) async fn run_loop(
                 .collect();
             if !non_replayable.is_empty() {
                 let tool_msg = Message {
+                    provider_state: None,
+                    display: None,
                     id: new_id(),
                     role: Role::Tool,
                     blocks: non_replayable,
@@ -691,9 +619,13 @@ pub(crate) async fn run_loop(
             }
             on_event(SessionEvent::LlmRoundEnd);
             on_event(SessionEvent::Status("interrupted".into()));
+            // Terminal frame (same contract as the loop-head exit above).
+            on_event(SessionEvent::Done);
             break;
         }
         let tool_msg = Message {
+            provider_state: None,
+            display: None,
             id: new_id(),
             role: Role::Tool,
             blocks: tool_blocks,

@@ -93,12 +93,14 @@ async fn send_without_session_returns_error() {
     // Clean up first so there's no leftover state for this session id.
     SSH_SESSIONS.lock().unwrap().remove("test-no-session");
     let ctx = ToolContext {
+        extra_env: Vec::new(),
         session_id: "test-no-session".to_string(),
         message_id: "test-msg".to_string(),
         agent: "act".to_string(),
         working_dir: std::path::PathBuf::from("/tmp"),
         max_output: 4096,
         proxy: None,
+        tools_path: None,
     };
     let input = serde_json::json!({"action": "send", "command": "ls"});
     let out = SshPtyTool.execute(input, &ctx).await.unwrap();
@@ -112,12 +114,14 @@ async fn connect_rejects_injection_in_host() {
     // Ensure clean state
     SSH_SESSIONS.lock().unwrap().clear();
     let ctx = ToolContext {
+        extra_env: Vec::new(),
         session_id: "test-injection".to_string(),
         message_id: "test-msg".to_string(),
         agent: "act".to_string(),
         working_dir: std::path::PathBuf::from("/tmp"),
         max_output: 4096,
         proxy: None,
+        tools_path: None,
     };
     let input = serde_json::json!({
         "action": "connect",
@@ -134,12 +138,14 @@ async fn connect_rejects_injection_in_port() {
     use opencoder_core::ToolContext;
     SSH_SESSIONS.lock().unwrap().clear();
     let ctx = ToolContext {
+        extra_env: Vec::new(),
         session_id: "test-port-injection".to_string(),
         message_id: "test-msg".to_string(),
         agent: "act".to_string(),
         working_dir: std::path::PathBuf::from("/tmp"),
         max_output: 4096,
         proxy: None,
+        tools_path: None,
     };
     let input = serde_json::json!({
         "action": "connect",
@@ -156,12 +162,14 @@ async fn send_rejects_interactive_command() {
     use opencoder_core::ToolContext;
     SSH_SESSIONS.lock().unwrap().clear();
     let ctx = ToolContext {
+        extra_env: Vec::new(),
         session_id: "test-interactive".to_string(),
         message_id: "test-msg".to_string(),
         agent: "act".to_string(),
         working_dir: std::path::PathBuf::from("/tmp"),
         max_output: 4096,
         proxy: None,
+        tools_path: None,
     };
     let input = serde_json::json!({
         "action": "send",
@@ -176,12 +184,14 @@ async fn status_without_session_reports_none() {
     use opencoder_core::ToolContext;
     SSH_SESSIONS.lock().unwrap().clear();
     let ctx = ToolContext {
+        extra_env: Vec::new(),
         session_id: "test-status-none".to_string(),
         message_id: "test-msg".to_string(),
         agent: "act".to_string(),
         working_dir: std::path::PathBuf::from("/tmp"),
         max_output: 4096,
         proxy: None,
+        tools_path: None,
     };
     let input = serde_json::json!({"action": "status"});
     let out = SshPtyTool.execute(input, &ctx).await.unwrap();
@@ -193,12 +203,14 @@ async fn status_without_session_reports_none() {
 async fn unknown_action_returns_error() {
     use opencoder_core::ToolContext;
     let ctx = ToolContext {
+        extra_env: Vec::new(),
         session_id: "test-unknown".to_string(),
         message_id: "test-msg".to_string(),
         agent: "act".to_string(),
         working_dir: std::path::PathBuf::from("/tmp"),
         max_output: 4096,
         proxy: None,
+        tools_path: None,
     };
     let input = serde_json::json!({"action": "foobar"});
     let out = SshPtyTool.execute(input, &ctx).await.unwrap();

@@ -14,13 +14,54 @@ use opencoder_store::{Store, SubagentStatus, SubagentTaskRecord};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::chat::{short, summarize, ChatBlock, ChatView, TOOL_OUTPUT_LINES};
+use crate::chat::{
+    coalesce_steps, short, single_step_group, summarize, tool_output_lines, ChatBlock, ChatView,
+    Step, ToolCall,
+};
 use crate::terminal_text::{sanitize_multiline, sanitize_single_line};
 use crate::theme;
 
-/// Replay a single persisted message into `chat`: reconstruct `Assistant` text and
-/// `Tool` blocks (header from `ToolUse`, output from matching `ToolResult`),
-/// mirroring the live `ChatView::apply` path for resumed/compacted sessions.
+/// Emit one replay segment as a ladder: pre-Say reasoning plus the segment's
+/// calls form the turn's StepGroup (a call-less step when the turn only
+/// thought before speaking). Mirrors the live path's grouping rules; pure
+/// w.r.t. the passed buffers (drains both on flush).
+fn flush_segment(
+    chat: &mut ChatView,
+    seg_thinking: &mut Vec<String>,
+    seg_calls: &mut Vec<ToolCall>,
+) {
+    if seg_thinking.is_empty() && seg_calls.is_empty() {
+        return;
+    }
+    let thinking_raw = seg_thinking.join("");
+    seg_thinking.clear();
+    // Render eagerly, mirroring the live path (thinking is rendered markdown
+    // the moment it is absorbed into a step): replayed steps carry the
+    // rendered body too, so `.thinking` readers (disclosure, copy mode) see
+    // it without waiting for a lazy render pass that replay never runs.
+    let thinking = crate::markdown::render(&thinking_raw);
+    let steps = vec![Step {
+        thinking_raw,
+        thinking,
+        thinking_dirty: false,
+        calls: std::mem::take(seg_calls),
+        open: false,
+        calls_open: false,
+        sealed: true,
+    }];
+    chat.blocks.push(ChatBlock::StepGroup {
+        steps,
+        open: false,
+        progress_active: false,
+    });
+}
+
+/// Replay a single persisted message into `chat`: reconstruct `Assistant` text
+/// and `ChatBlock::StepGroup` blocks (headers from `ToolUse`, outputs from
+/// matching `ToolResult`s), mirroring the live `ChatView::apply` path
+/// (calls accumulate in the trailing step until new Thinking) for resumed/compacted
+/// sessions. Thinking folding into steps happens once, via `coalesce_steps`
+/// at the end of replay.
 pub(super) fn replay_one(
     chat: &mut ChatView,
     msg: &Message,
@@ -28,22 +69,29 @@ pub(super) fn replay_one(
 ) {
     match msg.role {
         Role::User => {
-            // Synthetic user messages (plan->act handoff, compaction summaries,
-            // pure-skill triggers) are internal — skip `user:` blocks on replay.
-            // Steer/queue promotions are real user input and ARE rendered so the
-            // user sees their queued/steered prompts after resume.
-            if msg.synthetic {
+            // Synthetic user messages (plan->act handoff, compaction summaries)
+            // are internal — skip `user:` blocks on replay. Skill triggers are
+            // the exception: they carry the verbatim input as `display`, which
+            // IS rendered. Steer/queue promotions are real user input and ARE
+            // rendered (via `display`, tokens included) so the user sees their
+            // prompts verbatim after resume.
+            if msg.synthetic && msg.display.is_none() {
                 return;
             }
-            let text: String = msg
-                .blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
+            // Echo contract: `display` is the verbatim input single source of
+            // truth; fall back to the recorded blocks for legacy rows.
+            let text: String = match &msg.display {
+                Some(d) => d.clone(),
+                None => msg
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            };
             let text = sanitize_multiline(&text).into_owned();
             if chat.first_prompt.is_none() {
                 let t = text.trim();
@@ -85,59 +133,55 @@ pub(super) fn replay_one(
             if msg.usage.total_tokens > 0 {
                 chat.real_context_tokens = Some(msg.usage.total_tokens);
             }
-            // Live streaming groups every reasoning segment before the round's
-            // sole Assistant block. Rebuild in the same order so resume never
-            // flips `Thinking -> Say` into `Say -> Thinking`.
+            // Rebuild in BLOCK ORDER, mirroring the live path's Turn
+            // contract: a Text block (Say) CLOSES a Turn — reasoning/tool
+            // blocks that follow it belong to the NEXT turn's ladder, not
+            // the one above the Say. Segments between Says accumulate
+            // exactly like live rounds within one turn. `coalesce_steps`
+            // later merges call-only steps that share a turn.
+            let mut seg_thinking: Vec<String> = Vec::new();
+            let mut seg_calls: Vec<ToolCall> = Vec::new();
             for b in &msg.blocks {
-                if let ContentBlock::Reasoning { text } = b {
-                    chat.blocks.push(ChatBlock::Thinking {
-                        text: sanitize_multiline(text).into_owned(),
-                        collapsed: true,
-                        sealed: true,
-                    });
-                }
-            }
-            let text: String = msg
-                .blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            let text = sanitize_multiline(&text).into_owned();
-            if !text.is_empty() {
-                let rendered = crate::markdown::render(&text);
-                chat.blocks.push(ChatBlock::Assistant {
-                    raw: text,
-                    rendered,
-                    done: true,
-                });
-            }
-            for b in &msg.blocks {
-                if let ContentBlock::ToolUse { id, name, input } = b {
-                    if name == "task" {
-                        continue;
+                match b {
+                    ContentBlock::Reasoning { text } => {
+                        seg_thinking.push(sanitize_multiline(text).into_owned());
                     }
-                    chat.blocks.push(ChatBlock::Tool {
-                        id: id.clone(),
-                        header: Line::from(vec![
-                            Span::styled(
-                                format!("\u{25b8} {} ", sanitize_single_line(name)),
-                                Style::default()
-                                    .fg(theme::accent())
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(summarize(input), Style::default().fg(theme::muted())),
-                        ]),
-                        output: Vec::new(),
-                        collapsed: true,
-                        started_at_ms: 0,
-                        elapsed_ms: Some(0),
-                    });
+                    ContentBlock::Text { text } if !text.trim().is_empty() => {
+                        flush_segment(chat, &mut seg_thinking, &mut seg_calls);
+                        let raw = sanitize_multiline(text).into_owned();
+                        chat.blocks.push(ChatBlock::Assistant {
+                            raw,
+                            rendered: crate::markdown::render(text),
+                            done: true,
+                        });
+                    }
+                    ContentBlock::ToolUse { id, name, input } if name != "task" => {
+                        seg_calls.push(ToolCall {
+                            id: id.clone(),
+                            header: Line::from(vec![
+                                Span::styled(
+                                    format!("\u{25b8} {} ", sanitize_single_line(name)),
+                                    Style::default()
+                                        .fg(theme::accent())
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(summarize(input), Style::default().fg(theme::muted())),
+                            ]),
+                            output: Vec::new(),
+                            // Replayed calls carry no wall-clock timing: mark them
+                            // finished (elapsed 0) so no epoch-scale live timer or
+                            // "running" hint renders on resume.
+                            started_at_ms: Some(0),
+                            elapsed_ms: Some(0),
+                            expanded: false,
+                        });
+                    }
+                    _ => {}
                 }
             }
+            // Trailing segment after the last Say (or the whole message
+            // when it never spoke): its ladder follows the same contract.
+            flush_segment(chat, &mut seg_thinking, &mut seg_calls);
         }
         Role::Tool => {
             for b in &msg.blocks {
@@ -154,40 +198,49 @@ pub(super) fn replay_one(
                     } else {
                         theme::muted()
                     };
-                    let clean_content = sanitize_multiline(content);
-                    let out: Vec<Line<'static>> = clean_content
-                        .lines()
-                        .take(TOOL_OUTPUT_LINES)
-                        .map(|l| {
-                            Line::from(Span::styled(format!("  {l}"), Style::default().fg(color)))
-                        })
-                        .collect();
-                    if let Some(ChatBlock::Tool { output: o, .. }) = chat
-                        .blocks
-                        .iter_mut()
-                        .rev()
-                        .find(|blk| {
-                            matches!(blk, ChatBlock::Tool { id: bid, .. } if bid == tool_use_id)
-                        }) {
-                        o.extend(out);
+                    let out = tool_output_lines(content, color);
+                    let target = chat.blocks.iter().enumerate().rev().find_map(|(gi, blk)| {
+                        if let ChatBlock::StepGroup { steps, .. } = blk {
+                            steps
+                                .iter()
+                                .enumerate()
+                                .rev()
+                                .find_map(|(si, s)| {
+                                    s.calls
+                                        .iter()
+                                        .rposition(|c| c.id == *tool_use_id)
+                                        .map(|ci| (si, ci))
+                                })
+                                .map(|(si, ci)| (gi, si, ci))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((gi, si, ci)) = target {
+                        if let ChatBlock::StepGroup { steps, .. } = &mut chat.blocks[gi] {
+                            steps[si].calls[ci].output.extend(out);
+                        }
                     } else {
                         // Skip fallback for "task" tools — their output is
-                        // shown via the Subagent block, not a Tool block.
+                        // shown via the Subagent block, not a StepGroup.
                         let has_subagent = chat.blocks.iter().any(|b| {
                             matches!(b, ChatBlock::Subagent { id: bid, .. } if bid == tool_use_id)
                         });
                         if !has_subagent {
-                            chat.blocks.push(ChatBlock::Tool {
-                                id: tool_use_id.clone(),
-                                header: Line::from(Span::styled(
-                                    "\u{25b8} (output)",
-                                    Style::default().fg(theme::accent()),
-                                )),
-                                output: out,
-                                collapsed: true,
-                                started_at_ms: 0,
-                                elapsed_ms: Some(0),
-                            });
+                            chat.blocks.push(single_step_group(
+                                ToolCall {
+                                    id: tool_use_id.clone(),
+                                    header: Line::from(Span::styled(
+                                        "\u{25b8} (output)",
+                                        Style::default().fg(theme::accent()),
+                                    )),
+                                    output: out,
+                                    started_at_ms: None,
+                                    elapsed_ms: Some(0),
+                                    expanded: false,
+                                },
+                                Vec::new(),
+                            ));
                         }
                     }
                     // Render tool-returned images inline after the text output.
@@ -295,6 +348,10 @@ pub async fn replay_into_chat(
         push_subagent_block(&mut chat, block);
     }
 
+    // Fold replayed blocks into the step model: trailing `Thinking` runs
+    // merge into the following StepGroup's first step and adjacent groups
+    // coalesce — the same shape the live streaming path produces.
+    coalesce_steps(&mut chat.blocks);
     // Full transcript token count for ctx% (system prompt added at render).
     chat.context_used = estimate_messages_for_display(messages) as u64;
     // Compaction truncates the message list, so the usage sum above can only
@@ -316,8 +373,8 @@ fn push_subagent_block(chat: &mut ChatView, block: ChatBlock) {
 }
 
 /// Rebuild the chat view after a mid-run `TranscriptReset` (compaction /
-/// clear-context), carrying over cross-reset UI state: plan-submitted flag,
-/// saved annotation, submitted flag, first prompt, and the session-lifetime
+/// clear-context), carrying over cross-reset UI state: saved annotation,
+/// submitted flag, first prompt, and the session-lifetime
 /// token accumulation (floored via `preserve_tokens_total`).
 pub async fn rebuild_after_reset(
     chat: &mut ChatView,
@@ -326,18 +383,36 @@ pub async fn rebuild_after_reset(
     session_id: &str,
 ) {
     let agent = chat.agent.clone();
-    let saved_plan_submitted = chat.plan_submitted;
     let saved_annotation_text = chat.annotation_text.clone();
     let saved_submitted = chat.submitted;
     let saved_first_prompt = chat.first_prompt.clone();
     let saved_tokens_total = chat.tokens_total;
+    let saved_turn_echo = chat.pending_turn_echo.clone();
     *chat = replay_into_chat(&agent, msgs, store, session_id, saved_tokens_total).await;
-    chat.plan_submitted = saved_plan_submitted;
     chat.annotation_text = saved_annotation_text;
     chat.submitted = saved_submitted;
     chat.first_prompt = saved_first_prompt;
-    // The reset happened inside the admitted turn; reliable
-    // completion repair must never target pre-reset blocks.
+    chat.pending_turn_echo = saved_turn_echo;
+    // The reset happened inside the admitted turn (e.g. the compound
+    // `/act_clear_context <tail>` that triggered it), and the folded
+    // transcript cannot contain that turn's prompt yet — it is recorded
+    // after the reset fires. Without re-pushing the echo, the running
+    // turn's ladder and Say would render with NO user boundary below the
+    // rebuilt blocks, reading as steps accumulated into the previous turn
+    // and Says glued together. Restore the boundary, then anchor the
+    // ladder below it.
+    if let Some(echo) = chat
+        .pending_turn_echo
+        .as_ref()
+        .filter(|e| !e.trim().is_empty())
+    {
+        let rendered = crate::markdown::render(echo);
+        chat.blocks.push(crate::chat::ChatBlock::User { rendered });
+        chat.blocks.push(crate::chat::ChatBlock::Marker(vec![
+            ratatui::text::Line::from(""),
+        ]));
+    }
+    // Reliable completion repair must never target pre-reset blocks.
     chat.turn_block_start = chat.blocks.len();
 }
 
@@ -362,7 +437,14 @@ pub(super) async fn build_subagent_block(
         }
     };
 
-    let view = reconstruct_child_view(&task.child_session_id, &task.agent, store).await;
+    let mut view = reconstruct_child_view(&task.child_session_id, &task.agent, store).await;
+    // The persisted event log may end mid-stream (crash / kill between
+    // flushes): the child never emitted its round-terminal frames, and
+    // unlike the live path — whose `mark_subagent_done` finalizes the child
+    // view — a rebuilt view has no turn end to repair it. Finalize once
+    // here so a truncated log never resurrects an open Say whose body
+    // renders raw markdown.
+    view.finalize_assistant();
 
     ChatBlock::Subagent {
         id: task.task_id.clone(),
@@ -535,6 +617,8 @@ pub fn replay_messages(agent_name: &str, messages: &[Message]) -> ChatView {
     for msg in messages {
         replay_one(&mut chat, msg, &empty);
     }
+    // Same fold as `replay_into_chat` — one shared step-shape guarantee.
+    coalesce_steps(&mut chat.blocks);
     chat.context_used = estimate_messages_for_display(messages) as u64;
     chat
 }

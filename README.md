@@ -5,7 +5,7 @@
 <h1 align="center">OpenCoder</h1>
 
 <p align="center">
-  从零实现的 Rust 原生编码代理 · 单二进制 · 可替换的存储与 LLM 后端<br/>
+  从零实现的 Rust 原生编码代理 · CLI/TUI 与节点调度平台 · 可替换的存储与 LLM 后端<br/>
   A high-performance, minimal coding agent written in Rust.
 </p>
 
@@ -42,9 +42,11 @@
 
 OpenCoder 是一个完全独立、从零实现的 Rust 原生编码代理。它以单一二进制 `opencoder` 提供 **交互式 TUI**、**无头一次性运行**、**集中式 HTTP/SSE 服务端** 与 **远程瘦客户端** 四种工作形态。所有上层逻辑只依赖两个抽象口子 —— `Arc<dyn Store>` 与 `Arc<dyn ChatStream>` —— 因此持久化层（libsql）与 LLM 后端（OpenAI 兼容）均可替换。
 
+多节点平台由 `opencoder-server` 管理调度、`opencoder-agent` 执行任务，复用 Web 控制台；运行明细保存在所属节点。部署、NFS 资源共享与恢复语义见 [Agent 调度平台](docs/agent-platform.md)。
+
 ## ✨ 特性
 
-- **🧠 多形态运行时** — TUI 交互、headless `run`、`server`（HTTP/JSON + SSE）、`client` 远程瘦前端，四种入口共享同一套 session 运行时。
+- **🧠 多形态运行时** — 本地 TUI 与 headless `run` 共享会话运行时；独立的 `opencoder-server` 和 `opencoder-agent` 提供 Fleet 控制面与节点执行。
 - **🔄 会话恢复与分叉** — `--session <id>` / `--continue` / `--fork` 跨进程从 libsql 重建历史；title 由 small model 异步生成。
 - **📦 Session 二进制导出/导入** — `session export/import` 以 `.opencoder` 二进制（`OPENCODR` magic）携带完整 subagent 树迁移会话，幂等且不导出 Config（API key 安全）。
 - **🛠️ Subagent 调度** — `explore`（只读探查）与 `build`（实现执行）两类子代理，DB 追踪生命周期、可折叠查看。
@@ -55,6 +57,8 @@ OpenCoder 是一个完全独立、从零实现的 Rust 原生编码代理。它�
 - **⚡ 高性能** — 冷启动 ~6 ms，二进制 9.3 MB（thin-LTO + strip）；libsql WAL 并发读写，千条消息追加 30 ms。
 
 ## 🚀 快速开始
+
+Windows 11 x64 支持原生 TUI 和 operator 节点，使用稳定版 PowerShell 7.4 及以上（7.x）。安装、构建与支持范围见 [Windows 使用说明](docs/windows.md)。
 
 > 👉 新用户上手（TUI 键位、notepad 浏览/编辑文件、任务附加备注等）见 [**快速上手指南**](docs/quickstart.md)。
 
@@ -69,6 +73,11 @@ cargo build --release
 # 二进制位于 target/release/opencoder
 ```
 
+平台前置（源码构建）：
+
+- **Linux**：直接 `cargo build --release`，全量功能可用（含 `opencoder-agent` 节点）。
+- **macOS**：可构建并使用 `opencoder`（CLI/TUI）与 `opencoder-server`；需先执行 `xcode-select --install` 并 `brew install cmake`（libsql 的 libsql-ffi 依赖 libclang 与 cmake）。macOS 上会话子进程以直接子进程方式运行（无 Linux pidfd 进程监管），`opencoder-agent` 节点（runc 沙箱、进程监管）仅支持 Linux。
+
 或使用安装脚本：
 
 ```bash
@@ -78,6 +87,15 @@ curl -fsSL https://raw.githubusercontent.com/MoSunDay/opencoder/main/scripts/ins
 ### 配置
 
 首次交互式启动时，OpenCoder 会创建 `~/.opencoder/config.json`；若合并后的配置尚不可用，会在 TUI 内引导填写第一个模型。provider、model、端点和 API key 通过本地校验后，将在同一个 TUI 中直接进入任务输入界面；已有可用的项目配置或环境变量配置则不会重复提示。
+
+TUI 事件命令可写在 `~/.opencoder/hooks.json`：`turn_done` 在最终回合结束时触发，`question` 在提问工具等待回答时触发。每个事件接受命令字符串数组，使用 `sh -c` 执行，单条命令最多等待 3 秒；命令失败不影响会话。例如在 terminator-rust 的非活动 tab 上显示提示：
+
+```json
+{
+  "turn_done": ["if [ -n \"${TERMINATOR_PANE_ID:-}\" ]; then \"${TERMINATOR_CTL:-terminator-ctl}\" notice; fi"],
+  "question": ["if [ -n \"${TERMINATOR_PANE_ID:-}\" ]; then \"${TERMINATOR_CTL:-terminator-ctl}\" notice; fi"]
+}
+```
 
 在项目根目录或 `~/.opencoder/` 放置 `opencoder.json`（环境变量与 CLI flag 优先级更高）：
 
@@ -102,6 +120,10 @@ curl -fsSL https://raw.githubusercontent.com/MoSunDay/opencoder/main/scripts/ins
 
 `model` 格式为 `"{provider}/{model_id}"`，provider 名匹配 `providers` map 的 key（未匹配则回退到默认 `provider`）。`api_key` / header `value` 支持 `{ENV_VAR}` 环境变量间接引用。
 
+接入 GPT-5/6 时，在对应 provider 中设置 `"protocol": "responses"`，并填写服务端提供的模型 ID。未设置协议的旧配置默认使用 `chat_completions`。两种协议可以混用，支持流式推理、工具/MCP、图片、子代理和会话恢复。配置示例与验收范围见 [Responses API](features/responses/index.md)。
+
+需要操作桌面应用或浏览器时，可安装可选的 [`opencoder-computer`](tools/computer-use/README.md)，通过 `/cli` 注册接入。它使用独立配置的桌面模型，由 Cua 的 Agent 操作已有远程桌面；平台能力沿用 Cua。
+
 ### 三种使用方式
 
 ```bash
@@ -111,9 +133,9 @@ opencoder
 # 2) 无头一次性运行，输出到 stdout
 opencoder run "用 Rust 实现一个 LRU cache 并写测试"
 
-# 3) 启动服务端（集中存储 + LLM 网关 + SSE），另一台机器用 client 接入
-opencoder server --host 0.0.0.0 --port 8080
-opencoder client --remote http://127.0.0.1:8080 "总结这个仓库的架构"
+# 3) 启动 Fleet 服务端，并在另一台机器接入执行节点
+opencoder-server --host 0.0.0.0 --port 8080 --token-file /secure/path/token
+opencoder-agent --remote http://SERVER:8080 --name worker-1 --token-file /secure/path/token
 
 # 4) 在 tmux 里跑 TUI：SSH 断线后会话存活，重连后 opencoder ts 自动 reattach
 opencoder ts            # 新建/恢复 tmux 会话
@@ -123,7 +145,7 @@ opencoder ts -r <id>    # 恢复指定会话
 
 ## 🧱 架构
 
-OpenCoder 是一个 Cargo workspace，由 8 个 crate 组成，依赖严格分层：
+OpenCoder 是一个依赖分层的 Cargo workspace。主要 crate 包括：
 
 | Crate | 职责 |
 | --- | --- |
@@ -133,8 +155,10 @@ OpenCoder 是一个 Cargo workspace，由 8 个 crate 组成，依赖严格分�
 | `session` | 运行时核心：drain 主循环、工具注册、subagent 调度、plan bash 守卫、压缩、resume |
 | `tui` | ratatui 交互界面（3 区域布局、subagent 折叠、steer/followup、plan/act 切换） |
 | `web` | axum HTTP + SSE 会话管理（prompt admit / 事件流 / 运行时切换 / interrupt） |
-| `client` | 远程瘦客户端：提交 prompt 并流式回放，本地不存储、不调 LLM |
-| `cli` | clap 前端 + headless 运行时（run / tui / server / client / config / models / session） |
+| `control` / `server` | Fleet HTTP 控制面与独立服务端二进制 |
+| `node` / `worker` / `agent` | 节点连接、执行适配与独立节点二进制 |
+| `local` / `ctl` | 本地交互与无头前端、Fleet 管理 CLI |
+| `brain` / `dag` / `team` / `todos` | 编排能力与执行契约 |
 
 **关键抽象：**
 
@@ -149,8 +173,9 @@ opencoder [OPTIONS] [PROMPT]...        # 默认进入 TUI
 opencoder run <PROMPT>                  # 无头一次性运行
 opencoder tui                           # 显式启动 TUI
 opencoder ts                            # 在 tmux 里跑 TUI（SSH 断线存活；-l 列出，-r <id> 恢复）
-opencoder server [--host] [--port]      # 服务端（别名：serve）
-opencoder client --remote <URL> <PROMPT># 远程瘦客户端
+opencoder-server --host <ADDR> --port <PORT> --token-file <PATH>  # Fleet 服务端
+opencoder-agent --remote <URL> --name <NAME> --token-file <PATH> # Fleet 执行节点
+opencoder-cli --help                    # Fleet 管理 CLI
 opencoder config [show]                 # 查看合并后的配置
 opencoder models                        # 列出已知模型
 opencoder session <list|show|delete>    # 会话管理（show --json 为深度观测面）
@@ -255,6 +280,10 @@ opencoder run "实现终端贪吃蛇..."
 
 ## 🧪 开发与测试
 
+本仓库只维护 OpenCoder 的通用基建能力。外部业务实现、专用工作流及其说明存放在仓库外的 `/data00/opencoder-tools/`，通过独立工具维护。核心代码、构建和测试不依赖该目录。
+
+
+
 本项目强制遵循 [`rules/`](rules/) 下的开发规则：每个业务功能必须有对应测试，每轮迭代结束前跑全量回归并附 changelog + 测试清单。
 
 ```bash
@@ -263,9 +292,15 @@ cargo test --workspace
 
 # 真实模型端到端契约测试（~3–5 min，需 API key）
 scripts/e2e-glm.sh
+
+# 仅跑某一层（--only cli|web）；E20 config 与 E21 todos 契约套件无 key 依赖，
+# 会随 cli/全量模式一起执行
+scripts/e2e-glm.sh --only cli
 ```
 
-测试分层规范见 [`rules/03-test-pyramid.md`](rules/03-test-pyramid.md)。
+todos 领域套件清单（validate 诊断 / 运行时事件目录 / 中断恢复 / web 生命周期）见
+[`agents/todos/index.md`](agents/todos/index.md)；测试分层规范见
+[`rules/03-test-pyramid.md`](rules/03-test-pyramid.md)。
 
 ## 📁 项目结构
 
@@ -277,9 +312,12 @@ opencoder/
 │   ├── store/     # Store trait + libsql 实现
 │   ├── session/   # 会话运行时核心
 │   ├── tui/       # ratatui 交互界面
-│   ├── web/       # axum HTTP + SSE
-│   ├── client/    # 远程瘦客户端
-│   └── cli/       # clap 前端 + headless 运行时
+│   ├── web/       # HTTP/SSE 与 SPA 模块
+│   ├── control/   # Fleet 控制面
+│   ├── server/    # 独立服务端二进制
+│   ├── agent/     # 独立执行节点二进制
+│   ├── local/     # 本地 CLI 与 headless 运行时
+│   └── ctl/       # Fleet 管理 CLI
 ├── docs/          # 性能 profile 等文档
 ├── features/      # 能力地图 + 按日期归档的 changelog
 ├── rules/         # 开发规则（测试 / 回归 / 分层）

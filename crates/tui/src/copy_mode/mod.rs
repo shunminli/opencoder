@@ -10,11 +10,13 @@
 //! the selection fight.
 //!
 //! While active, the body is re-rendered full-width with render decoration
-//! stripped — no rounded border, no scrollbar column, no `[turn cost]` row,
+//! stripped — no rounded border, no scrollbar column, no `[call cost]` row,
 //! no border indicators; per row the indent gutter and code-frame prefixes
 //! (`│ `, `▎ `) are removed and pure-decoration rows (role headers
 //! `❯ User:`/`❯ Say:`, thematic breaks, `┌ lang`/`└───` code frames, plan
-//! headers) are dropped. Stripping is *structured*: [`clean`] matches the
+//! headers) are dropped; the merged `{❯|▸} Say(n step{s}): ` pair header
+//! keeps its preview payload (label/spinner stripped — the body below
+//! skips that line). Stripping is *structured*: [`clean`] matches the
 //! exact span shapes the renderers declare as constants, and the scroll
 //! geometry runs on the cleaned line set ([`CleanModel`]), so dropped rows
 //! leave no blank band and the first visible row is never over-skipped.
@@ -24,6 +26,8 @@
 //! returns to the latest content, and Home jumps to the beginning.
 
 pub mod clean;
+#[cfg(test)]
+mod clean_say_tests;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -155,7 +159,7 @@ pub(crate) fn handle_key(
 // ── Clean-view layer ─────────────────────────────────────────────────────
 
 /// Render the transcript for copy mode: full width, no block/border, no
-/// scrollbar, no `[turn cost]` row, no border indicators — every visible row
+/// scrollbar, no `[call cost]` row, no border indicators — every visible row
 /// is already clean text so terminal-native selection spans it directly.
 /// Reuses the shared viewport cache; the width check naturally rebuilds it
 /// when toggling in/out of copy mode (full width vs inner).

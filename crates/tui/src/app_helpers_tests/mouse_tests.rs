@@ -1,7 +1,8 @@
 use super::mouse_helpers::{empty_hits, StubStore};
 use crate::app_helpers::*;
-use crate::render::SubagentBtn;
-use crossterm::event::KeyModifiers;
+use crate::queue_panel;
+use crate::render::{MouseHits, SubagentBtn};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use opencoder_session::SessionEvent;
 use ratatui::layout::Rect;
 
@@ -24,7 +25,7 @@ async fn submit_btn_returns_steer_submit() {
     let mut subagent_sys = 0u64;
     chat.steer_items = vec![(10, "redirect".into())];
     let mut queue_items: Vec<(i64, String)> = vec![];
-    let store = StubStore;
+    let store = StubStore::default();
     let mut queue_scroll: u32 = 0;
 
     let down = MouseEvent {
@@ -86,7 +87,7 @@ async fn jump_btn_click_works_after_recent_body_click() {
         attach_del_btns: Vec::new(),
         thinking_btns: Vec::new(),
         subagent_btns: Vec::new(),
-        tool_btns: Vec::new(),
+        tool_call_btns: Vec::new(),
         compaction_btns: Vec::new(),
         keymap_btns: Vec::new(),
         total_rows: 0,
@@ -98,7 +99,7 @@ async fn jump_btn_click_works_after_recent_body_click() {
     let mut subagent_sys = 0u64;
     let mut queue_items: Vec<(i64, String)> = vec![];
     let mut queue_scroll: u32 = 0;
-    let store = StubStore;
+    let store = StubStore::default();
 
     // First click: hits the body interior (row 5, well inside body).
     let body_click = MouseEvent {
@@ -167,12 +168,14 @@ async fn jump_btn_click_works_after_recent_body_click() {
 #[tokio::test]
 async fn thinking_header_toggles_even_right_after_another_click() {
     let mut chat = ChatView::default();
-    chat.apply(&SessionEvent::ReasoningDelta(
-        "secret reasoning here".into(),
-    ));
+    // Legacy/replay shape built directly (live reasoning goes into the
+    // ladder): the double-click-window fix is header-machinery-generic.
+    chat.blocks.push(crate::chat::ChatBlock::Thinking {
+        text: "secret reasoning here".into(),
+        collapsed: true,
+        sealed: true,
+    });
     chat.apply(&SessionEvent::TextDelta("answer".into()));
-    chat.apply(&SessionEvent::Done);
-    // Collapsed by default: the reasoning content must NOT be visible yet.
     assert!(
         !chat.flatten().iter().any(|l| l
             .spans
@@ -196,7 +199,7 @@ async fn thinking_header_toggles_even_right_after_another_click() {
             rect: header_rect,
         }],
         subagent_btns: Vec::new(),
-        tool_btns: Vec::new(),
+        tool_call_btns: Vec::new(),
         compaction_btns: Vec::new(),
         keymap_btns: Vec::new(),
         total_rows: 0,
@@ -207,7 +210,7 @@ async fn thinking_header_toggles_even_right_after_another_click() {
     let mut subagent_focus: Option<usize> = None;
     let mut subagent_sys = 0u64;
     let mut queue_items: Vec<(i64, String)> = Vec::new();
-    let store = StubStore;
+    let store = StubStore::default();
     let mut queue_scroll: u32 = 0;
 
     let outcome = handle_mouse(
@@ -270,7 +273,7 @@ async fn compaction_header_click_toggles_collapse() {
         attach_del_btns: Vec::new(),
         thinking_btns: Vec::new(),
         subagent_btns: Vec::new(),
-        tool_btns: Vec::new(),
+        tool_call_btns: Vec::new(),
         compaction_btns: vec![crate::render::CompactionBtn {
             block_idx: crate::chat::ChatView::compaction_headers(&chat)[0].block_idx,
             rect: header_rect,
@@ -284,7 +287,7 @@ async fn compaction_header_click_toggles_collapse() {
     let mut subagent_focus: Option<usize> = None;
     let mut subagent_sys = 0u64;
     let mut queue_items: Vec<(i64, String)> = Vec::new();
-    let store = StubStore;
+    let store = StubStore::default();
     let mut queue_scroll: u32 = 0;
 
     let outcome = handle_mouse(
@@ -317,133 +320,7 @@ async fn compaction_header_click_toggles_collapse() {
     );
 }
 
-/// Regression test for the idle-session `[→ view]` bug: when a subagent has
-/// finished, clicking its header (which maps to a `SubagentBtn`) must set
-/// `subagent_focus` so the child transcript becomes visible. Previously the
-/// `Event::Mouse` arm never set `dirty = true`, so the focused view never
-/// re-rendered and the click appeared to do nothing.
-#[tokio::test]
-async fn clicking_subagent_view_enters_subagent() {
-    // Build a ChatView with one completed Subagent block — the realistic
-    // idle-session scenario where the user clicks `[→ view]`.
-    let mut chat = ChatView::default();
-    chat.apply(&SessionEvent::SubagentStart {
-        id: "s1".into(),
-        kind: "explore".into(),
-        prompt: "test subagent".into(),
-        child_session_id: "c1".into(),
-    });
-    chat.apply(&SessionEvent::SubagentEnd {
-        id: "s1".into(),
-        ok: true,
-        cancelled: false,
-        summary: "done".into(),
-    });
-
-    // Body-only hit map with a single subagent header button at row 1.
-    let body = Rect::new(0, 0, 80, 12);
-    let mut hits = empty_hits(body);
-    hits.subagent_btns.push(SubagentBtn {
-        block_idx: 0,
-        rect: Rect::new(1, 1, 78, 1),
-    });
-
-    let mut scroll = 0u32;
-    let mut follow = true;
-    let mut subagent_focus: Option<usize> = None;
-    let mut subagent_sys = 0u64;
-    let mut queue_items: Vec<(i64, String)> = Vec::new();
-    let mut queue_scroll: u32 = 0;
-    let store = StubStore;
-
-    handle_mouse(
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 10,
-            row: 1,
-            modifiers: KeyModifiers::NONE,
-        },
-        &hits,
-        &mut scroll,
-        &mut follow,
-        &mut chat,
-        &mut subagent_focus,
-        &mut subagent_sys,
-        Path::new("."),
-        &mut queue_items,
-        "s",
-        &store,
-        &mut queue_scroll,
-        &mut vec![], // no pending images
-    )
-    .await;
-
-    assert_eq!(
-        subagent_focus,
-        Some(0),
-        "clicking a subagent header must enter the subagent view"
-    );
-}
-
-/// Clicking an attachment ✕ button removes exactly the clicked pending image
-/// (the first-click region, like queue buttons — no recent-body guard).
-#[tokio::test]
-async fn attach_del_click_removes_only_clicked_image() {
-    let mut chat = ChatView::default();
-    let body = Rect::new(0, 0, 80, 12);
-    let mut hits = empty_hits(body);
-    hits.attach_del_btns
-        .push(crate::attach_badge::AttachDelBtn {
-            index: 0,
-            rect: Rect::new(78, 0, 1, 1),
-        });
-    hits.attach_del_btns
-        .push(crate::attach_badge::AttachDelBtn {
-            index: 1,
-            rect: Rect::new(78, 1, 1, 1),
-        });
-    let mut pending_images: Vec<(String, String)> = vec![
-        ("data:image/png;base64,aa".to_string(), "a.png".to_string()),
-        ("data:image/png;base64,bb".to_string(), "b.png".to_string()),
-    ];
-
-    let mut scroll = 0u32;
-    let mut follow = true;
-    let mut subagent_focus: Option<usize> = None;
-    let mut subagent_sys = 0u64;
-    let mut queue_items: Vec<(i64, String)> = vec![];
-    let store = StubStore;
-    let mut queue_scroll: u32 = 0;
-
-    // Click the SECOND ✕ (row 1).
-    let down = MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 78,
-        row: 1,
-        modifiers: KeyModifiers::NONE,
-    };
-    let outcome = handle_mouse(
-        down,
-        &hits,
-        &mut scroll,
-        &mut follow,
-        &mut chat,
-        &mut subagent_focus,
-        &mut subagent_sys,
-        Path::new("."),
-        &mut queue_items,
-        "s",
-        &store,
-        &mut queue_scroll,
-        &mut pending_images,
-    )
-    .await;
-
-    assert_eq!(outcome, MouseOutcome::None);
-    assert_eq!(pending_images.len(), 1, "exactly one attachment removed");
-    assert_eq!(
-        pending_images[0].1, "a.png",
-        "the FIRST image must survive a click on the second ✕"
-    );
-    assert_eq!(chat.steer_items.len(), 0, "no steer side effects");
-}
+#[path = "mouse_tests/hierarchy_and_actions.rs"]
+mod hierarchy_and_actions;
+#[path = "mouse_tests/steer_actions.rs"]
+mod steer_actions;

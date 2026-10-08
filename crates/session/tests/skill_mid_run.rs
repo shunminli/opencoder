@@ -63,7 +63,7 @@ fn done_turn(text: &str) -> LlmEvent {
 
 /// Extract the system message content from a ChatRequest's messages.
 fn system_content(req: &opencoder_llm::ChatRequest) -> String {
-    req.messages
+    opencoder_llm::lower_messages(&req.messages)
         .iter()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
@@ -74,7 +74,7 @@ fn system_content(req: &opencoder_llm::ChatRequest) -> String {
 /// Extract the content of the LAST user-role message of a ChatRequest —
 /// where the transient `[active skill]` tail reminder is appended.
 fn last_user_content(req: &opencoder_llm::ChatRequest) -> String {
-    req.messages
+    opencoder_llm::lower_messages(&req.messages)
         .iter()
         .rev()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
@@ -86,12 +86,28 @@ fn last_user_content(req: &opencoder_llm::ChatRequest) -> String {
 /// Whether any user message of the request carries the `[active skill]`
 /// tail reminder.
 fn has_active_skill_reminder(req: &opencoder_llm::ChatRequest) -> bool {
-    req.messages.iter().any(|m| {
-        m.get("role").and_then(|r| r.as_str()) == Some("user")
-            && m.get("content")
-                .and_then(|c| c.as_str())
-                .is_some_and(|c| c.contains("[active skill]"))
-    })
+    opencoder_llm::lower_messages(&req.messages)
+        .iter()
+        .any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("[active skill]"))
+        })
+}
+
+/// The skill body ships as the one-shot `[skill loaded]` payload
+/// message naming `path` (the `[active skill]` tail pointer is
+/// fallback-only).
+fn has_loaded_skill_message(req: &opencoder_llm::ChatRequest, path: &str) -> bool {
+    opencoder_llm::lower_messages(&req.messages)
+        .iter()
+        .any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.starts_with("[skill loaded] ") && c.contains(path))
+        })
 }
 
 /// Skill body as the TUI `$` picker / `skill_resolve` actually store it:
@@ -122,8 +138,7 @@ async fn seed_session(store: &Arc<dyn Store>) {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();
@@ -227,11 +242,12 @@ async fn skill_set_mid_run_appears_in_next_turn_tail_reminder() {
     assert!(
         !has_active_skill_reminder(&requests[0]),
         "turn 1 payload must carry no [active skill] reminder: {:?}",
-        requests[0].messages
+        opencoder_llm::lower_messages(&requests[0].messages)
     );
 
     // Turn 2's system prompt still excludes the body; the skill arrives as
-    // the transient tail reminder — the LAST user message of the payload.
+    // the one-shot `[skill loaded]` payload message (the
+    // `[active skill]` tail pointer is fallback-only and stays silent).
     let second_system = system_content(&requests[1]);
     assert!(
         !second_system.contains("MID-RUN-SKILL"),
@@ -239,8 +255,12 @@ async fn skill_set_mid_run_appears_in_next_turn_tail_reminder() {
     );
     let tail = last_user_content(&requests[1]);
     assert!(
-        tail.contains("[active skill]") && tail.contains("/skills/mid-run/SKILL.md"),
-        "turn 2 tail reminder must name the mid-run skill's path: {tail}"
+        !tail.contains("[active skill]"),
+        "pointer suppressed while the loaded marker is present: {tail}"
+    );
+    assert!(
+        has_loaded_skill_message(&requests[1], "/skills/mid-run/SKILL.md"),
+        "turn 2 receives the mid-run skill via the [skill loaded] message"
     );
 }
 
@@ -253,7 +273,7 @@ async fn skill_set_mid_run_appears_in_next_turn_tail_reminder() {
 /// 2. Turn 2: done → idle → consume queue → continue
 /// 3. Turn 3: done → idle → no queue → Done
 #[tokio::test]
-async fn skill_set_mid_run_appears_in_queue_followup_turn() {
+async fn skill_set_mid_run_delivers_once_before_queue_followup() {
     let store = mem_store().await;
     let mock: Arc<MockChatClient> = Arc::new(
         MockChatClient::new()
@@ -293,8 +313,7 @@ async fn skill_set_mid_run_appears_in_queue_followup_turn() {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();
@@ -356,18 +375,29 @@ async fn skill_set_mid_run_appears_in_queue_followup_turn() {
         "turn 1 payload must carry no [active skill] reminder"
     );
 
-    // Turn 3 (queue follow-up): the skill arrives via the tail reminder —
-    // the LAST user message names the skill's source path; the system
-    // prompt stays skill-free.
-    let third_system = system_content(&requests[2]);
+    // The skill set mid-run arrives via the ONE-SHOT `[skill loaded]`
+    // payload message on the FIRST round that observes it (turn 2, the
+    // post-bash round) — and ONLY that round: the queue follow-up (turn 3)
+    // carries no skill body at all, the delivered marker being the model's
+    // pointer back to the source file. The system prompt stays skill-free
+    // and the tail pointer stays silent throughout.
+    let second_system = system_content(&requests[1]);
     assert!(
-        !third_system.contains("QUEUE-SKILL"),
-        "skill bodies never ship in the system prompt: {third_system}"
+        !second_system.contains("QUEUE-SKILL"),
+        "skill bodies never ship in the system prompt: {second_system}"
     );
-    let tail = last_user_content(&requests[2]);
+    let second_tail = last_user_content(&requests[1]);
     assert!(
-        tail.contains("[active skill]") && tail.contains("/skills/queue/SKILL.md"),
-        "turn 3 (queue follow-up) tail reminder must name the skill path: {tail}"
+        !second_tail.contains("[active skill]"),
+        "pointer suppressed while the loaded marker is present: {second_tail}"
+    );
+    assert!(
+        has_loaded_skill_message(&requests[1], "/skills/queue/SKILL.md"),
+        "turn 2 (first round observing the mid-run skill) delivers the body once"
+    );
+    assert!(
+        !has_loaded_skill_message(&requests[2], "/skills/queue/SKILL.md"),
+        "turn 3 (queue follow-up) carries NO skill body — one-shot delivery spent"
     );
 }
 
@@ -447,8 +477,7 @@ async fn skill_only_empty_prompt_starts_turn_with_skill_tail_reminder() {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();
@@ -479,8 +508,12 @@ async fn skill_only_empty_prompt_starts_turn_with_skill_tail_reminder() {
     );
     let tail = last_user_content(&requests[0]);
     assert!(
-        tail.contains("[active skill]") && tail.contains("/skills/do-the-thing/SKILL.md"),
-        "tail reminder (last user message) must name the skill path: {tail}"
+        !tail.contains("[active skill]"),
+        "pointer suppressed while the loaded marker is present: {tail}"
+    );
+    assert!(
+        has_loaded_skill_message(&requests[0], "/skills/do-the-thing/SKILL.md"),
+        "the skill-only submit delivers the body via the [skill loaded] message"
     );
 
     // A synthetic trigger user message must be recorded for skill-only submits
@@ -536,8 +569,7 @@ async fn skill_only_empty_prompt_records_user_trigger_message() {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();
@@ -617,8 +649,7 @@ async fn image_only_turn_with_skill_records_both_user_image_and_trigger() {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();

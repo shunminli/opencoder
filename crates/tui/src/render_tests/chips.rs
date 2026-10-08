@@ -1,22 +1,25 @@
 use super::*;
-use crate::chat::ChatView;
+use crate::chat::{ChatBlock, ChatView};
 use crate::theme::{agent_chip_fg, mode_flash_bg};
 use opencoder_session::SessionEvent;
 
-/// Issue #6: the `[agent]` status chip is Yellow in plan mode and Cyan
-/// for every other agent. Guards against a regression to the old uniform
-/// Magenta.
+/// Issue #6: the `[agent]` status chip is Yellow in plan (read-only) mode
+/// and Cyan for every other agent. Guards against a regression to the old
+/// uniform Magenta.
 #[test]
 fn agent_chip_color_is_yellow_for_plan_cyan_otherwise() {
     assert_eq!(agent_chip_fg("plan"), Color::Yellow);
     assert_eq!(agent_chip_fg("act"), Color::Cyan);
+    // The interlude `sandbox` spelling is gone; it must not map to the
+    // plan hue anymore.
+    assert_eq!(agent_chip_fg("sandbox"), Color::Cyan);
     assert_eq!(agent_chip_fg("explore"), Color::Cyan);
     assert_eq!(agent_chip_fg(""), Color::Cyan);
 }
 
-/// Issue #6: the plan/act mode-flash chip background is Yellow for plan,
-/// Cyan for act. Both the agent chip and the flash share the same theme
-/// mapping, so they never visually disagree.
+/// Issue #6: the plan/act mode-flash chip background is Yellow for
+/// plan, Cyan for act. Both the agent chip and the flash share the same
+/// theme mapping, so they never visually disagree.
 #[test]
 fn mode_flash_bg_matches_plan_yellow_act_cyan() {
     assert_eq!(mode_flash_bg(true), Color::Yellow);
@@ -27,18 +30,18 @@ fn mode_flash_bg_matches_plan_yellow_act_cyan() {
     assert_eq!(agent_chip_fg("act"), mode_flash_bg(false));
 }
 
-/// Issue #5 core invariant: while a preamble block is WITHHELD (multiple
-/// subagents running), the `header_line_idx` values reported by
+/// Core invariant: while MULTIPLE subagents run and the parent's preamble
+/// assistant text stays visible, the `header_line_idx` values reported by
 /// `thinking_headers()` and `subagent_headers()` must exactly match the
 /// line indices in `flatten_with()` where those headers actually render.
-/// If any of the `is_withheld` guards in those three functions drift out
-/// of sync, a header index would point at the wrong row and mouse clicks
-/// would land on the wrong block.
+/// The visible preamble is counted by every line-accounting path, so if
+/// any of them drifts, a header index would point at the wrong row and
+/// mouse clicks would land on the wrong block.
 #[test]
-fn header_line_indices_aligned_with_flatten_while_withheld() {
+fn header_line_indices_aligned_with_flatten_with_preamble_visible() {
     let mut v = ChatView::default();
-    // Preamble assistant text — withheld once 2 subagents run. Its "say:"
-    // header + 2 content lines mean a stale (non-skipping) accounting
+    // Preamble assistant text — visible even while 2 subagents run. Its
+    // "say:" header + 2 content lines mean an accounting that skipped it
     // would shift every later header by 3 rows.
     v.apply(&SessionEvent::TextDelta(
         "preamble line one\npreamble line two".into(),
@@ -56,15 +59,15 @@ fn header_line_indices_aligned_with_flatten_while_withheld() {
         child_session_id: "cb".into(),
     });
     // Thinking block after the subagents: its header_line_idx is the
-    // canary — if the withheld preamble were counted it would overshoot.
-    v.apply(&SessionEvent::ReasoningDelta(
-        "post\ndispatch\nanalysis".into(),
-    ));
+    // canary — if the preamble were skipped it would undershoot.
+    // Legacy shape built directly (live reasoning goes into the ladder):
+    // the header canary keeps guarding the preamble line accounting.
+    v.blocks.push(ChatBlock::Thinking {
+        text: "post\ndispatch\nanalysis".into(),
+        collapsed: true,
+        sealed: true,
+    });
 
-    assert!(
-        v.hidden_assistant_idx.is_some(),
-        "preamble must be withheld"
-    );
     assert_eq!(v.subagents_running, 2);
     let flat = v.flatten_with(0, 0);
 
@@ -101,15 +104,20 @@ fn header_line_indices_aligned_with_flatten_while_withheld() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), all_idx.len(), "collide: {:?}", all_idx);
-    // The withheld preamble contributes ZERO lines to flatten.
-    for (i, line) in flat.iter().enumerate() {
-        let txt: String = line.spans.iter().map(|s| s.content.clone()).collect();
-        assert!(
-            !txt.contains("preamble line"),
-            "line {i}: withheld preamble leaked: {:?}",
-            txt,
-        );
-    }
+    // The visible preamble contributes its "say:" header + content lines
+    // to flatten — every accounting function counts it.
+    let preamble_lines = flat
+        .iter()
+        .filter(|line| {
+            line.spans
+                .iter()
+                .any(|s| s.content.contains("preamble line"))
+        })
+        .count();
+    assert_eq!(
+        preamble_lines, 2,
+        "both preamble content lines must render while subagents run"
+    );
 }
 
 /// The autopilot status chip is tri-state: `AP` for fully-automatic mode,
@@ -150,11 +158,10 @@ fn ap_chip_reflects_autopilot_mode() {
             None, // mode_flash
             None, // skill_menu
             None, // task_picker
-            None, // command_menu
-            None, // file_menu
+            None,
+            None, // agent_menu
             None, // model_menu
             None, // mcp_menu
-            None, // envs_menu
             None, // cli_menu
             None, // skill_toggle_menu
             None, // ap_menu
@@ -174,6 +181,7 @@ fn ap_chip_reflects_autopilot_mode() {
             true,
             mode,
             "act",
+            false,
             None,
         )
         .unwrap();
@@ -256,13 +264,14 @@ fn ap_chip_reflects_autopilot_mode() {
     }
 }
 
-/// Mode-flash chip colouring contract: ONLY the definite mode-switch flash
-/// ("→ plan mode", emitted by handle_switch_agent / prep_plan_to_act /
-/// enter_plan_edit) participates in the plan/act two-colour scheme. Every
-/// other flash — the busy hint ("⏳ busy — mode switch blocked, retry when
-/// idle"), "→ act mode", and any future neutral text that merely CONTAINS
-/// "plan" — renders on the accent background. Guards against the old
-/// `text.contains("plan")` substring guess mis-tinting unrelated hints.
+/// Mode-flash chip colouring contract: ONLY the definite plan-family
+/// flashes — "→ plan mode" (agent switch via /plan) and "→ edit plan"
+/// (the plan-text editor, entered from the plan agent) — participate in
+/// the two-colour scheme. Every other flash — the busy hint ("⏳ busy — mode
+/// switch blocked, retry when idle"), "→ act mode", and any future neutral
+/// text that merely CONTAINS "plan" — renders on the accent background.
+/// Guards against the old `text.contains("plan")` substring guess
+/// mis-tinting unrelated hints.
 #[test]
 fn mode_flash_chip_two_colour_only_for_definite_switch() {
     use crate::render::render;
@@ -309,7 +318,6 @@ fn mode_flash_chip_two_colour_only_for_definite_switch() {
             None,
             None,
             None,
-            None,
             &mut hits,
             &mut None,
             false,
@@ -323,6 +331,7 @@ fn mode_flash_chip_two_colour_only_for_definite_switch() {
             true,
             ApMode::Off,
             "act",
+            false,
             None,
         )
         .unwrap();
@@ -366,6 +375,7 @@ fn mode_flash_chip_two_colour_only_for_definite_switch() {
 
     // Definite mode-switch flashes keep the two-colour scheme.
     check("\u{2192} plan mode", "plan mode", true);
+    check("\u{2192} edit plan", "edit plan", true);
     check("\u{2192} act mode", "act mode", false);
     // Busy hint: accent — it is not a completed switch.
     check(

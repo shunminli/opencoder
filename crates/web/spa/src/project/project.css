@@ -1,0 +1,91 @@
+/* project.css — 项目 module styles. Vite extracts every imported CSS into
+   the single dist/static/app.css output, so panel-local rules live here
+   instead of growing the shared src/app.css (sibling-agent merge safety).
+   The --oc-* custom properties consumed below are declared once in that same
+   src/app.css :root block (Vite bundles every imported CSS into
+   dist/static/app.css, so the vars are in scope here); theme.test.js scans
+   this file and fails the build if it references a var that is not declared
+   in app.css :root AND present in theme.js cssVars. */
+
+/* Markdown bodies rendered by src/project/markdown.jsx. */
+.md-body {
+  min-width: 0;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--oc-text);
+  word-break: break-word;
+}
+.md-body--empty {
+  color: rgba(0, 0, 0, 0.35);
+}
+.md-body h1, .md-body h2, .md-body h3, .md-body h4 {
+  margin: 0.6em 0 0.35em;
+  font-size: 1.05em;
+}
+.md-body h1 { font-size: 1.25em; }
+.md-body p { margin: 0.35em 0; }
+.md-body ul, .md-body ol { margin: 0.35em 0; padding-left: 1.5em; }
+.md-body code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.06);
+  font-family: var(--oc-mono);
+  font-size: 0.92em;
+}
+.md-body pre {
+  margin: 0.45em 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #f6f8fa;
+  overflow-x: auto;
+}
+.md-body pre code {
+  padding: 0;
+  background: none;
+}
+.md-body blockquote {
+  margin: 0.45em 0;
+  padding: 2px 12px;
+  border-left: 3px solid #d9d9d9;
+  color: rgba(0, 0, 0, 0.55);
+}
+.md-body table { border-collapse: collapse; margin: 0.45em 0; }
+.md-body th, .md-body td {
+  border: 1px solid #e5e7eb;
+  padding: 4px 10px;
+}
+.md-body a { color: var(--oc-primary); }
+.md-body img { max-width: 100%; }
+
+.project-table { width: 100%; min-width: 0; }
+.project-table .ant-table { width: 100%; }
+.project-table .ant-table-cell { overflow-wrap: anywhere; padding: 10px 8px; }
+.project-table .ant-table-column-title { min-width: 0; overflow-wrap: anywhere; }
+.project-table .ant-space, .project-table .ant-select { max-width: 100%; min-width: 0; }
+.project-table .ant-tag { max-width: 100%; white-space: normal; overflow-wrap: anywhere; margin-inline-end: 4px; }
+.project-table-text { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-name { display: flex; justify-content: flex-start; padding-inline: 0; max-width: 100%; min-width: 0; height: auto; text-align: start; }
+.project-name > span { min-width: 0; }
+.project-table-row { cursor: pointer; }
+.project-column-filter { width: 280px; max-width: calc(100vw - 32px); padding: 12px; }
+.project-column-filter .ant-input-number { width: 115px; }
+.project-progress { min-width: 0; width: 100%; max-width: 320px; }
+.project-progress .ant-progress { margin-bottom: 0; }
+.project-progress .ant-progress-text { font-size: 12px; }
+.project-board-columns { display: grid; grid-template-columns: repeat(4, minmax(210px, 1fr)); gap: 12px; overflow-x: auto; padding-bottom: 8px; }
+.project-board-lane { min-height: 220px; min-width: 0; border-radius: 8px; padding: 10px; background: var(--oc-bg-layout); border: 1px solid var(--oc-border); }
+.project-board-lane-over { border-color: var(--oc-primary); }
+.project-todo-card { margin-top: 10px; }
+.project-todo-card .ant-card-head-title { min-width: 0; }
+.project-todo-card .ant-card-head { padding-inline: 10px; }
+.project-todo-card .ant-card-body { padding: 10px; }
+.project-tag-manager { width: 100%; }
+@media (max-width: 800px) {
+  .project-table .ant-table-content { overflow-x: auto; }
+  .project-table table { min-width: 760px; }
+  .project-table .ant-table-cell { padding: 8px 4px; font-size: 12px; }
+  .project-table .ant-select-selection-item { font-size: 12px; }
+  .project-table .ant-btn { padding-inline: 3px; }
+  .project-table .ant-table-column-sorters { gap: 2px; }
+}

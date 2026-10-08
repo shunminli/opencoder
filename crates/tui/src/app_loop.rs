@@ -22,7 +22,7 @@ use ratatui::text::{Line, Span};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::app_helpers::{mode_switch_busy_flash, start_turn, sys_tokens_for, worker_dead};
+use crate::app_helpers::{start_turn, worker_dead};
 use crate::cache_salt_menu::CacheSaltMenu;
 use crate::chat::ChatView;
 use crate::command::{handle_command_key, CommandMenu, CommandOutcome};
@@ -30,7 +30,12 @@ use crate::keymap_menu::KeymapMenu;
 use crate::model_menu::ModelMenu;
 use crate::task::TaskPicker;
 use crate::theme;
-use crate::worker::{dedup_switch, try_send_idempotent, UiCmd, UiEvent};
+use crate::worker::{UiCmd, UiEvent};
+
+/// Animation tick rate for the running spinner (10 FPS).
+pub(crate) const ANIM_TICK_MS: u64 = 100;
+/// Body refresh cadence (3 FPS), decoupled from the fast spinner.
+pub(crate) const BODY_REFRESH_MS: u64 = 333;
 
 /// Translation of the `continue` / `break` control flow that lived inside the
 /// extracted loop blocks. `Proceed` means fall through to the rest of the loop
@@ -69,6 +74,14 @@ pub(crate) struct DisplayState<'a> {
 /// when one is focused. The top-level title grades its segments by importance
 /// (subtle workdir, muted separators, accent model, pink thinking level). The
 /// mode remains in the bottom status bar. Pure: reads state, returns the values; the caller assigns them.
+/// Whether the body currently shows the TOP-LEVEL main transcript — the only
+/// context where the empty-session tutorial may appear. A focused sidecar
+/// panel (or a subagent child view) is never top level: the sidecar's fresh
+/// empty nested view must show a bare panel, not the welcome tutorial.
+pub(crate) fn body_is_top_level(chat: &ChatView, subagent_focus: Option<usize>) -> bool {
+    subagent_focus.is_none() && !chat.sidecar_focus
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_display<'a>(
     chat: &'a ChatView,
@@ -85,8 +98,31 @@ pub(crate) fn compute_display<'a>(
     // When viewing a subagent's perspective, swap in its child ChatView,
     // back-title, and its own context stats (instead of the parent's).
     // The body title keeps the "Ctrl+L back" hint.
+    // The focused sidecar box takes precedence (sidecar focus and a subagent
+    // focus are mutually exclusive): body = the sidecar panel's nested view,
+    // mode chip reads `sidecar`, and the ctx meter reads the conversation's
+    // accumulated Turn tokens (the child's usage is forwarded bare, so the
+    // nested view itself never carries a context figure). The main task's
+    // `running` state is untouched — it is driven by the worker, not by
+    // sidecar turns.
     let (display_chat, display_title, display_ctx, display_sys, display_mode) =
-        if let Some(idx) = subagent_focus {
+        if let Some((view, question, total_tokens)) = crate::chat::sidecar::focused(chat) {
+            // A question-less block is the freshly entered empty panel: the
+            // title keeps only the nav element (the submitted question now
+            // echoes into the body, so no input hint is needed).
+            let title = if question.is_empty() {
+                "\u{2190} [Ctrl+L] back | \u{21f2}sidecar".to_string()
+            } else {
+                format!("\u{2190} [Ctrl+L] back | \u{21f2}sidecar {question}")
+            };
+            (
+                view,
+                Line::from(title),
+                total_tokens,
+                sys_tokens,
+                "sidecar".to_string(),
+            )
+        } else if let Some(idx) = subagent_focus {
             match chat.blocks.get(idx) {
                 Some(crate::chat::ChatBlock::Subagent {
                     view, kind, prompt, ..
@@ -108,11 +144,15 @@ pub(crate) fn compute_display<'a>(
                 ),
             }
         } else {
-            let title = super::app_display::compose_top_title(
-                workdir,
-                config.model_id(),
-                config.reasoning_effort.as_deref(),
-            );
+            let title = if chat.remote {
+                Line::from(format!("Server · {}", chat.agent))
+            } else {
+                super::app_display::compose_top_title(
+                    workdir,
+                    config.model_id(),
+                    config.reasoning_effort.as_deref(),
+                )
+            };
             (
                 chat,
                 title,
@@ -159,111 +199,24 @@ pub(crate) fn tick_clock(
     }
 }
 
-/// Outcome of [`handle_switch_agent`]: mirrors the `break` (quit) that lived
-/// inline in the loop body when the worker channel died.
-pub(crate) enum SwitchOutcome {
-    Proceed,
-    Quit,
-}
-
-/// Handle `KeyAction::SwitchAgent` (and `SwitchAgentNoClear`): switch agent
-/// mode behind a BIDIRECTIONAL running gate — the same contract as the
-/// slash paths' `worker::gate_switch`. Busy (a turn in flight OR a live
-/// subagent) blocks BOTH directions with an explicit busy hint: nothing is
-/// sent, agent/input/sys_tokens/running stay untouched, and the user
-/// re-presses at a clean idle boundary (no deferred auto-fire).
+/// Whether an input event should prompt an immediate frame render.
 ///
-/// When idle: a submitted plan→act hands off immediately (transcript fold +
-/// immediate execution, carrying any input text); `no_handoff`
-/// (SwitchAgentNoClear / t+Tab chord) skips that handoff entirely —
-/// transcript preserved in full. The optimistic `fold_agent_switch` keeps
-/// the status chip correct even if the AgentSwitch event is dropped under
-/// channel pressure and collapses a stale `plan_submitted` synchronously
-/// (rapid double-tap hygiene). Pure-switch send: try_send + same-name dedup.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_switch_agent(
-    name: String,
-    no_handoff: bool,
-    chat: &mut ChatView,
-    running: &mut bool,
-    follow: &mut bool,
-    input: &mut String,
-    cursor_idx: &mut usize,
-    mode_flash: &mut Option<(String, u32)>,
-    anim_tick: u32,
-    cmd_tx: &mpsc::Sender<UiCmd>,
-    cancel: &mut CancellationToken,
-    sys_tokens: &mut u64,
-    workdir: &Path,
-    active_skill_body: &Option<String>,
-    last_switch_sent: &mut Option<UiCmd>,
-) -> SwitchOutcome {
-    let plan_to_act = chat.agent == "plan" && name == "act";
-    if *running || chat.subagents_running > 0 {
-        // Busy (a turn in flight OR a live subagent): the worker is
-        // mid-run_session and any mode switch — either direction — would
-        // apply at an arbitrary partial boundary (and a plan→act handoff
-        // would start the next turn with a stale agent). Intercept with an
-        // explicit hint — the user re-presses at a clean idle boundary (no
-        // deferred auto-fire). sys_tokens / input / running are untouched
-        // (the mode is unchanged).
-        *mode_flash = Some(mode_switch_busy_flash(anim_tick));
-        return SwitchOutcome::Proceed;
-    }
-    *sys_tokens = sys_tokens_for(&name, workdir, active_skill_body.as_deref());
-    // Optimistically reflect the switch so the status chip is correct even if
-    // AgentSwitch is dropped under channel pressure. Covers non-turning switches
-    // (Alt+Tab) that emit no TurnDone to reconcile against. Folding the full
-    // switch (not just copying the name) also collapses a stale
-    // `plan_submitted` synchronously — the second tap of a rapid Shift+Tab
-    // act→plan→act double-tap then takes the pure-switch branch below instead
-    // of firing a bogus handoff off an `AgentSwitch("plan")` event that has
-    // not yet round-tripped back to the UI.
-    chat.fold_agent_switch(&name);
-    if !no_handoff && plan_to_act && chat.plan_submitted {
-        // Idle: handoff immediately, carrying any input text.
-        let extra = std::mem::take(input);
-        *cursor_idx = 0;
-        *mode_flash = Some((format!("\u{2192} {name} mode"), anim_tick));
-        if !start_turn(cmd_tx, cancel, UiCmd::SwitchAndStart(name, extra)).await {
-            worker_dead(chat);
-            return SwitchOutcome::Quit;
-        }
-        *running = true;
-        *follow = true;
-        chat.begin_turn(); // handoff starts a turn: the pure-switch dedup baseline no longer applies
-    } else {
-        *mode_flash = Some((format!("\u{2192} {name} mode"), anim_tick));
-        // Pure switch: idempotent — best-effort try_send (a full cmd channel
-        // must never block the UI loop) + drop consecutive same-name repeats.
-        let next = UiCmd::SwitchAgent(name);
-        if !dedup_switch(last_switch_sent.as_ref(), &next)
-            && try_send_idempotent(cmd_tx, next.clone())
-        {
-            *last_switch_sent = Some(next);
-        }
-    }
-    SwitchOutcome::Proceed
-}
-
-/// Shared plan→act handoff prep for the `/act` and `/act_clear_context` slash
-/// commands (and mirrors the Shift+Tab path in [`handle_switch_agent`]):
-/// drain the input box, refresh the context-meter baseline, set the mode-flash
-/// banner. Returns the captured input text to forward as `SwitchAndStart`'s
-/// extra payload.
-fn prep_plan_to_act(
-    input: &mut String,
-    cursor_idx: &mut usize,
-    sys_tokens: &mut u64,
-    mode_flash: &mut Option<(String, u32)>,
-    anim_tick: u32,
-    workdir: &Path,
-) -> String {
-    let extra = std::mem::take(input);
-    *cursor_idx = 0;
-    *sys_tokens = sys_tokens_for("act", workdir, None);
-    *mode_flash = Some(("\u{2192} act mode".into(), anim_tick));
-    extra
+/// The main loop renders only when `dirty && render_pending`; before this
+/// predicate was wired in, the only steady-state source of `render_pending`
+/// was the fps-configured `frame_ticker` (default 10 FPS = 100ms/帧), so key
+/// echo waited an average ~50ms (worst ~100ms) — visibly laggy for IME/CJK
+/// input where the user watches the screen to confirm each commit. Marking
+/// every Key/Paste/Mouse/Resize event as render-prompting decouples input
+/// echo latency from the fps setting (frames are ratatui diffs, so unchanged
+/// state renders an empty diff; idle CPU is unaffected).
+pub(crate) fn input_event_prompts_frame(ev: &crossterm::event::Event) -> bool {
+    matches!(
+        ev,
+        crossterm::event::Event::Key(_)
+            | crossterm::event::Event::Mouse(_)
+            | crossterm::event::Event::Paste(_)
+            | crossterm::event::Event::Resize(_, _)
+    )
 }
 
 /// Body of the `maybe_ev = evt_rx.recv()` select arm: drain all queued
@@ -281,6 +234,7 @@ pub(crate) async fn fold_ui_events(
     store: &Arc<dyn Store>,
     session_id: &str,
     queue_items: &mut Vec<(i64, String)>,
+    plan_skill_active: &mut bool,
     admit: &mut crate::queue_admitter::AdmitUiState,
     running: &mut bool,
     cancelled: &mut bool,
@@ -317,6 +271,16 @@ pub(crate) async fn fold_ui_events(
         *skip_next_render = false;
         let mut hidden_reasoning_append = false;
         match ev {
+            UiEvent::RemoteSnapshot {
+                chat: restored,
+                running: active,
+            } => {
+                *chat = *restored;
+                *running = active;
+                *cancelled = false;
+                *drain_pending = false;
+                queue_items.clear();
+            }
             UiEvent::Session(sev) => {
                 // Question dialogs ride on ToolStart/ToolEnd (no new event
                 // kind): open on `question` start, close on its end. Only
@@ -324,14 +288,30 @@ pub(crate) async fn fold_ui_events(
                 match &sev {
                     SessionEvent::ToolStart { id, name, input } if name == "question" => {
                         crate::question_menu::on_tool_start(question_menu, id, input);
+                        crate::hooks::emit(crate::hooks::Event::Question);
                     }
                     SessionEvent::ToolEnd { id, .. } => {
                         crate::question_menu::on_tool_end(question_menu, id, question_hub);
                     }
                     _ => {}
                 }
+                if chat.remote
+                    && matches!(
+                        sev,
+                        SessionEvent::LlmRoundStart { .. } | SessionEvent::TextDelta(_)
+                    )
+                {
+                    *running = true;
+                }
                 if let SessionEvent::TranscriptReset(msgs) = &sev {
-                    crate::session_ui::rebuild_after_reset(chat, msgs, store, session_id).await;
+                    if chat.remote {
+                        let label = chat.agent.clone();
+                        *chat = crate::session_ui::replay_messages(&label, msgs);
+                        chat.remote = true;
+                        chat.submitted = true;
+                    } else {
+                        crate::session_ui::rebuild_after_reset(chat, msgs, store, session_id).await;
+                    }
                 } else {
                     hidden_reasoning_append = matches!(sev, SessionEvent::ReasoningDelta(_))
                         && chat.last_open_thinking_collapsed();
@@ -346,24 +326,66 @@ pub(crate) async fn fold_ui_events(
                     // Prefer the text carried by the event (robust against a
                     // saturated UI channel dropping the mirror update); fall
                     // back to the local mirror for old events without text.
+                    // The event text is already model-facing: the compound
+                    // tail for `/plan <args>`, empty for a bare control
+                    // command (applied inline, never echoed). Normalize again
+                    // here so legacy persisted events carrying the raw
+                    // prefix stay correct too; the local mirror falls back
+                    // through the same normalization.
                     let display = if !text.is_empty() {
-                        text.clone()
+                        opencoder_session::consumed_echo_text(text)
                     } else {
                         queue_items
                             .iter()
                             .find(|(s, _)| s == seq)
-                            .map(|(_, d)| d.clone())
-                            .unwrap_or_default()
+                            .and_then(|(_, d)| opencoder_session::consumed_echo_text(d))
                     };
-                    if !display.is_empty() {
-                        chat.blocks.push(crate::chat::ChatBlock::User {
-                            rendered: crate::markdown::render(&display),
-                        });
-                        chat.push_marker(Line::from(""));
+                    if let Some(display) = display {
+                        if !display.is_empty() {
+                            chat.blocks.push(crate::chat::ChatBlock::User {
+                                rendered: crate::markdown::render(&display),
+                            });
+                            chat.push_marker(Line::from(""));
+                            // Remember the echo across a TranscriptReset
+                            // rebuild (a queued `/act_clear_context <tail>`
+                            // resets the view right after this event).
+                            chat.pending_turn_echo = Some(display.clone());
+                            // The queued prompt opens a NEW Turn: re-anchor
+                            // the ladder floor BELOW the echo (`begin_turn`
+                            // ran at the drain restart, before the echo
+                            // landed) so this turn's steps render as their
+                            // own `N Steps` group after the prompt — never
+                            // above it, never merged with the previous
+                            // turn's group.
+                            chat.reanchor_turn_after_user_echo();
+                        }
                     }
                     queue_items.retain(|(s, _)| s != seq);
+                    // A queued input actually took effect: re-derive the
+                    // task-plan highlight from the consumed text -- a
+                    // `$task-plan` token in it is newly activated by the
+                    // runner's record_compound and keeps the chip yellow; any
+                    // other consumed input reverts the chip to the plain hue.
+                    *plan_skill_active =
+                        crate::skill_persist::plan_highlight_from_consumed_text(text);
                 }
-                if matches!(sev, SessionEvent::Done | SessionEvent::Error(_)) {
+                if let SessionEvent::SteerConsumed { seq, text } = &sev {
+                    // Ledger for optimistic-admit reconciliation: if the drain
+                    // consumed a steer whose admit completion is still in
+                    // flight, the completion must drop (never resurrect) the
+                    // temp row.
+                    crate::queue_admitter::note_consumed(admit, *seq);
+                    // A steered input actually took effect: same re-derivation
+                    // as the queue path -- a `$task-plan` token lights the
+                    // chip, any other steered input reverts it.
+                    *plan_skill_active =
+                        crate::skill_persist::plan_highlight_from_consumed_text(text);
+                }
+                if chat.remote && matches!(sev, SessionEvent::Done | SessionEvent::Error(_)) {
+                    *running = false;
+                    *cancelled = false;
+                    *drain_pending = false;
+                } else if matches!(sev, SessionEvent::Done | SessionEvent::Error(_)) {
                     if *cancelled {
                         // Stale event from a cancelled turn — consume without
                         // affecting running or clearing items belonging to a
@@ -431,28 +453,6 @@ pub(crate) async fn fold_ui_events(
                 // The ordered forwarder reliably delivers AgentSwitch before
                 // TurnDone. Keep this authoritative assignment for compatibility
                 // with older producers and restored UI state.
-                //
-                // Consumption-time plan arm: a TurnDone(plan) means a turn
-                // actually RAN in the plan phase, so re-arm `plan_submitted`
-                // from the persisted plan-phase state — the authoritative
-                // record of delivered requirements (the counter increments
-                // when a real requirement is recorded for the plan agent;
-                // bare commands and skill-only submissions never increment
-                // it) plus the phase-bounded snapshot. This covers steers,
-                // queued inputs and compound `/plan <content>` (the counter
-                // persists at record time, before this TurnDone), and it can
-                // NEVER arm from a stranded, never-consumed admit. The
-                // session row's agent column is NOT consulted: ts-origin
-                // sessions keep it NULL by design, which used to disarm
-                // Shift+Tab here — the TurnDone(plan) event itself proves a
-                // plan turn just ran. A store failure keeps the current flag
-                // (fail-open).
-                if agent == "plan" {
-                    if let Ok(Some(meta)) = store.get_session(session_id).await {
-                        chat.plan_submitted =
-                            meta.plan_input_count > 0 || meta.plan_snapshot.is_some();
-                    }
-                }
                 chat.agent = crate::terminal_text::sanitize_single_line(&agent).into_owned();
                 // Safety net for older producers that could omit
                 // SessionEvent::Done during token bursts. Current TurnDone is
@@ -481,6 +481,7 @@ pub(crate) async fn fold_ui_events(
                     *cancelled = false;
                 } else {
                     *running = false;
+                    crate::hooks::emit(crate::hooks::Event::TurnDone);
                 }
             }
         }
@@ -503,6 +504,7 @@ pub(crate) async fn dispatch_command(
     cmd_tx: &mpsc::Sender<UiCmd>,
     cancel: &mut CancellationToken,
     chat: &mut ChatView,
+    sidecar_ask: &mpsc::Sender<crate::sidecar_ui::SidecarCmd>,
     running: &mut bool,
     follow: &mut bool,
     store: &Arc<dyn Store>,
@@ -510,7 +512,6 @@ pub(crate) async fn dispatch_command(
     task_picker: &mut Option<TaskPicker>,
     model_menu: &mut Option<ModelMenu>,
     mcp_menu: &mut Option<crate::mcp_menu::McpMenu>,
-    envs_menu: &mut Option<crate::envs_menu::EnvsMenu>,
     cli_menu: &mut Option<crate::cli_menu::CliMenu>,
     skill_toggle_menu: &mut Option<crate::skill_menu::SkillMenu>,
     ap_menu: &mut Option<crate::ap_menu::ApMenu>,
@@ -526,6 +527,8 @@ pub(crate) async fn dispatch_command(
     sys_tokens: &mut u64,
     plan_edit: &mut Option<crate::plan_edit::PlanEdit>,
     notepad: &mut Option<crate::notepad::NotepadView>,
+    clear_confirm: &mut Option<crate::clear_confirm::ClearConfirm>,
+    agent_menu: &mut Option<crate::agent_menu::AgentMenu>,
 ) -> LoopFlow {
     let (outcome, quit) = handle_command_key(command_menu, k);
     if quit {
@@ -539,6 +542,7 @@ pub(crate) async fn dispatch_command(
                 cmd_tx,
                 cancel,
                 chat,
+                sidecar_ask,
                 running,
                 follow,
                 store,
@@ -546,14 +550,11 @@ pub(crate) async fn dispatch_command(
                 task_picker,
                 model_menu,
                 mcp_menu,
-                envs_menu,
                 cli_menu,
                 skill_toggle_menu,
                 ap_menu,
                 cache_salt_menu,
                 agent_name,
-                input,
-                cursor_idx,
                 config,
                 workdir,
                 mode_flash,
@@ -561,6 +562,8 @@ pub(crate) async fn dispatch_command(
                 sys_tokens,
                 plan_edit,
                 notepad,
+                clear_confirm,
+                agent_menu,
             )
             .await;
         }
@@ -586,7 +589,7 @@ pub(crate) async fn handle_quit(
     chat: &mut ChatView,
     cmd_tx: &mpsc::Sender<UiCmd>,
 ) {
-    if running {
+    if running && !chat.remote {
         cancel.cancel();
         chat.push_marker(Line::from(Span::styled(
             "[exiting…]",
@@ -647,7 +650,7 @@ pub(crate) fn enter_plan_edit(
 ) {
     if let Some(text) = chat.last_plan_text() {
         *plan_edit = Some(crate::plan_edit::PlanEdit::new(text));
-        *mode_flash = Some(("\u{2192} plan mode".into(), anim_tick));
+        *mode_flash = Some(("\u{2192} edit plan".into(), anim_tick));
     }
 }
 
@@ -675,6 +678,10 @@ pub(crate) mod tests;
 #[path = "app_loop_bugfix_tests.rs"]
 mod bugfix_tests;
 
+#[cfg(test)]
+#[path = "app_loop_render_prompt_tests.rs"]
+mod render_prompt_tests;
+
 #[path = "app_loop_model.rs"]
 mod app_loop_model;
 
@@ -686,11 +693,6 @@ pub(crate) use app_loop_model::handle_model_outcome;
 mod app_loop_mcp;
 
 pub(crate) use app_loop_mcp::handle_mcp_outcome;
-
-#[path = "app_loop_envs.rs"]
-mod app_loop_envs;
-
-pub(crate) use app_loop_envs::handle_envs_outcome;
 
 #[path = "app_loop_cli.rs"]
 mod app_loop_cli;
@@ -717,8 +719,11 @@ pub(crate) use app_loop_paste::{handle_paste_event, paste_clipboard_image};
 #[path = "app_loop_actions.rs"]
 mod app_loop_actions;
 
+#[cfg(test)]
+pub(crate) use app_loop_actions::fire_clear_confirm;
 pub(crate) use app_loop_actions::{
-    cancel_running_turn, dispatch_slash_action, steer_submit_after_mouse,
+    cancel_running_turn, confirm_tick, dispatch_mode_switch, dispatch_slash_action,
+    handle_confirm_key, steer_submit_after_mouse, ModeSwitch,
 };
 
 /// Handle a keystroke while the keymap-rebinding modal is open. On `Save`,

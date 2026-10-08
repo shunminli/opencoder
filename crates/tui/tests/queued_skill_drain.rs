@@ -7,8 +7,10 @@
 //! `sessions.skill`. The still-running kickoff turn therefore carries no
 //! `[active skill]` reminder (and no latent-tool unlock); only after the
 //! drain consumes the item does `record_compound` resolve + activate +
-//! persist the skill, so the drained turn's request ends with the tail
-//! reminder and the recorded user message is token-stripped.
+//! persist the skill, so the drained turn ships the skill body as the
+//! transient `[skill loaded]` payload message (the transient `[active
+//! skill]` tail is fallback-only and stays silent while the body ships
+//! adjacent) and the recorded user message is token-stripped.
 use std::sync::Arc;
 
 use opencoder_core::{resolve_agent, Config};
@@ -72,15 +74,16 @@ fn text_done(text: &str) -> LlmEvent {
     }
 }
 
-fn message_contents(req: &opencoder_llm::ChatRequest) -> Vec<&str> {
-    req.messages
+fn message_contents(req: &opencoder_llm::ChatRequest) -> Vec<String> {
+    opencoder_llm::lower_messages(&req.messages)
         .iter()
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .map(str::to_owned)
         .collect()
 }
 
 fn system_content(req: &opencoder_llm::ChatRequest) -> String {
-    req.messages
+    opencoder_llm::lower_messages(&req.messages)
         .iter()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
@@ -182,29 +185,35 @@ async fn queued_skill_fires_at_consumption_not_during_kickoff() {
         system_content(&requests[0])
     );
 
-    // The drained turn resolves the skill at consumption: its request ends
-    // with the transient tail reminder naming the skill's source file.
+    // The drained turn resolves the skill at consumption: the body ships
+    // as the transient `[skill loaded]` payload message naming the source
+    // file, and the `[active skill]` tail stays silent while the body
+    // rides adjacent in the same payload.
     let drained = &requests[1];
     assert!(
         !system_content(drained).contains("haiku"),
         "drained system prompt stays skill-free"
     );
-    let last_user = drained
-        .messages
+    let wire_messages_196 = opencoder_llm::lower_messages(&drained.messages);
+    let last_user = wire_messages_196
         .iter()
         .rev()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
         .unwrap_or("");
     assert!(
-        last_user.contains("[active skill]") && last_user.contains("haiku/SKILL.md"),
-        "drained queued turn must end with the skill tail reminder: {last_user}"
+        last_user.contains("[skill loaded]") && last_user.contains("haiku/SKILL.md"),
+        "drained queued turn must carry the loaded skill body: {last_user}"
+    );
+    assert!(
+        !last_user.contains("[active skill]"),
+        "tail must stay silent while the body message is present: {last_user}"
     );
 
     // The recorded user message is the clean text; the token never reaches
     // the model even though the queue row kept it.
-    let user_msgs: Vec<&str> = drained
-        .messages
+    let wire_messages_213 = opencoder_llm::lower_messages(&drained.messages);
+    let user_msgs: Vec<&str> = wire_messages_213
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))

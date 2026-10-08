@@ -57,6 +57,48 @@ pub(crate) async fn persist_skill(
         .await;
 }
 
+/// The only skill name that lights the parent `[act]` status chip yellow.
+pub(crate) const PLAN_CHIP_SKILL: &str = "task-plan";
+
+/// Whether the parent `[act]` chip should render in the sandbox warning hue:
+/// exactly when the committed skill is `task-plan` (exact match).
+pub(crate) fn act_plan_highlight(active_skill: Option<&str>) -> bool {
+    active_skill == Some(PLAN_CHIP_SKILL)
+}
+
+/// Re-derive the task-plan chip highlight at a **consumption boundary** (the
+/// runner's queue/steer drain reporting `QueueConsumed` / `SteerConsumed`).
+/// The consumed input is a `$name`-bearing raw text: `record_compound`
+/// resolves and activates any token it names at the idle boundary, so a
+/// `$task-plan` token in the consumed text arms the highlight just like an
+/// idle submit would (any hit among multiple tokens lights it). Text without
+/// a `task-plan` token returns `false`, preserving the previous revert
+/// semantics: an interjection takes effect and the chip falls back to the
+/// plain hue. Run-end refresh re-derives from the committed body afterwards,
+/// so this never resurrects a cleared highlight.
+pub(crate) fn plan_highlight_from_consumed_text(text: &str) -> bool {
+    opencoder_core::extract_skill_tokens(text)
+        .1
+        .iter()
+        .any(|name| name == PLAN_CHIP_SKILL)
+}
+
+/// Startup skill state derived from the shared handle: persisted body,
+/// system-prompt token estimate, and whether the `[act]` chip starts in the
+/// task-plan highlight (a resumed `task-plan` commit keeps the yellow).
+pub(crate) fn initial_skill_state(
+    skill_handle: &Arc<Mutex<Option<String>>>,
+    agent_name: &str,
+    workdir: &Path,
+) -> (Option<String>, u64, bool) {
+    let body = skill_handle.lock().ok().and_then(|g| g.clone());
+    let sys_tokens = crate::app_helpers::sys_tokens_for(agent_name, workdir, body.as_deref());
+    let name = body
+        .as_deref()
+        .and_then(crate::skill_display::skill_name_from_body);
+    (body, sys_tokens, act_plan_highlight(name.as_deref()))
+}
+
 /// Resolve `$skill` tokens in `text` (activating the skill in-memory) **and**
 /// persist the result to the store when it changed. `run_app`'s **idle**
 /// Submit path relies on this: the turn starts immediately, so eager
@@ -468,5 +510,57 @@ mod tests {
         );
         let persisted = store.get_session("s").await.unwrap().unwrap();
         assert_eq!(persisted.skill.as_deref(), Some("the alpha body"));
+    }
+
+    // -- act_plan_highlight (pure, exact-match only) ----------------------
+
+    #[test]
+    fn act_plan_highlight_matches_task_plan_exactly() {
+        assert!(act_plan_highlight(Some("task-plan")));
+        assert!(!act_plan_highlight(Some("review")));
+        assert!(!act_plan_highlight(None));
+        // Near-miss names must not light the yellow (exact match only).
+        assert!(!act_plan_highlight(Some("task-plans")));
+    }
+
+    // -- plan_highlight_from_consumed_text (pure, token scan) --------------
+
+    #[test]
+    fn consumed_text_with_plan_token_arms_the_highlight() {
+        assert!(plan_highlight_from_consumed_text(
+            "$task-plan plan the work"
+        ));
+        // Any hit among multiple tokens arms it.
+        assert!(plan_highlight_from_consumed_text("$review then $task-plan"));
+        // Token mid-text, no other text at all.
+        assert!(plan_highlight_from_consumed_text("$task-plan"));
+    }
+
+    #[test]
+    fn consumed_text_without_plan_token_keeps_the_revert() {
+        assert!(!plan_highlight_from_consumed_text("plain follow-up"));
+        assert!(!plan_highlight_from_consumed_text("$review this diff"));
+        // Exact-match discipline at the token level too.
+        assert!(!plan_highlight_from_consumed_text("$task-plans go"));
+        // `$5`/trailing `$` are literal, not tokens.
+        assert!(!plan_highlight_from_consumed_text("price is $5 and $"));
+        assert!(!plan_highlight_from_consumed_text(""));
+    }
+
+    #[test]
+    fn initial_skill_state_derives_body_tokens_and_highlight() {
+        let plan_body = "> Source: /skills/task-plan/SKILL.md\n\nplan".to_string();
+        let skill_handle = Arc::new(std::sync::Mutex::new(Some(plan_body.clone())));
+        let (body, sys_tokens, plan_highlight) =
+            initial_skill_state(&skill_handle, "act", std::path::Path::new("/tmp"));
+        assert_eq!(body.as_deref(), Some(plan_body.as_str()));
+        assert!(sys_tokens > 0, "tokens estimated from the skill body");
+        assert!(plan_highlight, "resumed task-plan commit starts yellow");
+
+        // No persisted skill: no highlight.
+        let skill_handle: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let (_body, _sys_tokens, plan_highlight) =
+            initial_skill_state(&skill_handle, "act", std::path::Path::new("/tmp"));
+        assert!(!plan_highlight, "no committed skill means no highlight");
     }
 }

@@ -186,12 +186,14 @@ mod tests {
 
     fn ctx_for(dir: &tempfile::TempDir) -> ToolContext {
         ToolContext {
+            extra_env: Vec::new(),
             session_id: "test".into(),
             message_id: "test".into(),
             agent: "explore".into(),
             working_dir: dir.path().to_path_buf(),
             max_output: 4096,
             proxy: None,
+            tools_path: None,
         }
     }
 

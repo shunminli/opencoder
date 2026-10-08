@@ -1,0 +1,352 @@
+//! Legacy node-facing compat API: models/skills via maintenance, task
+//! create/continue with node pinning, dialogs ledger, cancel and task SSE.
+
+use opencoder_core::fleet::{ExecutionKind, ExecutionStatus};
+use reqwest::Method;
+use serde_json::json;
+
+use crate::support::Harness;
+
+#[tokio::test]
+async fn models_and_skills_delegate_to_node_maintenance() {
+    let h = Harness::new().await;
+    h.node
+        .set_maintenance("models", 200, json!({"models": [{"id": "glm-5.2"}]}));
+    h.node
+        .set_maintenance("skills", 200, json!({"skills": [{"name": "pdf"}]}));
+    let (status, body) = h.req(Method::GET, "/api/models", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["models"][0]["id"], json!("glm-5.2"));
+    let (status, body) = h.req(Method::GET, "/api/skills", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["skills"][0]["name"], json!("pdf"));
+    let (status, body) = h.req(Method::GET, "/api/models?node_id=ghost", None).await;
+    assert_eq!(status, 503, "{body}");
+}
+
+#[tokio::test]
+async fn task_create_pins_node_and_continue_reuses_session() {
+    let h = Harness::new().await;
+    // New task: submit routed at the path node → 200 receipt triple.
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-e2e/tasks",
+            Some(json!({"prompt": "do it", "agent": "act"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let task_id = body["task_id"].as_str().unwrap().to_string();
+    assert!(task_id.starts_with("operator-"), "{body}");
+    assert_eq!(body["node_id"], json!("node-e2e"));
+    assert_eq!(body["session_id"], json!(task_id));
+
+    // Continue: same session id → `prompt` command on the owning node.
+    h.node
+        .set_command(&task_id, "prompt", 202, json!({"queued": true}));
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-e2e/tasks",
+            Some(json!({"session_id": task_id, "prompt": "again"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["task_id"], json!(task_id));
+    assert_eq!(body["session_id"], json!(task_id));
+    assert_eq!(body["node_id"], json!("node-e2e"));
+    let seen = h.node.seen_commands();
+    assert!(
+        seen.iter().any(|(id, action, input)| id == &task_id
+            && action == "prompt"
+            && input["prompt"] == json!("again")),
+        "{seen:?}"
+    );
+
+    // Cross-node continue is refused.
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-other/tasks",
+            Some(json!({"session_id": task_id, "prompt": "x"})),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+}
+
+#[tokio::test]
+async fn dialogs_ledger_and_task_cancel() {
+    let h = Harness::new().await;
+    h.put_index(
+        "operator-dlg-1",
+        ExecutionKind::Operator,
+        ExecutionStatus::Idle,
+    )
+    .await;
+    h.node.set_command(
+        "operator-dlg-1",
+        "summary",
+        200,
+        json!({"id": "operator-dlg-1", "title": "ledger", "status": "idle", "last_created_at": 42}),
+    );
+    let (status, body) = h
+        .req(Method::GET, "/api/nodes/node-e2e/dialogs", None)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let dialogs = body["dialogs"].as_array().unwrap();
+    assert_eq!(dialogs[0]["session_id"], json!("operator-dlg-1"));
+    assert_eq!(dialogs[0]["title"], json!("ledger"));
+
+    h.node.set_command(
+        "operator-dlg-1",
+        "cancel",
+        200,
+        json!({"id": "operator-dlg-1", "status": "cancelled"}),
+    );
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-e2e/tasks/operator-dlg-1/cancel",
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], json!("cancelled"));
+    // Cancelling from the wrong node is a 409, not a silent redirect.
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-other/tasks/operator-dlg-1/cancel",
+            None,
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+}
+
+#[tokio::test]
+async fn task_events_stream_uses_the_shared_sse_handler() {
+    let h = Harness::new().await;
+    h.put_index(
+        "operator-tevt-1",
+        ExecutionKind::Operator,
+        ExecutionStatus::Done,
+    )
+    .await;
+    h.node.set_events(
+        "operator-tevt-1",
+        vec![json!({"seq": 1, "kind": "status", "data": {"phase": "done"}, "ts": 9})],
+        true,
+    );
+    let (status, text) = h.sse_text("/api/nodes/tasks/operator-tevt-1/events").await;
+    assert_eq!(status, 200);
+    assert!(
+        text.contains("id: 1") && text.contains("event: status"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn task_create_validates_caller_ids_and_node_pins() {
+    let h = Harness::new().await;
+    // Caller-supplied id is honored in the receipt triple.
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-e2e/tasks",
+            Some(json!({"id": "operator-task-named", "prompt": "hi"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["task_id"], json!("operator-task-named"));
+    assert_eq!(body["session_id"], json!("operator-task-named"));
+    assert_eq!(body["node_id"], json!("node-e2e"));
+
+    // Malformed caller ids never reach a node.
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-e2e/tasks",
+            Some(json!({"id": "bad id", "prompt": "x"})),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    // A path node that never connected has no eligible fleet member.
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-other/tasks",
+            Some(json!({"prompt": "hi"})),
+        )
+        .await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(
+        body["error"],
+        json!("no ready online node can accept this execution")
+    );
+
+    // Continuing an unknown conversation on this node is a 409, not a create.
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-e2e/tasks",
+            Some(json!({"session_id": "operator-ghost-9", "prompt": "x"})),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+
+    // A drained control plane refuses brand-new tasks.
+    let (status, _) = h.req(Method::POST, "/api/admin/drain", None).await;
+    assert_eq!(status, 200);
+    let (status, body) = h
+        .req(
+            Method::POST,
+            "/api/nodes/node-e2e/tasks",
+            Some(json!({"id": "operator-drained-1", "prompt": "x"})),
+        )
+        .await;
+    assert_eq!(status, 503, "{body}");
+}
+
+#[tokio::test]
+async fn dialogs_delete_clears_node_and_terminal_indexes() {
+    let h = Harness::new().await;
+    h.put_index(
+        "operator-dlg-1",
+        ExecutionKind::Operator,
+        ExecutionStatus::Idle,
+    )
+    .await;
+    h.put_index(
+        "operator-dlg-2",
+        ExecutionKind::Operator,
+        ExecutionStatus::Running,
+    )
+    .await;
+    h.put_index("agent-dlg-1", ExecutionKind::Agent, ExecutionStatus::Done)
+        .await;
+    h.node.set_maintenance(
+        "dialogs_clear",
+        200,
+        json!({"ok": true, "removed": 1, "skipped": [], "forgotten": 1}),
+    );
+    let (status, body) = h
+        .req(Method::DELETE, "/api/nodes/node-e2e/dialogs", None)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["removed"], json!(1));
+    assert_eq!(body["skipped"], json!(["operator-dlg-2"]));
+
+    // The idle index row is gone, the running one survives.
+    let rows = h
+        .state
+        .fleet
+        .indexes(Some("node-e2e"), Some(ExecutionKind::Operator), 500)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, vec!["operator-dlg-2"]);
+    let agent_rows = h
+        .state
+        .fleet
+        .indexes(Some("node-e2e"), Some(ExecutionKind::Agent), 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        agent_rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+        vec!["agent-dlg-1"]
+    );
+
+    // The Agent lane is cleared independently and never shares the
+    // Operator lane's index selection.
+    h.node.set_maintenance(
+        "dialogs_clear",
+        200,
+        json!({"ok": true, "removed": 1, "skipped": [], "forgotten": 1}),
+    );
+    let (status, body) = h
+        .req(
+            Method::DELETE,
+            "/api/nodes/node-e2e/dialogs?kind=agent",
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["removed"], json!(1));
+    assert!(h
+        .state
+        .fleet
+        .indexes(Some("node-e2e"), Some(ExecutionKind::Agent), 500)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn dialogs_delete_keeps_node_skipped_agent_reference() {
+    let h = Harness::new().await;
+    h.put_index("agent-race-1", ExecutionKind::Agent, ExecutionStatus::Idle)
+        .await;
+    h.node.set_maintenance(
+        "dialogs_clear",
+        200,
+        json!({"removed": 0, "skipped": ["agent-race-1"]}),
+    );
+    let (status, body) = h
+        .req(
+            Method::DELETE,
+            "/api/nodes/node-e2e/dialogs?kind=agent",
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["skipped"], json!(["agent-race-1"]));
+    assert!(h.state.fleet.index("agent-race-1").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn dialogs_delete_dry_run_is_read_only_and_lane_scoped() {
+    let h = Harness::new().await;
+    h.put_index(
+        "operator-preview-1",
+        ExecutionKind::Operator,
+        ExecutionStatus::Done,
+    )
+    .await;
+    h.put_index(
+        "agent-preview-1",
+        ExecutionKind::Agent,
+        ExecutionStatus::Done,
+    )
+    .await;
+    // If the control plane called the node, this reply would fail the test.
+    h.node
+        .set_maintenance("dialogs_clear", 500, json!({"error": "must not run"}));
+
+    let (status, body) = h
+        .req(
+            Method::DELETE,
+            "/api/nodes/node-e2e/dialogs?kind=operator&dry_run=true",
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["dry_run"], json!(true));
+    assert_eq!(body["kind"], json!("operator"));
+    assert_eq!(body["selected"], json!(["operator-preview-1"]));
+    assert_eq!(body["skipped"], json!([]));
+    assert!(h
+        .state
+        .fleet
+        .index("operator-preview-1")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(h
+        .state
+        .fleet
+        .index("agent-preview-1")
+        .await
+        .unwrap()
+        .is_some());
+}

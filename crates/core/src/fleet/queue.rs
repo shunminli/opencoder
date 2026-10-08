@@ -1,0 +1,151 @@
+use serde::{Deserialize, Serialize};
+
+pub const MAX_NODE_RUNS: usize = 65535;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueOrder {
+    #[default]
+    Fifo,
+    Lifo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeScheduling {
+    pub max_runs: usize,
+    #[serde(default)]
+    pub queue_order: QueueOrder,
+    /// Optional opencoder workspace for sessions this node runs. `None` keeps
+    /// the node's startup workdir; blank values normalize back to `None`.
+    #[serde(default)]
+    pub workdir: Option<String>,
+}
+
+impl NodeScheduling {
+    /// Collapse blank workdir input (e.g. a cleared UI field) to `None`.
+    pub fn normalized(mut self) -> Self {
+        if let Some(dir) = &self.workdir {
+            let trimmed = dir.trim();
+            self.workdir = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        }
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_NODE_RUNS).contains(&self.max_runs) {
+            return Err(format!("max_runs must be between 1 and {MAX_NODE_RUNS}"));
+        }
+        if let Some(dir) = &self.workdir {
+            if !absolute_workdir(dir) {
+                return Err(format!("workdir must be an absolute path: {dir}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+// Scheduling crosses OS boundaries: a Linux Server must accept Windows paths.
+fn absolute_workdir(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if path.starts_with('/') {
+        return true;
+    }
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+    {
+        return true;
+    }
+    let Some(unc) = path.strip_prefix(r"\\") else {
+        return false;
+    };
+    let mut parts = unc.split('\\');
+    matches!(parts.next(), Some(host) if !host.is_empty() && host != "." && host != "?")
+        && matches!(parts.next(), Some(share) if !share.is_empty())
+}
+
+/// Stable ordering independent of client IDs and wall-clock resolution.
+pub fn queue_cmp(order: QueueOrder, left: u64, right: u64) -> std::cmp::Ordering {
+    match order {
+        QueueOrder::Fifo => left.cmp(&right),
+        QueueOrder::Lifo => right.cmp(&left),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scheduling_accepts_remote_os_absolute_paths_and_refuses_relative_paths() {
+        for path in [
+            "/tmp/ws",
+            r"C:\OpenCoder\work",
+            "D:/中文 空格",
+            r"\\server\share\work",
+        ] {
+            assert!(absolute_workdir(path), "{path}");
+        }
+        for path in [
+            "",
+            "relative",
+            r"C:relative",
+            r"\relative",
+            r"\\server",
+            r"\\.\device",
+        ] {
+            assert!(!absolute_workdir(path), "{path}");
+        }
+    }
+    #[test]
+    fn queue_order_and_capacity_are_explicit() {
+        assert!(queue_cmp(QueueOrder::Fifo, 1, 2).is_lt());
+        assert!(queue_cmp(QueueOrder::Lifo, 1, 2).is_gt());
+        for max_runs in [0, MAX_NODE_RUNS + 1] {
+            assert!(NodeScheduling {
+                max_runs,
+                queue_order: QueueOrder::Fifo,
+                workdir: None,
+            }
+            .validate()
+            .is_err());
+        }
+        let settings: NodeScheduling = serde_json::from_str(r#"{"max_runs":3}"#).unwrap();
+        assert_eq!(settings.queue_order, QueueOrder::Fifo);
+        assert_eq!(settings.workdir, None);
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn workdir_is_optional_absolute_and_blank_clears() {
+        let settings: NodeScheduling =
+            serde_json::from_str(r#"{"max_runs":2,"queue_order":"fifo","workdir":"/tmp/ws"}"#)
+                .unwrap();
+        assert_eq!(settings.workdir.as_deref(), Some("/tmp/ws"));
+        settings.validate().unwrap();
+        // Relative paths are refused so sessions never resolve the workspace
+        // against the node process's own cwd.
+        let relative = NodeScheduling {
+            max_runs: 2,
+            queue_order: QueueOrder::Fifo,
+            workdir: Some("rel/dir".into()),
+        };
+        assert!(relative.validate().is_err());
+        let cleared = NodeScheduling {
+            max_runs: 2,
+            queue_order: QueueOrder::Fifo,
+            workdir: Some("  ".into()),
+        }
+        .normalized();
+        assert_eq!(cleared.workdir, None);
+        cleared.validate().unwrap();
+        let normalized = NodeScheduling {
+            max_runs: 2,
+            queue_order: QueueOrder::Fifo,
+            workdir: Some(" /tmp/ws ".into()),
+        }
+        .normalized();
+        assert_eq!(normalized.workdir.as_deref(), Some("/tmp/ws"));
+    }
+}

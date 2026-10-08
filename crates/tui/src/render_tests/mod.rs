@@ -1,13 +1,19 @@
 use super::*;
-use crate::chat::ChatView;
+use crate::chat::{ChatBlock, ChatView};
 use opencoder_session::SessionEvent;
 use ratatui::backend::TestBackend;
 
 pub(super) fn thinking_view() -> ChatView {
     let mut v = ChatView::default();
-    v.apply(&SessionEvent::ReasoningDelta("think-a-1\nthink-a-2".into()));
+    // Legacy/replay shape: live reasoning streams into the step ladder, so
+    // the top-level block is constructed directly to keep exercising its
+    // header/hit machinery.
+    v.blocks.push(ChatBlock::Thinking {
+        text: "think-a-1\nthink-a-2".into(),
+        collapsed: true,
+        sealed: true,
+    });
     v.apply(&SessionEvent::TextDelta("answer".into()));
-    v.apply(&SessionEvent::Done);
     v
 }
 

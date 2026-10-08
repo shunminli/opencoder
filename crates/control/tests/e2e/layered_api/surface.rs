@@ -1,0 +1,177 @@
+//! `GET /api/brain/runs/:id/layered` and `/layered/rounds/:round`: the view
+//! keys the workbench reads, and the rule that a layered route never serves
+//! another schema version.
+use super::*;
+
+#[tokio::test]
+async fn layered_view_and_rounds_read_the_node_projection() {
+    let h = Harness::with_brain_kind().await;
+    advertise_v4(&h);
+    create(&h).await;
+    let operation = json!({
+        "operation_id":format!("{RUN}#l1#scan#a1"), "run_id":RUN,
+        "layer":1, "node_id":"scan", "attempt":1,"round":1,"activation":1,
+        "capability_id":"builtin-agent-act", "execution_kind":"agent",
+        "execution_id":"agent-layered-scan", "status":"creating",
+        "source_sequence":null, "cancel_requested":false
+    });
+    let events: Vec<opencoder_core::brain::layered::LayeredEvent> = serde_json::from_value(json!([
+        {"seq":1,"run_id":RUN,"layer":0,"event_type":"run_created",
+         "evidence_execution_ids":[],"at_ms":1},
+        {"seq":2,"run_id":RUN,"layer":1,"event_type":"decision_started",
+         "evidence_execution_ids":[],"at_ms":2},
+        {"seq":3,"run_id":RUN,"layer":1,"event_type":"layer_started","activation":1,
+         "decision_summary":"dispatch_layer","reason_summary":"Scan before applying",
+         "evidence_execution_ids":[],"at_ms":3},
+        {"seq":4,"run_id":RUN,"layer":1,"event_type":"node_dispatched",
+         "node_id":"scan","attempt":1,"capability_id":"builtin-agent-act",
+         "execution_kind":"agent","execution_id":"agent-layered-scan",
+         "evidence_execution_ids":[],"at_ms":4}
+    ]))
+    .unwrap();
+    let mut projection = snapshot("waiting", 1, 3);
+    projection["run"]["last_event_seq"] = json!(4);
+    projection["operations"] = json!([operation]);
+    h.node.set_brain("snapshot", 200, projection);
+    h.node.set_brain("events", 200, json!({"events":events}));
+    let path = format!("/api/brain/runs/{RUN}/layered");
+    let (status, view) = h.req(Method::GET, &path, None).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["schema_version"], json!(7));
+    assert_eq!(view["run"]["run_id"], json!(RUN));
+    assert_eq!(view["run"]["phase"], json!("waiting"));
+    assert_eq!(view["run"]["layer"], json!(1));
+    assert_eq!(view["run"]["generation"], json!(3));
+    assert_eq!(view["run"]["total_layers"], json!(2));
+    assert_eq!(view["layers"], json!([["scan"], ["apply"]]));
+    assert_eq!(view["operations"], json!([operation]));
+    assert_eq!(view["events"], json!(events));
+    assert_eq!(view["plan"]["nodes"].as_array().unwrap().len(), 2);
+    let capabilities = view["capabilities"].as_array().unwrap();
+    assert_eq!(capabilities.len(), 2);
+    assert_eq!(capabilities[0]["capability_id"], json!("builtin-agent-act"));
+    assert!(capabilities.iter().all(|capability| {
+        capability["kind"].is_string()
+            && capability["target"].is_string()
+            && capability["version"].is_string()
+    }));
+
+    for (layer, node) in [(1, "scan"), (2, "apply")] {
+        let path = format!("/api/brain/runs/{RUN}/layered/rounds/{layer}");
+        let (status, detail) = h.req(Method::GET, &path, None).await;
+        assert_eq!(status, 200, "{detail}");
+        assert_eq!(detail["schema_version"], 7);
+        assert_eq!(detail["layer"], layer);
+        assert_eq!(detail["run_phase"], "waiting");
+        assert_eq!(detail["nodes"][0]["node_id"], node);
+        if layer == 1 {
+            assert_eq!(detail["visit"]["decision_summary"], "dispatch_layer");
+            assert_eq!(detail["visit"]["reason_summary"], "Scan before applying");
+            assert_eq!(
+                detail["nodes"][0]["operations"][0]["execution_id"],
+                "agent-layered-scan"
+            );
+        } else {
+            assert!(detail["visit"].is_null());
+            assert_eq!(detail["nodes"][0]["operations"], json!([]));
+        }
+    }
+    let (status, _) = h
+        .req(
+            Method::GET,
+            &format!("/api/brain/runs/{RUN}/layered/rounds/1?activation=99"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404);
+    // Layers are derived from the plan, so an out-of-range round is a miss.
+    for round in [0, 3] {
+        let path = format!("/api/brain/runs/{RUN}/layered/rounds/{round}");
+        let (status, body) = h.req(Method::GET, &path, None).await;
+        assert_eq!(status, 404, "{round}: {body}");
+    }
+    let reads = h
+        .node
+        .brain_calls()
+        .iter()
+        .filter(|call| call.action == "snapshot")
+        .count();
+    assert!(
+        reads >= 3,
+        "every layered read is a node projection read: {reads}"
+    );
+}
+
+#[tokio::test]
+async fn dispatched_layer_without_history_is_an_explicit_error() {
+    let h = Harness::with_brain_kind().await;
+    advertise_v4(&h);
+    create(&h).await;
+    h.node.set_brain("snapshot", 200, snapshot("waiting", 1, 3));
+    let path = format!("/api/brain/runs/{RUN}/layered/rounds/1");
+    let (status, body) = h.req(Method::GET, &path, None).await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(
+        body["error"],
+        json!("layer 1 dispatch decision is missing from the event journal")
+    );
+}
+
+#[tokio::test]
+async fn layered_events_and_snapshot_routes_delegate_for_v4_runs() {
+    let h = Harness::with_brain_kind().await;
+    advertise_v4(&h);
+    create(&h).await;
+    // The workbench run stream is the shared execution event SSE; the owning
+    // node pages the layered run's own log there, so the relay only has to
+    // forward the frames and close once the node reports `finished`.
+    h.node.set_events(
+        RUN,
+        vec![json!({"seq":1,"kind":"layered_phase",
+            "data":{"run_id":RUN,"layer":1,"phase":"deciding","at_ms":7},"ts":7})],
+        true,
+    );
+    h.node
+        .set_brain("snapshot", 200, snapshot("deciding", 1, 1));
+    let path = format!("/api/brain/runs/{RUN}/events?after=0");
+    let (status, text) = h.sse_text(&path).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+    assert!(text.contains("event: layered_phase"), "{text}");
+    assert!(text.contains("id: 1"), "{text}");
+    assert!(text.contains("deciding"), "{text}");
+    assert!(text.contains("stream_end"), "{text}");
+    // The paged detail route is the projected layered snapshot.
+    let path = format!("/api/brain/runs/{RUN}?offset=0");
+    let (status, body) = h.req(Method::GET, &path, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["schema_version"], json!(7));
+    assert_eq!(body["run"]["run_id"], json!(RUN));
+    assert_eq!(body["run"]["phase"], json!("deciding"));
+}
+
+#[tokio::test]
+async fn layered_routes_never_cross_serve_another_schema() {
+    let h = Harness::with_brain_kind().await;
+    advertise_v4(&h);
+    create(&h).await;
+    seed_v3_run(&h, "brain-scheduler-e2e").await;
+    // If a v3 or unknown run were served, this projection would answer it.
+    h.node.set_brain("snapshot", 200, snapshot("ready", 0, 1));
+    for path in [
+        "/api/brain/runs/brain-scheduler-e2e/layered".to_string(),
+        "/api/brain/runs/brain-scheduler-e2e/layered/rounds/1".to_string(),
+        "/api/brain/runs/brain-missing/layered".to_string(),
+        "/api/brain/runs/brain-missing/layered/rounds/1".to_string(),
+    ] {
+        let (status, body) = h.req(Method::GET, &path, None).await;
+        assert_eq!(status, 404, "{path}: {body}");
+    }
+    // The v3 presentation routes refuse a layered run instead of rendering it.
+    for path in [
+        format!("/api/brain/runs/{RUN}/view"),
+        format!("/api/brain/runs/{RUN}/rounds/1"),
+    ] {
+        let (status, body) = h.req(Method::GET, &path, None).await;
+        assert_eq!(status, 404, "{path}: {body}");
+    }
+}

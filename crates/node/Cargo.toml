@@ -6,15 +6,21 @@ license.workspace = true
 
 [dependencies]
 opencoder-core.workspace = true
+opencoder-dag.workspace = true
 opencoder-llm.workspace = true
 opencoder-session.workspace = true
 opencoder-store.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 reqwest = { workspace = true }
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
+futures.workspace = true
+ulid.workspace = true
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 [dev-dependencies]
 tempfile.workspace = true

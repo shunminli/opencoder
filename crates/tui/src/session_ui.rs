@@ -188,10 +188,63 @@ mod tests {
         m
     }
 
+    /// Echo contract: a synthetic skill trigger carrying the verbatim input
+    /// as `display` IS rendered (as the user's own words), while display-less
+    /// synthetic messages stay skipped.
+    #[test]
+    fn replay_renders_skill_trigger_display_and_skips_bare_synthetic() {
+        let mut trigger = make_user("u1", "The active skill is now in effect.", true);
+        trigger.display = Some("$review".to_string());
+        let msgs = vec![trigger, make_user("u2", "[compaction summary]", true)];
+        let chat = replay_messages("act", &msgs);
+        let joined: String = chat
+            .flatten()
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.clone())
+            .collect::<String>();
+        assert!(
+            joined.contains("$review"),
+            "verbatim token must render on replay: {joined}"
+        );
+        assert!(
+            !joined.contains("active skill is now in effect"),
+            "resolved trigger body must never surface: {joined}"
+        );
+        assert!(
+            !joined.contains("compaction summary"),
+            "display-less synthetic user message must stay skipped: {joined}"
+        );
+    }
+
+    /// A real user turn's `display` (verbatim input, token included) wins
+    /// over the recorded clean text on replay.
+    #[test]
+    fn replay_prefers_display_over_recorded_blocks_for_user_turns() {
+        let mut m = make_user("u1", " fix the bug", false);
+        m.display = Some("$review fix the bug".to_string());
+        let chat = replay_messages("act", &[m]);
+        let joined: String = chat
+            .flatten()
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.clone())
+            .collect::<String>();
+        assert!(joined.contains("$review fix the bug"), "display: {joined}");
+        assert!(
+            !joined.contains(
+                " fix the bug
+"
+            ) && joined.contains("$review fix the bug"),
+            "clean text alone must not render when display exists: {joined}"
+        );
+    }
+
     #[test]
     fn replay_skips_synthetic_user_messages() {
-        // Synthetic user messages (steer/queue promotion, plan->act handoff, compaction
-        // summary) must NOT appear as visible `user:` blocks on resume/replay.
+        // Synthetic user messages (steer/queue promotion, agent-switch
+        // handoff, compaction summary) must NOT appear as visible `user:`
+        // blocks on resume/replay.
         let msgs = vec![
             make_user("u1", "real prompt", false),
             make_user("u2", "[synthetic steer body]", true),
@@ -255,9 +308,9 @@ mod tests {
     }
 
     #[test]
-    fn replay_renders_plan_handoff_as_markdown() {
-        // Simulate the synthetic user message produced by plan_handoff::handoff:
-        // the plan markdown is stuffed into a Role::User message.
+    fn replay_renders_markdown_user_message() {
+        // A persisted user message carrying markdown renders with headings
+        // styled, not raw.
         let msg = Message::user("u1", "## Plan\n1. do X\n2. do Y");
         let chat = replay_messages("act", &[msg]);
         let lines = chat.flatten();
@@ -299,7 +352,7 @@ mod tests {
     fn replay_reconstructs_tool_blocks() {
         // Assistant message with a ToolUse, followed by a Role::Tool message
         // carrying the matching ToolResult. Replay must produce a
-        // ChatBlock::Tool with the correct id, header, and appended output.
+        // ChatBlock::StepGroup with the correct call id, header, and appended output.
         let mut asst = Message::assistant("a1");
         asst.blocks.push(ContentBlock::text("Running a command."));
         asst.blocks.push(ContentBlock::ToolUse {
@@ -316,23 +369,24 @@ mod tests {
             images: Vec::new(),
         }];
         let chat = replay_messages("act", &[asst, tool_msg]);
-        let tools: Vec<_> = chat
+        let groups: Vec<_> = chat
             .blocks
             .iter()
             .filter_map(|b| match b {
-                ChatBlock::Tool {
-                    id, header, output, ..
-                } => Some((id, header, output)),
+                ChatBlock::StepGroup { steps, .. } => Some(steps),
                 _ => None,
             })
             .collect();
-        assert_eq!(tools.len(), 1, "expected one tool block");
-        assert_eq!(tools[0].0, "t1");
-        let text: String = tools[0]
-            .1
+        assert_eq!(groups.len(), 1, "expected one step group");
+        let calls: Vec<_> = groups[0].iter().flat_map(|s| s.calls.iter()).collect();
+        assert_eq!(calls.len(), 1, "expected one call in the group");
+        let call = calls[0];
+        assert_eq!(call.id, "t1");
+        let text: String = call
+            .header
             .spans
             .iter()
-            .chain(tools[0].2.iter().flat_map(|l| l.spans.iter()))
+            .chain(call.output.iter().flat_map(|l| l.spans.iter()))
             .map(|s| s.content.clone())
             .collect();
         assert!(
@@ -354,9 +408,13 @@ mod tests {
         });
         let chat = replay_messages("act", &[asst]);
         assert!(
-            chat.blocks
-                .iter()
-                .any(|b| matches!(b, ChatBlock::Tool { id, .. } if id == "t9")),
+            chat.blocks.iter().any(|b| {
+                matches!(
+                    b,
+                    ChatBlock::StepGroup { steps, .. }
+                        if steps.iter().any(|s| s.calls.iter().any(|c| c.id == "t9"))
+                )
+            }),
             "tool-only assistant turn must not be skipped; got: {:?}",
             chat.blocks
         );
@@ -395,31 +453,36 @@ mod tests {
             },
         ];
         let chat = replay_messages("act", &[asst, tool_msg]);
-        let tools: Vec<_> = chat
+        let groups: Vec<_> = chat
             .blocks
             .iter()
             .filter_map(|b| match b {
-                ChatBlock::Tool { id, output, .. } => Some((id, output)),
+                ChatBlock::StepGroup { steps, .. } => Some(steps),
                 _ => None,
             })
             .collect();
-        assert_eq!(tools.len(), 2, "expected two tool blocks");
-        assert_eq!(tools[0].0, "p1");
-        assert_eq!(tools[1].0, "p2");
-        let out0: String = tools[0]
-            .1
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.content.clone())
-            .collect();
-        let out1: String = tools[1]
-            .1
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.content.clone())
-            .collect();
-        assert!(out0.contains("one"), "p1 output: {out0}");
-        assert!(out1.contains("two"), "p2 output: {out1}");
+        assert_eq!(groups.len(), 1, "the two calls form one group");
+        let tools: Vec<_> = groups[0].iter().flat_map(|s| s.calls.iter()).collect();
+        assert_eq!(tools.len(), 2, "expected two calls in the group");
+        assert_eq!(tools[0].id, "p1");
+        assert_eq!(tools[1].id, "p2");
+        let out = |c: &crate::chat::ToolCall| -> String {
+            c.output
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.content.clone())
+                .collect()
+        };
+        assert!(
+            out(tools[0]).contains("one"),
+            "p1 output: {}",
+            out(tools[0])
+        );
+        assert!(
+            out(tools[1]).contains("two"),
+            "p2 output: {}",
+            out(tools[1])
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -437,6 +500,8 @@ mod tests {
         use opencoder_core::{ContentBlock, Message, MessageUsage, Role};
         let uri = tiny_png_data_uri();
         let tool_msg = Message {
+            provider_state: None,
+            display: None,
             id: "m-tool".into(),
             role: Role::Tool,
             blocks: vec![ContentBlock::ToolResult {
@@ -468,6 +533,8 @@ mod tests {
     fn replay_tool_message_without_images_no_image_block() {
         use opencoder_core::{ContentBlock, Message, MessageUsage, Role};
         let tool_msg = Message {
+            provider_state: None,
+            display: None,
             id: "m-tool2".into(),
             role: Role::Tool,
             blocks: vec![ContentBlock::ToolResult {
@@ -507,3 +574,7 @@ mod replay_duration_tests;
 #[cfg(test)]
 #[path = "session_ui/terminal_safety_tests.rs"]
 mod terminal_safety_tests;
+
+#[cfg(test)]
+#[path = "session_ui/handoff_card_tests.rs"]
+mod handoff_card_tests;

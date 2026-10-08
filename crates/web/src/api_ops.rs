@@ -19,6 +19,14 @@ use crate::cmd::DrainCmd;
 use crate::handle::{send_cmd, start_drain_locked};
 use crate::AppState;
 
+pub(crate) async fn reject_codex_override(state: &AppState, id: &str) -> Option<Response> {
+    match state.store.harness_runtime(id).await {
+        Ok(Some(runtime)) if runtime.harness == opencoder_core::harness::Harness::Codex => Some(error_409("Codex owns its model, instructions and context; use a new session to change launch settings")),
+        Ok(_) => None,
+        Err(error) => Some(error_500(format!("harness state: {error:#}"))),
+    }
+}
+
 // ── fork ──────────────────────────────────────────────────────────────────
 
 /// POST /api/sessions/:id/fork — clone a session (meta + messages).
@@ -40,16 +48,23 @@ pub async fn fork_session(State(state): State<Arc<AppState>>, Path(id): Path<Str
 // ── compact ───────────────────────────────────────────────────────────────
 
 /// POST /api/sessions/:id/compact — queue a manual compaction command.
-pub async fn post_compact(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub async fn post_compact(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    runtime_config: Option<axum::Extension<Config>>,
+) -> Response {
     if let Some(resp) = crate::api::reject_node_session(&state, &id).await {
         return resp;
+    }
+    if let Some(response) = reject_codex_override(&state, &id).await {
+        return response;
     }
     match state.store.get_session(&id).await {
         Ok(Some(_)) => {}
         Ok(None) => return error_404(&format!("session not found: {id}")),
         Err(e) => return error_500(format!("get_session: {e:#}")),
     }
-    let config = match load_config(&state) {
+    let config = match load_config(&state, runtime_config) {
         Ok(c) => c,
         Err(r) => return *r,
     };
@@ -70,6 +85,7 @@ pub async fn post_compact(State(state): State<Arc<AppState>>, Path(id): Path<Str
         &id,
         client,
         state.workdir.clone(),
+        state.config_home.clone(),
         config,
         &handle,
     )
@@ -85,14 +101,19 @@ pub struct HandoffBody {
     pub extra: String,
 }
 
-/// POST /api/sessions/:id/handoff — execute a plan->act handoff.
+/// POST /api/sessions/:id/handoff — execution handoff: collapse the transcript
+/// to the newest assistant brief and switch to `act`.
 pub async fn post_handoff(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    runtime_config: Option<axum::Extension<Config>>,
     body: Option<Json<HandoffBody>>,
 ) -> Response {
     if let Some(resp) = crate::api::reject_node_session(&state, &id).await {
         return resp;
+    }
+    if let Some(response) = reject_codex_override(&state, &id).await {
+        return response;
     }
     match state.store.get_session(&id).await {
         Ok(Some(_)) => {}
@@ -105,7 +126,7 @@ pub async fn post_handoff(
     if handle.draining.load(Ordering::SeqCst) {
         return error_409("handoff refused while drain running");
     }
-    let config = match load_config(&state) {
+    let config = match load_config(&state, runtime_config) {
         Ok(c) => c,
         Err(r) => return *r,
     };
@@ -122,6 +143,7 @@ pub async fn post_handoff(
         &id,
         client,
         state.workdir.clone(),
+        state.config_home.clone(),
         config,
         &handle,
     )
@@ -151,7 +173,7 @@ pub(crate) fn apply_prompt_model(config: &mut Config, model: Option<String>) -> 
 
 /// GET /api/config — return the current on-disk config as JSON.
 pub async fn get_config(State(state): State<Arc<AppState>>) -> Response {
-    match Config::load(&state.workdir) {
+    match Config::load_with_home(&state.workdir, state.config_home.as_deref()) {
         Ok(cfg) => {
             let val = serde_json::to_value(&cfg).unwrap_or_else(|_| json!({}));
             // Never echo provider secrets back: mask every `api_key` before
@@ -249,8 +271,17 @@ pub async fn stop_bg(State(_state): State<Arc<AppState>>) -> Response {
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-fn load_config(state: &AppState) -> Result<Config, Box<Response>> {
-    Config::load(&state.workdir).map_err(|e| Box::new(error_500(format!("config: {e:#}"))))
+// Only the in-process execution adapter can install this extension. External
+// HTTP clients continue loading normal workspace configuration.
+pub(crate) fn load_config(
+    state: &AppState,
+    runtime_config: Option<axum::Extension<Config>>,
+) -> Result<Config, Box<Response>> {
+    runtime_config
+        .map(|axum::Extension(config)| config)
+        .map(Ok)
+        .unwrap_or_else(|| Config::load_with_home(&state.workdir, state.config_home.as_deref()))
+        .map_err(|e| Box::new(error_500(format!("config: {e:#}"))))
 }
 
 fn build_client(state: &AppState, config: &Config) -> Result<Arc<dyn ChatStream>, Box<Response>> {
@@ -261,13 +292,7 @@ fn build_client(state: &AppState, config: &Config) -> Result<Arc<dyn ChatStream>
         Ok(v) => v,
         Err(e) => return Err(Box::new(error_500(format!("api_key: {e:#}")))),
     };
-    match ChatClient::new_with_read_timeout(
-        &ep.base_url,
-        &ep.api_key,
-        &ep.headers,
-        config.stream_idle_timeout(),
-        config.network.proxy.as_deref(),
-    ) {
+    match ChatClient::from_config(config, &ep) {
         Ok(c) => Ok(Arc::new(c) as Arc<dyn ChatStream>),
         Err(e) => Err(Box::new(error_500(format!("client: {e:#}")))),
     }

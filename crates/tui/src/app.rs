@@ -1,11 +1,11 @@
 use anyhow::Result;
 use crossterm::event::Event;
 use opencoder_core::Config;
-use opencoder_llm::{estimate, ChatStream};
+use opencoder_llm::ChatStream;
 use opencoder_session::SessionState;
 use opencoder_store::Store;
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -13,16 +13,15 @@ use tokio_util::sync::CancellationToken;
 use crate::cache_salt_menu::{handle_cache_salt_key, CacheSaltMenu, CacheSaltOutcome};
 use crate::chat::ChatView;
 use crate::command::CommandMenu;
-use crate::input::spawn_input_pump;
 use crate::key_handler::{handle_key, KeyAction};
 use crate::menu::SkillMenu;
 use crate::model_menu::ModelMenu;
 use crate::queue_admitter;
 use crate::render::{MouseHits, Term};
-use crate::skill_persist::resolve_persist;
+use crate::skill_persist::{act_plan_highlight, initial_skill_state};
 use crate::task::{handle_task_key, TaskOutcome, TaskPicker};
 use crate::terminal::consume_modifier_or_release;
-use crate::worker::{process_cmd, UiCmd, UiEvent};
+use crate::worker::{UiCmd, UiEvent};
 use crate::TuiOpts;
 #[path = "app_bootstrap.rs"]
 mod app_bootstrap;
@@ -32,6 +31,8 @@ mod app_display;
 pub(crate) mod app_loop;
 #[path = "app_notepad.rs"]
 mod app_notepad;
+#[path = "app_submit.rs"]
+mod app_submit;
 #[path = "app_task.rs"]
 mod app_task;
 #[path = "steer_dispatch.rs"]
@@ -41,18 +42,13 @@ mod steer_fire;
 #[path = "subagent_input.rs"]
 mod subagent_input;
 
-/// Animation tick rate for the running spinner (10 FPS).
-const ANIM_TICK_MS: u64 = 100;
-/// Body (info area) refresh interval -- the cached ChatView snapshot is rebuilt
-/// at this cadence (3 FPS), decoupling text layout from the fast spinner.
-const BODY_REFRESH_MS: u64 = 333;
-
 pub async fn run(opts: &TuiOpts) -> Result<()> {
     app_bootstrap::run(opts).await
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_app(
+    opts: &TuiOpts,
     terminal: &mut Term,
     session: SessionState,
     store: Arc<dyn Store>,
@@ -64,21 +60,15 @@ pub(super) async fn run_app(
     mut config: Config,
     mut client: Arc<dyn ChatStream>,
 ) -> Result<String> {
-    // Cancellation token for double-Esc hard-abort (mid-stream/mid-tool).
-    // Reassigned by `rebind_session` on every `/task` session switch.
     let mut cancel = CancellationToken::new();
     let session = session.with_cancel(cancel.clone());
-    // Parent turn-level interrupt: TUI `>` steer fires this (not a hard `cancel`) so a
-    // pending steer is absorbed at the next boundary; the run loop continues, unlike
-    // double-Esc. Reassigned by `rebind_session` on every `/task` switch.
+    // These session handles are rebound together on task switches.
     let mut turn_cancel = session
         .turn_cancel
         .clone()
         .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(CancellationToken::new())));
     let mut child_runtime = crate::worker::ChildRuntimeHandles::from_session(&session);
     let mut skill_handle = session.skill_prompt.clone();
-    // Question hub: the TUI is the interactive question listener, attached
-    // before the worker spawns so the first turn may already ask the user.
     let mut question_hub = session.question_hub.clone();
     question_hub.attach();
     let mut question_menu = crate::question_menu::dialog_state();
@@ -98,82 +88,58 @@ pub(super) async fn run_app(
     let mut undo_state = crate::undo::init(&input, cursor_idx);
     let mut scroll: u32 = 0;
     let mut follow = true;
-    // Queue/steer panel scroll offset (0 = pinned to top (oldest)); snapshot/restored per-session.
     let mut queue_scroll: u32 = 0;
     let mut plan_edit: Option<crate::plan_edit::PlanEdit> = None;
     let mut notepad: Option<crate::notepad::NotepadView> = None;
     let mut bash_rx: Option<tokio::sync::oneshot::Receiver<String>> = None;
-    let initial_skill_body = skill_handle.lock().ok().and_then(|g| g.clone());
-    let mut sys_tokens: u64 = sys_tokens_for(
-        session.agent.name.as_str(),
-        &workdir,
-        initial_skill_body.as_deref(),
-    );
+    let (initial_skill_body, mut sys_tokens, mut plan_skill_active) =
+        initial_skill_state(&skill_handle, session.agent.name.as_str(), &workdir);
     // Cached system-prompt tokens for the subagent currently being viewed.
     // Computed once on entry (ctx-switch click) to avoid per-frame rebuild.
     let mut subagent_sys: u64 = 0;
     let mut queue_items =
         crate::queue_panel::restore_pending_mirrors(&store, &session_id, &mut chat.steer_items)
             .await;
-    // Off-loop queue admission: Tab / Enter-while-running submits go through a
-    // dedicated actor so this event loop never waits on the store-wide db_lock
-    // (held in bursts by the running turn's message/subagent flushers). The
-    // optimistic temp row appears instantly; reconciliation arrives on
-    // `admit_done_rx` (select branch below).
-    let (admit_tx, mut admit_done_rx) = queue_admitter::spawn_admitter(Arc::clone(&store));
+    // Queue and steer admission run outside the render loop.
+    let (admit_tx, mut admit_done_rx) =
+        queue_admitter::spawn_admitter(Arc::clone(&store), config.network.proxy.clone());
     let mut admit_st = queue_admitter::AdmitUiState::default();
+    let mut clear_confirm: Option<crate::clear_confirm::ClearConfirm> = None; // countdown guard
     let mut admitter_alive = true;
     let mut skill_menu: Option<SkillMenu> = None;
     let mut task_picker: Option<TaskPicker> = None;
     let mut command_menu: Option<CommandMenu> = None;
-    let mut file_menu: Option<crate::file_menu::FileMenu> = None;
+    let mut agent_menu: Option<crate::agent_menu::AgentMenu> = None;
     let mut model_menu: Option<ModelMenu> = None;
     let mut mcp_menu: Option<crate::mcp_menu::McpMenu> = None;
-    let mut envs_menu: Option<crate::envs_menu::EnvsMenu> = None;
     let mut cli_menu: Option<crate::cli_menu::CliMenu> = None;
     let mut skill_toggle_menu: Option<crate::skill_menu::SkillMenu> = None;
     let mut ap_menu: Option<crate::ap_menu::ApMenu> = None;
     let mut cache_salt_menu: Option<CacheSaltMenu> = None;
     let mut keymap_menu: Option<crate::keymap_menu::KeymapMenu> = None;
     let mut keymap = crate::keymap::KeyBindings::from_config(&config);
-    let mut active_skill: Option<String> = None;
-    let mut active_skill_body: Option<String> = None;
+    let (mut active_skill, mut active_skill_body) =
+        crate::skill_display::skill_mirror_from_body(initial_skill_body);
     let mut anim_tick: u32 = 0;
     let mut mode_flash: Option<(String, u32)> = None;
-    let mut last_switch_sent: Option<UiCmd> = None; // dedup baseline for pure-switch try_send
     let mut last_esc: Option<Instant> = None;
     let mut subagent_focus: Option<usize> = None;
     let mut shift_held = false;
     let mut copy_mode = false;
     let mut session_states: std::collections::HashMap<String, crate::session_ui::SessionUiState> =
         std::collections::HashMap::new();
-    let (mut cmd_tx, mut cmd_rx) = mpsc::channel::<UiCmd>(64);
+    let (mut cmd_tx, cmd_rx) = mpsc::channel::<UiCmd>(64);
     let (evt_tx, mut evt_rx) = mpsc::channel::<UiEvent>(crate::worker::UI_EVENT_CAPACITY);
 
-    let worker = tokio::spawn(async move {
-        let mut sess = session;
-        while let Some(cmd) = cmd_rx.recv().await {
-            if process_cmd(cmd, &mut sess, &evt_tx).await {
-                break;
-            }
-        }
-    });
+    let (mut sidecar_ask, worker) =
+        crate::app_helpers::start_worker(session, evt_tx, cmd_rx, store.clone());
 
-    // Input uses a dedicated OS thread. A liveness supervisor handles pty-close
-    // stalls by restoring the terminal and exiting cleanly.
-    let heartbeat = crate::supervisor::Heartbeat::new();
-    let supervisor_active = Arc::new(AtomicBool::new(true));
-    crate::supervisor::spawn(heartbeat.clone(), Arc::clone(&supervisor_active));
-    let (mut input_rx, _input_handle) = spawn_input_pump(heartbeat);
-    let mut anim_ticker = tokio::time::interval(Duration::from_millis(ANIM_TICK_MS));
-    // Frame-rate limiter: redraw cadence is decided by the `/config` fps
-    // (default 10 FPS). `Skip` prevents burst-fire catch-up after a stall.
+    let (mut input_rx, supervisor_active) = crate::app_helpers::start_input();
+    let mut anim_ticker = tokio::time::interval(Duration::from_millis(app_loop::ANIM_TICK_MS));
     let mut frame_ms = config.tui_frame_ms();
     let mut frame_ticker = tokio::time::interval(Duration::from_millis(frame_ms));
     frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Body cache refresh ticker: rebuilds the cached ChatView snapshot at 3 FPS.
-    // `Skip` prevents burst-fire catch-up after a stall.
-    let mut body_ticker = tokio::time::interval(Duration::from_millis(BODY_REFRESH_MS));
+    let mut body_ticker = tokio::time::interval(Duration::from_millis(app_loop::BODY_REFRESH_MS));
     body_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut quitting = false; // render "shutting down…" frame before worker-shutdown wait
     let mut skip_next_render = false;
@@ -185,7 +151,78 @@ pub(super) async fn run_app(
     let mut hits = MouseHits::default();
 
     let mut last_size: Option<(u16, u16)> = terminal.size().ok().map(|r| (r.width, r.height));
+    let mut pending_task_pick = None;
+    let mut selection: crate::remote::Selection = None;
     loop {
+        let (changed, pick) =
+            crate::remote::poll_ui(&mut agent_menu, &mut selection, &mut mode_flash, anim_tick);
+        if changed {
+            dirty = true;
+            render_pending = true;
+        }
+        if pick.is_some() {
+            pending_task_pick = pick;
+        }
+        if let Some(pick) = pending_task_pick.take() {
+            if chat.remote {
+                question_menu = None;
+            } else {
+                crate::question_menu::abandon_dialog(&mut question_menu, &question_hub);
+            }
+
+            let switched = app_task::switch_session(
+                pick,
+                opts,
+                &mut cmd_tx,
+                &mut evt_rx,
+                &workdir,
+                &config,
+                &client,
+                &store,
+                &mut model_label,
+                &mut session_states,
+                &mut running,
+                &mut chat,
+                &mut history,
+                &mut scroll,
+                &mut follow,
+                &mut queue_scroll,
+                &mut sys_tokens,
+                &mut queue_items,
+                &mut active_skill,
+                &mut active_skill_body,
+                &mut session_id,
+                &mut input,
+                &mut cursor_idx,
+                &mut hist_idx,
+                &mut cancel,
+                &mut turn_cancel,
+                &mut child_runtime,
+                &mut skill_handle,
+                &mut question_hub,
+                &mut sidecar_ask,
+            )
+            .await;
+            match switched {
+                Ok(()) => {
+                    mode_flash = None;
+                    pending_images.clear();
+                    subagent_focus = None;
+                    cancelled = false;
+                    drain_pending = false;
+                    clear_confirm = None;
+                    plan_edit = None;
+                    last_esc = None;
+                    task_elapsed_ms = 0;
+                    plan_skill_active = false;
+                    admit_st = Default::default();
+                    dirty = true;
+                    render_pending = true;
+                    body_refresh_pending = true;
+                }
+                Err(error) => mode_flash = Some((format!("{error:#}"), anim_tick)),
+            }
+        }
         app_loop::tick_clock(
             running,
             &mut prev_running,
@@ -248,10 +285,9 @@ pub(super) async fn run_app(
                     skill_menu.as_ref(),
                     task_picker.as_ref(),
                     command_menu.as_ref(),
-                    file_menu.as_ref(),
+                    agent_menu.as_ref(),
                     model_menu.as_ref(),
                     mcp_menu.as_ref(),
-                    envs_menu.as_ref(),
                     cli_menu.as_ref(),
                     skill_toggle_menu.as_ref(),
                     ap_menu.as_ref(),
@@ -266,9 +302,10 @@ pub(super) async fn run_app(
                     input_disabled,
                     tail_ms,
                     task_elapsed_ms,
-                    subagent_focus.is_none(),
+                    app_loop::body_is_top_level(&chat, subagent_focus),
                     config.autopilot.mode,
                     &display_mode,
+                    plan_skill_active,
                     notepad.as_ref(),
                 )?;
             }
@@ -291,9 +328,20 @@ pub(super) async fn run_app(
                         break;
                     }
                 };
+                // 输入即帧：Key/Paste/Mouse/Resize 立即置 render_pending，
+                // 按键回显不再等待 fps 帧周期的下一个 tick。
                 dirty = true;
+                if app_loop::input_event_prompts_frame(&ev) {
+                    render_pending = true;
+                }
                 match ev {
                     Event::Key(k) => {
+                        // Armed clear-context guard: Enter or a second Shift+Tab fires, Esc 回撤, rest inert.
+                        if clear_confirm.is_some() {
+                            if app_loop::handle_confirm_key(&mut clear_confirm, k, &mut input, &mut cursor_idx, &mut undo_state, &mut chat, &cmd_tx, &mut cancel, &mut running, &mut follow, &mut sys_tokens, &mut mode_flash, anim_tick, &workdir, &admit_tx, &mut admit_st, &mut queue_items, &mut pending_images, &session_id, &mut history, &mut hist_idx, &mut child_runtime, &mut cancelled).await { break; }
+                            dirty = true;
+                            continue;
+                        }
                         if consume_modifier_or_release(&k, &mut shift_held, copy_mode) {
                             dirty = true;
                             continue;
@@ -311,41 +359,7 @@ pub(super) async fn run_app(
                         if task_picker.is_some() {
                             match handle_task_key(&mut task_picker, k) {
                                 TaskOutcome::Pick(pick) => {
-                                    // Drop any pending question dialog: abandoning its hub
-                                    // entry unblocks the tool with the skip reply.
-                                    crate::question_menu::abandon_dialog(&mut question_menu, &question_hub);
-
-                                    app_task::switch_session(
-                                        pick,
-                                        &mut cmd_tx,
-                                        &mut evt_rx,
-                                        &workdir,
-                                        &config,
-                                        &client,
-                                        &store,
-                                        &mut model_label,
-                                        &mut session_states,
-                                        &mut running,
-                                        &mut chat,
-                                        &mut history,
-                                        &mut scroll,
-                                        &mut follow,
-                                        &mut queue_scroll,
-                                        &mut sys_tokens,
-                                        &mut queue_items,
-                                        &mut active_skill,
-                                        &mut active_skill_body,
-                                        &mut session_id,
-                                        &mut input,
-                                        &mut cursor_idx,
-                                        &mut hist_idx,
-                                        &mut cancel,
-                                        &mut turn_cancel,
-                                        &mut child_runtime,
-                                        &mut skill_handle,
-                                        &mut question_hub,
-                                    )
-                                    .await?;
+                                    selection = None; pending_task_pick = Some(pick);
                                 }
                                 TaskOutcome::Quit => { let _ = cmd_tx.send(UiCmd::Quit).await; break; }
                                 TaskOutcome::ClearAll { keep_session_id } => {
@@ -373,12 +387,6 @@ pub(super) async fn run_app(
                             let _ = app_loop::handle_mcp_outcome(
                                 &mut mcp_menu, k, &mut config, &cmd_tx, &mut chat, &workdir,
                             ).await;
-                            continue;
-                        }
-                        if envs_menu.is_some() {
-                            match app_loop::handle_envs_outcome(&mut envs_menu, k, &mut client, &mut config, &mut model_label, &mut compaction_threshold, &mut context_limit, &mut frame_ms, &mut frame_ticker, &cmd_tx, &mut chat, &workdir).await {
-                                app_loop::LoopFlow::Quit => break, app_loop::LoopFlow::Redraw => continue, _ => {}
-                            }
                             continue;
                         }
                         if cli_menu.is_some() {
@@ -420,14 +428,16 @@ pub(super) async fn run_app(
                         if command_menu.is_some() {
                             match app_loop::dispatch_command(
                                 &mut command_menu, k, &cmd_tx, &mut cancel, &mut chat,
-                                &mut running, &mut follow, &store,
-                                &session_id, &mut task_picker, &mut model_menu, &mut mcp_menu, &mut envs_menu, &mut cli_menu, &mut skill_toggle_menu, &mut ap_menu,
+                                &sidecar_ask, &mut running, &mut follow, &store,
+                                &session_id, &mut task_picker, &mut model_menu, &mut mcp_menu, &mut cli_menu, &mut skill_toggle_menu, &mut ap_menu,
                                 &mut cache_salt_menu, &mut keymap_menu, &agent_name,
                                 &mut input, &mut cursor_idx,
                                 &mut config, &workdir,
                                 &mut mode_flash, anim_tick, &mut sys_tokens,
                                 &mut plan_edit,
                                 &mut notepad,
+                                &mut clear_confirm,
+                                &mut agent_menu,
                             )
                             .await
                             {
@@ -448,6 +458,7 @@ pub(super) async fn run_app(
                             &mut input,
                             &mut cursor_idx,
                             &mut needs_clear,
+                            &sidecar_ask,
                         ) {
                             apply_force_redraw(
                                 needs_clear,
@@ -457,14 +468,14 @@ pub(super) async fn run_app(
                             );
                             continue;
                         }
-                        match handle_key(
+                        let action = handle_key(
                             k,
                             &keymap,
                             &mut input,
                             &mut cursor_idx,
                             &history,
                             &mut hist_idx,
-                            running,
+                            running, chat.subagents_running > 0,
                             &agent_name,
                             &mut scroll,
                             &mut follow,
@@ -478,98 +489,36 @@ pub(super) async fn run_app(
                                 .unwrap_or(78),
                             2,
                             subagent_focus.is_some(),
+                            chat.sidecar_focus,
                             input_disabled,
                             &mut undo_state,
                             &mut queue_scroll,
-                            &mut file_menu,
-                            &workdir,
-                        ) {
+                            &mut agent_menu,
+                        );
+                        if chat.remote && crate::remote::local_control(&action) {
+                            mode_flash = Some(("This control is available for /agent self tasks".into(), anim_tick));
+                            continue;
+                        }
+                        match action {
                             KeyAction::Submit(text) => {
-                                if running {
-                                    // Submit while running is reachable only via BackTab's
-                                    // compound `/plan …` (Enter/Tab map to Steer/Queue when
-                                    // running), so no bare slash command can land here.
-                                    // Deferred: the raw text (tokens included) queues verbatim;
-                                    // the runner's record_compound resolves/activates/
-                                    // persists the skill at the idle boundary — never now,
-                                    // or it would fire inside the running turn.
-                                    queue_admitter::handle_queue(
-                                        &text, &admit_tx, &mut admit_st, &mut queue_items,
-                                        &mut pending_images, &session_id,
-                                    );
-                                    push_history(&mut history, &mut hist_idx, &text);
-                                    continue;
-                                }
-                                // Idle submit: the turn starts now, so eager skill
-                                // activation (and persistence) is the correct timing.
-                                let (clean, _unresolved) = resolve_persist(
-                                    &text, &mut active_skill, &mut active_skill_body,
-                                    &mut sys_tokens, &agent_name, &workdir, &skill_handle, &mut chat,
-                                    &store, &session_id,
-                                ).await;
-                                let clean = clean.trim().to_string();
-                                let clean = crate::control_helpers::forward_skill_if_compound(&text, &clean);
-                                // NOTE: no compound `/plan` arm here — arming is
-                                // consumption-time (TurnDone(plan) reads the persisted
-                                // plan-phase counter).
-                                // Intercept /annotation: open the editor instead of submitting
-                                if let Some(action) = crate::command::parse(&clean) {
-                                    // Unified slash-command dispatch: route recognized `/cmd`
-                                    // through the same handler as the `/` popup picker.
-                                    let f = app_loop::dispatch_slash_action(
-                                        action, &cmd_tx, &mut cancel, &mut chat,
-                                        &mut running, &mut follow, &store,
-                                        &session_id, &mut task_picker, &mut model_menu, &mut mcp_menu, &mut envs_menu, &mut cli_menu, &mut skill_toggle_menu,
-                                        &mut ap_menu, &mut cache_salt_menu, &agent_name, &mut input, &mut cursor_idx,
-                                        &mut config, &workdir,
-                                        &mut mode_flash, anim_tick, &mut sys_tokens,
-                                        &mut plan_edit, &mut notepad,
-                                    )
-                                    .await;
-                                    match f {
-                                        app_loop::LoopFlow::Quit => break,
-                                        _ => push_history(&mut history, &mut hist_idx, &text),
-                                    }
-                                } else if clean.is_empty() {
-                                    if active_skill.is_some() {
-                                        if !text.is_empty() {
-                                            push_user(&mut chat, &mut history, &mut hist_idx, &text);
-                                        }
-                                        // Skill-only submit: send a trigger prompt naming the active skill so
-                                        // the model records a user turn and acts on the injected skill body.
-                                        let skill_name = active_skill.as_deref().unwrap_or("");
-                                        let trigger = skill_trigger(skill_name);
-                                        let image_uris = snapshot_image_uris(&pending_images);
-                                        if !start_turn(&cmd_tx, &mut cancel, UiCmd::Prompt(trigger, image_uris)).await
-                                        {
-                                            worker_dead(&mut chat);
-                                            break;
-                                        }
-                                        pending_images.clear();
-                                        task_elapsed_ms = 0;
-                                        running = true;
-                                        follow = true;
-                                        chat.note_requirement_submitted();
-                                        chat.begin_turn();
-                                        body_refresh_pending = true;
-                                    }
-                                } else {
-                                    push_user(&mut chat, &mut history, &mut hist_idx, &text);
-                                    chat.context_used += estimate(&clean) as u64;
-                                    let image_uris = snapshot_image_uris(&pending_images);
-                                    if !start_turn(&cmd_tx, &mut cancel, UiCmd::Prompt(clean, image_uris)).await
-                                    {
-                                        worker_dead(&mut chat);
-                                        break;
-                                    }
-                                    pending_images.clear();
-                                    task_elapsed_ms = 0;
-                                    cancelled = false;
-                                    running = true;
-                                    follow = true;
-                                    chat.note_requirement_submitted();
-                                    chat.begin_turn();
-                                    body_refresh_pending = true;
+                                if app_submit::handle_submit_action(
+                                    text, &mut running, &admit_tx, &mut admit_st,
+                                    &mut queue_items, &mut pending_images, &session_id,
+                                    &mut history, &mut hist_idx, &mut active_skill,
+                                    &mut active_skill_body, &mut sys_tokens, &agent_name,
+                                    &workdir, &skill_handle, &mut chat, &sidecar_ask, &store,
+                                    &mut plan_skill_active, &mut clear_confirm, &mut mode_flash,
+                                    anim_tick, &mut plan_edit, &mut notepad, &mut task_picker,
+                                    &mut model_menu, &mut mcp_menu,
+                                    &mut cli_menu, &mut skill_toggle_menu, &mut ap_menu,
+                                    &mut cache_salt_menu, &mut config, &cmd_tx, &mut cancel,
+                                    &mut task_elapsed_ms, &mut cancelled, &mut follow,
+                                    &mut body_refresh_pending, &mut agent_menu,
+                                )
+                                .await
+                                    == app_loop::LoopFlow::Quit
+                                {
+                                    break;
                                 }
                             }
                             KeyAction::SubagentSteer(text) => {
@@ -577,6 +526,13 @@ pub(super) async fn run_app(
                                 follow = true;
                             }
                             KeyAction::Steer(text) => {
+                                // Typed clear_context while running: arm the countdown
+                                // guard instead of admitting the steer — firing queues
+                                // it for the idle boundary; Esc 回撤 restores the draft.
+                                if crate::clear_confirm::maybe_arm(&mut clear_confirm, &mut chat, &mut mode_flash, anim_tick, &text, Some(text.clone())) {
+                                    dirty = true;
+                                    continue;
+                                }
                                 // Deferred steer: the raw text (tokens included) is admitted
                                 // verbatim; the runner absorbs it at the turn boundary via
                                 // record_compound, which resolves/activates/persists the
@@ -585,15 +541,13 @@ pub(super) async fn run_app(
                                 // reads the persisted plan-phase counter).
                                 let raw = text.trim().to_string();
                                 if !raw.is_empty() {
-                                    let seq = steer_fire::admit_keyboard_steer(
-                                        &store, &session_id, &raw, &raw,
-                                        &mut pending_images, &mut chat,
-                                    )
-                                    .await;
-                                    // Store failure must not vanish silently; ↑ history still holds the text.
-                                    if let Some(flash) = steer_fire::flash_on_admit_failure(seq) {
-                                        mode_flash = Some((flash.to_string(), anim_tick));
-                                    }
+                                    // Off-loop actor owns the store write; a failed
+                                    // hand-off flashes (↑ recovers). `>` = interrupt.
+                                    steer_submit_flash(
+                                        &admit_tx, &mut admit_st, &mut chat.steer_items,
+                                        &mut pending_images, &session_id, &raw, anim_tick,
+                                        &mut mode_flash,
+                                    );
                                 }
                                 push_history(&mut history, &mut hist_idx, &text);
                                 // Enter admits without interrupting (`>` interrupts instead).
@@ -603,49 +557,84 @@ pub(super) async fn run_app(
                                 // Tab-queue: raw-text deferred admission — skill resolution
                                 // happens at consumption (idle boundary, record_compound).
                                 // The off-loop actor owns the store write; this loop never
-                                // waits on db_lock.
-                                queue_admitter::handle_queue(
+                                // waits on db_lock; a failed hand-off flashes (text via ↑).
+                                queue_submit_flash(
                                     &text, &admit_tx, &mut admit_st, &mut queue_items,
-                                    &mut pending_images, &session_id,
+                                    &mut pending_images, &session_id, anim_tick, &mut mode_flash,
                                 );
                                 push_history(&mut history, &mut hist_idx, &text);
                                 follow = true;
                             }
                             KeyAction::QueueUnsupported => {
-                                // Tab-queue rejected: a running subagent is
-                                // focused — transient hint only, the parent
-                                // session stays untouched (string lives in
-                                // app_helpers::queue_unsupported_flash).
                                 mode_flash = Some(queue_unsupported_flash(anim_tick));
                             }
                             KeyAction::ModeSwitchBlocked => {
                                 mode_flash = Some(mode_switch_busy_flash(anim_tick));
                             }
-                            KeyAction::SwitchAgent(name) => {
-                                if matches!(
-                                    app_loop::handle_switch_agent(
-                                        name, false, &mut chat, &mut running, &mut follow, &mut input,
-                                        &mut cursor_idx, &mut mode_flash, anim_tick, &cmd_tx,
-                                        &mut cancel, &mut sys_tokens, &workdir, &active_skill_body, &mut last_switch_sent,
-                                    )
-                                    .await,
-                                    app_loop::SwitchOutcome::Quit
-                                ) { break; }
+                            KeyAction::OpenTask => {
+                                selection = None;
+                                let sessions = store.list_sessions(&opencoder_store::SessionFilter::default()).await.unwrap_or_default();
+                                task_picker = Some(TaskPicker::new(sessions,session_id.clone()));
                             }
-                            KeyAction::SwitchAgentNoClear(name) => {
-                                // t+Tab chord: skip the plan->act handoff / TranscriptReset —
-                                // transcript preserved in full. Same bidirectional running gate
-                                // as Shift+Tab: while busy the switch is intercepted with the
-                                // busy hint (re-press when idle), never deferred.
-                                if matches!(
-                                    app_loop::handle_switch_agent(
-                                        name, true, &mut chat, &mut running, &mut follow, &mut input,
-                                        &mut cursor_idx, &mut mode_flash, anim_tick, &cmd_tx,
-                                        &mut cancel, &mut sys_tokens, &workdir, &active_skill_body, &mut last_switch_sent,
-                                    )
-                                    .await,
-                                    app_loop::SwitchOutcome::Quit
-                                ) { break; }
+                            KeyAction::SelectAgent(name) => {
+                                match name.as_str() {
+                                    "" => { selection = None; agent_menu = Some(crate::agent_menu::AgentMenu::configured(config.clone())); }
+                                    "self" => { selection = None; pending_task_pick = Some(crate::task::TaskPick::New); }
+                                    _ => { selection = Some(crate::remote::request(config.clone(),name)); mode_flash = Some(("Connecting to Server…".into(),anim_tick)); }
+                                }
+                            }
+                            KeyAction::SidecarAsk(question) => {
+                                if question.is_empty() {
+                                    crate::sidecar_ui::enter_panel(&mut chat, &sidecar_ask);
+                                    follow = true;
+                                } else if !chat.sidecar_focus {
+                                    crate::sidecar_ui::enter_panel(&mut chat, &sidecar_ask);
+                                    match sidecar_ask
+                                        .try_send(crate::sidecar_ui::SidecarCmd::Ask(question.clone()))
+                                    {
+                                        Ok(()) => {
+                                            // Instant echo: the actor needs a beat to
+                                            // build its conv before SidecarStart; the
+                                            // Busy path must NOT echo.
+                                            crate::sidecar_ui::echo_question(&mut chat, &question);
+                                            follow = true;
+                                        }
+                                        Err(_) => {
+                                            mode_flash = Some((
+                                                crate::sidecar_ui::SIDECAR_BUSY_FLASH.to_string(),
+                                                anim_tick,
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    // Follow-up inside the focused panel: the SAME
+                                    // conversation continues (no reset — Q/A
+                                    // continuity). Fire-and-forget into the actor:
+                                    // never blocks the UI loop, never touches
+                                    // steer/queue.
+                                    match sidecar_ask
+                                        .try_send(crate::sidecar_ui::SidecarCmd::Ask(question.clone()))
+                                    {
+                                        Ok(()) => {
+                                            crate::sidecar_ui::echo_question(&mut chat, &question);
+                                            chat.sidecar_focus = true;
+                                            follow = true;
+                                        }
+                                        Err(_) => {
+                                            mode_flash = Some((
+                                                crate::sidecar_ui::SIDECAR_BUSY_FLASH.to_string(),
+                                                anim_tick,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            KeyAction::SwitchAgent(name) => {
+                                let mode = app_loop::ModeSwitch::for_agent(&name);
+                                if app_loop::dispatch_mode_switch(
+                                    mode, &cmd_tx, &mut cancel, &mut running, &mut follow, &mut chat,
+                                    &mut sys_tokens, &mut mode_flash, anim_tick, &workdir,
+                                ).await == app_loop::LoopFlow::Quit { break; }
                             }
                             KeyAction::SetSkill(opt) => {
                                 crate::skill_persist::apply_skill_selection(
@@ -654,6 +643,11 @@ pub(super) async fn run_app(
                                     &skill_handle, &store, &session_id,
                                 )
                                 .await;
+                                plan_skill_active = act_plan_highlight(active_skill.as_deref());
+                            }
+                            KeyAction::ArmClearConfirm { rest, draft } => {
+                                crate::clear_confirm::engage(&mut clear_confirm, &mut chat, &mut mode_flash, anim_tick, rest, draft);
+                                dirty = true;
                             }
                             KeyAction::Cancel => {
                                 app_loop::cancel_running_turn(
@@ -710,18 +704,9 @@ pub(super) async fn run_app(
                     }
                     Event::Resize(_, _) => on_resize_event(terminal, &mut last_size)?,
                     Event::Paste(pasted) => {
-                        // Modal-priority paste routing (mirrors Event::Key);
-                        // empty pastes try a silent clipboard-image read.
-                        // (clippy's collapsible_match suggestion would put an
-                        // `.await` in a match guard, which Rust forbids.)
+                        // Modal-priority paste routing (mirrors Event::Key); empty pastes try a silent clipboard-image read. (clippy's collapsible_match suggestion would put an `.await` in a match guard, which Rust forbids.)
                         #[allow(clippy::collapsible_match)]
-                        if app_loop::handle_paste_event(
-                            &pasted, task_picker.is_some(), cache_salt_menu.is_some(), keymap_menu.is_some(),
-                            skill_toggle_menu.is_some(),
-                            &mut model_menu, &mut mcp_menu, &mut envs_menu, &mut cli_menu, &mut command_menu, &mut question_menu,
-                            &mut input, &mut cursor_idx, &mut pending_images, &mut img_asm,
-                            &mut chat, &workdir,
-                        ).await { continue; }
+                        if app_loop::handle_paste_event(&pasted, &mut plan_edit, &mut notepad, task_picker.is_some(), cache_salt_menu.is_some(), keymap_menu.is_some(), skill_toggle_menu.is_some(), &mut model_menu, &mut mcp_menu, &mut cli_menu, &mut command_menu, &mut question_menu, &mut input, &mut cursor_idx, &mut pending_images, &mut img_asm, &mut chat, &workdir).await { continue; }
                     }
                     _ => {}
                 }
@@ -729,7 +714,7 @@ pub(super) async fn run_app(
             maybe_done = admit_done_rx.recv(), if admitter_alive => {
                 match maybe_done {
                     Some(done) => {
-                        let o = crate::idle_rekick::on_admit_done(done, &mut admit_st, &mut queue_items, &mut pending_images, running, &store, &session_id, &cmd_tx, &mut cancel).await;
+                        let o = crate::idle_rekick::on_admit_done(done, &mut admit_st, &mut queue_items, &mut chat.steer_items, &mut pending_images, running, &store, &session_id, &cmd_tx, &mut cancel).await;
                         if let Some(flash) = o.flash { mode_flash = Some((flash.to_string(), anim_tick)); }
                         match o.flow {
                             crate::idle_rekick::AdmitDoneFlow::Started => { running = true; follow = true; cancelled = false; chat.begin_turn(); }
@@ -745,7 +730,8 @@ pub(super) async fn run_app(
             }
             maybe_ev = evt_rx.recv() => {
                 let np_flow = app_loop::fold_ui_events(
-                    maybe_ev, &mut chat, &store, &session_id, &mut queue_items, &mut admit_st, &mut running,
+                    maybe_ev, &mut chat, &store, &session_id, &mut queue_items,
+                    &mut plan_skill_active, &mut admit_st, &mut running,
                     &mut cancelled, &mut drain_pending, &mut skip_next_render, &mut follow,
                     &cmd_tx, &mut cancel, &mut evt_rx, &mut notepad,
                     &mut question_menu, &question_hub,
@@ -762,7 +748,7 @@ pub(super) async fn run_app(
                         if !running {
                             crate::app_helpers::refresh_skill_mirrors(
                                 &skill_handle, &mut active_skill, &mut active_skill_body,
-                                &mut sys_tokens, &agent_name, &workdir,
+                                &mut sys_tokens, &agent_name, &workdir, &mut plan_skill_active,
                             );
                             body_refresh_pending = true; // idle: land the final frame ([tok cost] total) behind the 333ms body ticker
                         }
@@ -773,6 +759,11 @@ pub(super) async fn run_app(
             }
             _ = anim_ticker.tick() => {
                 if running { anim_tick = anim_tick.wrapping_add(1); dirty = true; }
+                if clear_confirm.is_some() {
+                    anim_tick = anim_tick.wrapping_add(1);
+                    if app_loop::confirm_tick(&mut clear_confirm, &mut mode_flash, anim_tick, &cmd_tx, &mut cancel, &mut running, &mut follow, &mut chat, &mut sys_tokens, &workdir, &admit_tx, &mut admit_st, &mut queue_items, &mut pending_images, &session_id, &mut history, &mut hist_idx).await { break; }
+                    dirty = true;
+                }
                 if app_notepad::poll_bash(&mut bash_rx, &mut chat) { dirty = true; }
             }
             _ = frame_ticker.tick() => {
@@ -786,15 +777,21 @@ pub(super) async fn run_app(
             }
         }
     }
+    // Quit-path terminal quiesce: stop the terminal from reporting further
+    // input (Kitty pop + mouse/paste off) and absorb the release/repeat
+    // reports of the quitting keypress before they can strand in the tty
+    // queue and be echoed as `442;1:3u`-style garbage by the shell (no tmux).
+    // Must run BEFORE `finish` while raw mode is still on, so drained bytes
+    // are never echoed by the tty line discipline.
+    crate::input::drain_shutdown(&mut input_rx).await;
     app_bootstrap::finish(&supervisor_active, cmd_tx, worker).await;
     Ok(session_id)
 }
 pub(crate) use crate::app_helpers::{
     apply_force_redraw, handle_mouse, initial_chat_view, mode_switch_busy_flash, on_resize_event,
-    poll_idle_resize, pre_key_intercept, push_history, push_user, queue_unsupported_flash,
-    snapshot_image_uris, start_turn, sys_tokens_for, worker_dead, MouseOutcome,
+    poll_idle_resize, pre_key_intercept, push_history, queue_submit_flash, queue_unsupported_flash,
+    steer_submit_flash, worker_dead, MouseOutcome,
 };
-pub(crate) use crate::skill_display::skill_trigger;
 #[cfg(test)]
 #[path = "app_tests/mod.rs"]
 mod tests;

@@ -1,0 +1,81 @@
+//! Server-only control plane. No dependency on a session or workload runtime.
+pub mod admission;
+pub mod api;
+mod bootstrap;
+mod ontology;
+pub mod release;
+mod resource_scope;
+pub mod role_gate;
+mod routes;
+pub mod scheduler;
+pub mod seed_schedules;
+pub mod transport;
+
+// Share the existing stateless/global-definition HTTP implementations with
+// the node API. Their state seam has no execution handles on the server.
+#[path = "../../web/src/api_agent_nfs.rs"]
+pub mod api_agent_nfs;
+#[path = "../../web/src/api_agent_resources.rs"]
+pub mod api_agent_resources;
+#[path = "../../web/src/api_agents.rs"]
+pub mod api_agents;
+#[path = "../../web/src/api_brain.rs"]
+pub mod api_brain;
+#[path = "../../web/src/api_dag_binaries.rs"]
+pub mod api_dag_binaries;
+#[path = "../../web/src/api_dag_binaries_nfs.rs"]
+pub mod api_dag_binaries_nfs;
+#[path = "../../web/src/api_dag_workspace_nfs.rs"]
+pub mod api_dag_workspace_nfs;
+#[path = "../../web/src/api_project.rs"]
+pub mod api_project;
+#[path = "../../web/src/api_project_initiatives.rs"]
+pub mod api_project_initiatives;
+#[path = "../../web/src/api_project_tags.rs"]
+pub mod api_project_tags;
+#[path = "../../web/src/api_project_todos.rs"]
+pub mod api_project_todos;
+#[path = "../../web/src/api_todo_directory/mod.rs"]
+pub mod api_todo_directory;
+#[path = "../../web/src/api_todo_envs.rs"]
+pub mod api_todo_envs;
+#[path = "../../web/src/api_todo_template_versions.rs"]
+pub mod api_todo_template_versions;
+#[path = "../../web/src/api_todo_templates.rs"]
+pub mod api_todo_templates;
+#[path = "../../web/src/api_todo_util.rs"]
+pub mod api_todo_util;
+#[path = "../../web/src/auth_mw.rs"]
+pub mod auth_mw;
+#[path = "../../web/src/html.rs"]
+pub mod html;
+#[path = "../../web/src/nfs_exports.rs"]
+pub mod nfs_exports;
+pub use api::project_util as api_project_util;
+
+pub use bootstrap::{new_state, new_state_with_projects, serve, serve_release, ServerCredentials};
+use opencoder_store::{fleet::FleetStore, ProjectStore, Store};
+pub use routes::{build_app, build_app_with_metrics};
+use std::{path::PathBuf, sync::Arc};
+
+pub struct AppState {
+    pub lifecycle: Arc<release::Lifecycle>,
+    pub ontology: Option<opencoder_ontology::AppState>,
+    pub workdir: PathBuf,
+    pub(crate) data_dir: PathBuf,
+    pub store: Arc<dyn Store>,
+    pub projects: Arc<dyn ProjectStore>,
+    pub fleet: Arc<FleetStore>,
+    pub hub: Arc<transport::Hub>,
+    pub brain: opencoder_brain::Runtime,
+    pub(crate) brain_gate: api::brain_dispatch::BrainGate,
+    pub admission: Arc<admission::AdmissionGate>,
+    /// Serializes placement plus reservation; never held waiting for a node.
+    pub placement: tokio::sync::Mutex<()>,
+}
+
+impl AppState {
+    /// Published resource versions affect future assignments. Running nodes
+    /// retain their pinned snapshot, so there are no drains to reload here.
+    pub async fn reload_agents(&self) {}
+}

@@ -1,6 +1,8 @@
-use crate::chat::ChatView;
+use crate::chat::{ChatView, TOOL_OUTPUT_LINES};
 use crate::composer;
-use crate::terminal_text::sanitize_single_line;
+use crate::terminal_text::{sanitize_multiline, sanitize_single_line};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 
 use opencoder_core::message::now_ms;
 
@@ -37,6 +39,23 @@ pub(crate) fn short(s: &str, n: usize) -> String {
     composer::truncate_to_width(&sanitize_single_line(s.trim()), n)
 }
 
+/// Captured tool-output rows for an expanded function call: sanitize, cap at
+/// `TOOL_OUTPUT_LINES`, indent 2, style with `color`. Trailing blank lines are
+/// dropped here so the single structural blank rendered after the output (the
+/// `User:`-block parity separator) stays the ONLY trailing blank — outputs
+/// that end in newlines must never grow extra separators. Interior blanks are
+/// preserved.
+pub(crate) fn tool_output_lines(text: &str, color: Color) -> Vec<Line<'static>> {
+    let clean = sanitize_multiline(text);
+    let mut rows: Vec<&str> = clean.lines().take(TOOL_OUTPUT_LINES).collect();
+    while rows.last().is_some_and(|l| l.trim().is_empty()) {
+        rows.pop();
+    }
+    rows.into_iter()
+        .map(|l| Line::from(Span::styled(format!("  {l}"), Style::default().fg(color))))
+        .collect()
+}
+
 /// Read the concatenated text content of all blocks (for testing).
 pub fn block_text(view: &ChatView) -> String {
     view.flatten()
@@ -49,7 +68,7 @@ pub fn block_text(view: &ChatView) -> String {
 /// Append a styled duration span to the header. Running → live warn-color
 /// timer; done → frozen muted timer (hidden when < 1s to avoid `0s` noise).
 /// NOTE: now used only by Subagent headers — the per-call Tool inline timers
-/// were removed; the bottom-border corner shows the whole-turn `[turn cost]` timer instead.
+/// were removed; the bottom-border corner shows the whole-turn `[call cost]` timer instead.
 pub(crate) fn push_duration_span(
     spans: &mut Vec<ratatui::text::Span<'static>>,
     started_at_ms: i64,
@@ -104,6 +123,10 @@ impl ChatView {
                     }
                     view.llm_round_started_at_ms = None;
                     view.frozen_round_ms = None;
+                    // Same repair as mark_subagent_done: an orphaned child
+                    // (parent cancelled/error while it streamed) leaves its
+                    // Say open — finalize so the child view never shows raw.
+                    view.finalize_assistant();
                     view.steer_items.clear();
                     *elapsed_ms = Some(((now_ms() - *started_at_ms).max(0)) as u64);
                 }
@@ -114,65 +137,82 @@ impl ChatView {
 
 /// Add bash-command helper methods to [`ChatView`].
 impl ChatView {
-    /// Push a placeholder `ChatBlock::Tool` for a `!cmd` execution.
-    /// The block is expanded (not collapsed) so the user sees the command
-    /// running. Call [`finish_bash_tool`] to fill in the output.
+    /// Push a placeholder single-call `ChatBlock::StepGroup` for a `!cmd`
+    /// execution, fully expanded through every ladder level (turn → step →
+    /// function-call result) so the user sees the command running with its
+    /// output. Call [`finish_bash_tool`] to fill in the output without
+    /// changing the user's disclosure state.
     pub(crate) fn push_bash_tool(&mut self, cmd: &str) {
         use crate::theme;
         use ratatui::style::{Modifier, Style};
         use ratatui::text::{Line, Span};
         self.finalize_assistant();
-        self.blocks.push(crate::chat::ChatBlock::Tool {
-            id: format!("bash-{}", now_ms()),
-            header: Line::from(Span::styled(
-                format!("\u{25b8} {}", sanitize_single_line(cmd)),
-                Style::default()
-                    .fg(theme::accent())
-                    .add_modifier(Modifier::BOLD),
-            )),
-            output: Vec::new(),
-            collapsed: false,
-            started_at_ms: now_ms(),
-            elapsed_ms: None,
+        self.flush_pending_thinking();
+        self.blocks.push(crate::chat::ChatBlock::StepGroup {
+            steps: vec![crate::chat::Step {
+                thinking_raw: String::new(),
+                thinking: Vec::new(),
+                thinking_dirty: false,
+                calls: vec![crate::chat::ToolCall {
+                    id: format!("bash-{}", now_ms()),
+                    header: Line::from(Span::styled(
+                        format!("\u{25b8} {}", sanitize_single_line(cmd)),
+                        Style::default()
+                            .fg(theme::accent())
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    output: Vec::new(),
+                    started_at_ms: Some(now_ms()),
+                    elapsed_ms: None,
+                    expanded: true,
+                }],
+                open: true,
+                calls_open: true,
+                sealed: true,
+            }],
+            open: true,
+            progress_active: true,
         });
     }
 
-    /// Fill the output of the most recent unfinished `bash-` tool block,
-    /// collapse it, and record elapsed time.
+    /// Fill the output of the most recent unfinished `bash-` tool call and
+    /// record elapsed time. The ladder's disclosure state is left untouched;
+    /// only user actions (including Ctrl+L) may close expanded content.
     pub(crate) fn finish_bash_tool(&mut self, output: &str) {
-        use crate::chat::TOOL_OUTPUT_LINES;
-        use crate::terminal_text::sanitize_multiline;
         use crate::theme;
-        use ratatui::style::Style;
-        use ratatui::text::{Line, Span};
         let ts = now_ms();
-        let clean = sanitize_multiline(output);
-        let out: Vec<Line<'static>> = clean
-            .lines()
-            .take(TOOL_OUTPUT_LINES)
-            .map(|l| {
-                Line::from(Span::styled(
-                    format!("  {l}"),
-                    Style::default().fg(theme::muted()),
-                ))
-            })
-            .collect();
-        if let Some(crate::chat::ChatBlock::Tool {
-            output: o,
-            started_at_ms,
-            elapsed_ms,
-            collapsed,
-            ..
-        }) = self.blocks.iter_mut().rev().find(|b| {
-            matches!(
-                b,
-                crate::chat::ChatBlock::Tool { id, elapsed_ms, .. }
-                    if id.starts_with("bash-") && elapsed_ms.is_none()
-            )
-        }) {
-            *o = out;
-            *elapsed_ms = Some(((ts - *started_at_ms).max(0)) as u64);
-            *collapsed = true;
+        let out = tool_output_lines(output, theme::muted());
+        // Newest group holding an unfinished `bash-` call.
+        let target = self.blocks.iter().enumerate().rev().find_map(|(gi, blk)| {
+            if let crate::chat::ChatBlock::StepGroup { steps, .. } = blk {
+                steps
+                    .iter()
+                    .enumerate()
+                    .find_map(|(si, s)| {
+                        s.calls
+                            .iter()
+                            .position(|c| c.id.starts_with("bash-") && c.elapsed_ms.is_none())
+                            .map(|ci| (si, ci))
+                    })
+                    .map(|(si, ci)| (gi, si, ci))
+            } else {
+                None
+            }
+        });
+        if let Some((gi, si, ci)) = target {
+            if let crate::chat::ChatBlock::StepGroup {
+                steps,
+                progress_active,
+                ..
+            } = &mut self.blocks[gi]
+            {
+                let c = &mut steps[si].calls[ci];
+                c.output = out;
+                if let Some(started) = c.started_at_ms {
+                    c.elapsed_ms = Some(((ts - started).max(0)) as u64);
+                }
+                *progress_active = false;
+            }
         }
     }
 }

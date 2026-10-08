@@ -21,14 +21,12 @@ pub const KEYMAP_INFO: &[(&str, &str)] = &[
     ("redo", "Redo"),
     ("forward_word", "Move word forward"),
     ("backward_word", "Move word backward"),
-    ("switch_mode_clear", "Switch mode (clear context)"),
-    ("switch_mode_keep", "Switch mode (keep context)"),
     ("collapse_blocks", "Collapse blocks + exit subagent"),
     ("force_redraw", "Force full-screen redraw"),
     ("copy_mode", "Toggle copy/selection mode"),
 ];
 
-/// Configuration for all 19 re-bindable global keyboard shortcuts. Each field
+/// Configuration for all 17 re-bindable global keyboard shortcuts. Each field
 /// holds a key-spec string parsed by the TUI's `parse_key_spec`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KeymapConfig {
@@ -40,14 +38,13 @@ pub struct KeymapConfig {
     pub cursor_end: String,
     pub delete_word: String,
     pub clear_input: String,
+    #[serde(default = "default_switch_mode")]
     pub switch_mode: String,
     pub paste_image: String,
     pub undo: String,
     pub redo: String,
     pub forward_word: String,
     pub backward_word: String,
-    pub switch_mode_clear: String,
-    pub switch_mode_keep: String,
     pub collapse_blocks: String,
     pub force_redraw: String,
     pub copy_mode: String,
@@ -64,14 +61,12 @@ impl Default for KeymapConfig {
             cursor_end: "ctrl+e".into(),
             delete_word: "ctrl+w".into(),
             clear_input: "ctrl+u".into(),
-            switch_mode: "ctrl+t".into(),
+            switch_mode: default_switch_mode(),
             paste_image: "ctrl+v".into(),
             undo: "ctrl+z".into(),
             redo: "ctrl+y".into(),
             forward_word: "alt+f".into(),
             backward_word: "alt+b".into(),
-            switch_mode_clear: "alt+tab".into(),
-            switch_mode_keep: "ctrl+shift+tab".into(),
             collapse_blocks: "ctrl+l".into(),
             force_redraw: "ctrl+f".into(),
             copy_mode: "ctrl+g".into(),
@@ -97,8 +92,6 @@ impl KeymapConfig {
             "redo" => &self.redo,
             "forward_word" => &self.forward_word,
             "backward_word" => &self.backward_word,
-            "switch_mode_clear" => &self.switch_mode_clear,
-            "switch_mode_keep" => &self.switch_mode_keep,
             "collapse_blocks" => &self.collapse_blocks,
             "force_redraw" => &self.force_redraw,
             "copy_mode" => &self.copy_mode,
@@ -123,8 +116,6 @@ impl KeymapConfig {
             "redo" => self.redo = value,
             "forward_word" => self.forward_word = value,
             "backward_word" => self.backward_word = value,
-            "switch_mode_clear" => self.switch_mode_clear = value,
-            "switch_mode_keep" => self.switch_mode_keep = value,
             "collapse_blocks" => self.collapse_blocks = value,
             "force_redraw" => self.force_redraw = value,
             "copy_mode" => self.copy_mode = value,
@@ -132,6 +123,10 @@ impl KeymapConfig {
         }
         true
     }
+}
+
+fn default_switch_mode() -> String {
+    "ctrl+t".into()
 }
 
 #[cfg(test)]
@@ -155,8 +150,6 @@ mod tests {
         assert_eq!(d.redo, "ctrl+y");
         assert_eq!(d.forward_word, "alt+f");
         assert_eq!(d.backward_word, "alt+b");
-        assert_eq!(d.switch_mode_clear, "alt+tab");
-        assert_eq!(d.switch_mode_keep, "ctrl+shift+tab");
         assert_eq!(d.collapse_blocks, "ctrl+l");
         assert_eq!(d.force_redraw, "ctrl+f");
         assert_eq!(d.copy_mode, "ctrl+g");
@@ -180,6 +173,56 @@ mod tests {
 
     #[test]
     fn keymap_info_count_matches_fields() {
-        assert_eq!(KEYMAP_INFO.len(), 19);
+        let fields = serde_json::to_value(KeymapConfig::default())
+            .expect("defaults serialize")
+            .as_object()
+            .expect("defaults are an object")
+            .len();
+        assert_eq!(KEYMAP_INFO.len(), 17);
+        assert_eq!(
+            KEYMAP_INFO.len(),
+            fields,
+            "KEYMAP_INFO must cover every field"
+        );
+    }
+
+    /// Old user configs can still carry the retired Alt+Tab variant. Plain
+    /// `Deserialize` ignores that unknown field while restoring the live
+    /// `switch_mode` binding.
+    #[test]
+    fn legacy_keymap_restores_switch_mode_and_ignores_retired_variants() {
+        let legacy = r#"{
+            "help": "ctrl+h",
+            "quit": "ctrl+d",
+            "cancel": "ctrl+c",
+            "newline": "ctrl+j",
+            "cursor_home": "ctrl+a",
+            "cursor_end": "ctrl+e",
+            "delete_word": "ctrl+w",
+            "clear_input": "ctrl+u",
+            "switch_mode": "ctrl+t",
+            "paste_image": "ctrl+v",
+            "undo": "ctrl+z",
+            "redo": "ctrl+y",
+            "forward_word": "alt+f",
+            "backward_word": "alt+b",
+            "switch_mode_clear": "alt+tab",
+            "collapse_blocks": "ctrl+l",
+            "force_redraw": "ctrl+f",
+            "copy_mode": "ctrl+g"
+        }"#;
+        let cfg: KeymapConfig = serde_json::from_str(legacy).expect("legacy keymap loads");
+        assert_eq!(cfg, KeymapConfig::default());
+        assert_eq!(cfg.get("switch_mode"), Some("ctrl+t"));
+        assert!(cfg.get("switch_mode_clear").is_none());
+    }
+
+    #[test]
+    fn keymap_without_switch_mode_uses_ctrl_t_default() {
+        let json = serde_json::to_string(&KeymapConfig::default()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("switch_mode");
+        let cfg: KeymapConfig = serde_json::from_value(value).expect("older keymap loads");
+        assert_eq!(cfg.switch_mode, "ctrl+t");
     }
 }

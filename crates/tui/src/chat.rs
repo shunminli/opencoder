@@ -4,8 +4,12 @@ use ratatui::text::{Line, Span};
 use crate::terminal_text::{sanitize_line, sanitize_multiline, sanitize_single_line};
 use crate::theme;
 
-use opencoder_llm::estimate;
 use opencoder_session::SessionEvent;
+
+// Test modules under `chat_tests/` glob-import this scope and use `estimate`
+// in token-accounting assertions.
+#[cfg(test)]
+use opencoder_llm::estimate;
 
 // ── Exact flattened header shapes (single source of truth) ────────────────
 // These headers are emitted as single spans with exactly these contents, and
@@ -17,13 +21,16 @@ use opencoder_session::SessionEvent;
 pub(crate) const ROLE_USER_HEADER: &str = "\u{276f} User:";
 /// `ChatBlock::Assistant` header row.
 pub(crate) const ROLE_SAY_HEADER: &str = "\u{276f} Say:";
+/// Header row above an open step's folded thinking (inside a `StepGroup`),
+/// and of the standalone expanded Thinking block.
+pub(crate) const STEP_THINKING_HEADER: &str = "\u{1f4ad} Thinking";
 /// `ChatBlock::Plan` header row.
 pub(crate) const PLAN_HEADER: &str = "\u{2576}\u{2500} plan \u{2500}\u{2574}";
 
 /// Body lines of streaming assistant `raw`, mirroring `flatten_with`: drop the
 /// single trailing empty element from a terminating newline (interior blanks kept).
 /// Shared by `collect_headers` and `flatten_with` so they never diverge (A2/A3).
-fn assistant_rows(raw: &str) -> Vec<&str> {
+pub(crate) fn assistant_rows(raw: &str) -> Vec<&str> {
     let mut rows: Vec<&str> = raw.split('\n').collect();
     if rows.last().is_some_and(|s| s.is_empty()) {
         rows.pop();
@@ -38,25 +45,55 @@ pub use types::*;
 #[path = "chat_helpers.rs"]
 mod helpers;
 pub use helpers::block_text;
-pub(crate) use helpers::{push_duration_span, short, summarize};
+pub(crate) use helpers::{push_duration_span, short, summarize, tool_output_lines};
+
+#[path = "chat_step_render.rs"]
+mod step_render;
+pub(crate) use step_render::SayHeader;
+#[path = "chat_steps.rs"]
+mod steps;
 
 #[path = "compaction_block.rs"]
 mod compaction_block;
+#[path = "chat_context.rs"]
+mod context;
+#[path = "chat_flatten.rs"]
+mod flatten;
 #[path = "chat_headers.rs"]
 mod headers;
+#[path = "chat_sidecar.rs"]
+pub(crate) mod sidecar;
 #[path = "chat_stream.rs"]
 mod stream;
 pub(crate) use compaction_block::render_collapsible;
+pub(crate) use steps::{coalesce_steps, single_step_group, StepTarget};
 
 impl ChatView {
     pub fn apply(&mut self, ev: &SessionEvent) {
         self.track_context(ev);
         match ev {
             SessionEvent::LlmRoundStart { started_at_ms } => {
+                let start = self.turn_block_start.min(self.blocks.len());
+                self.attempt_snapshot = Some(AttemptSnapshot {
+                    start,
+                    blocks: self.blocks[start..].to_vec(),
+                    context_used: self.context_used,
+                    assistant: self.round_assistant_idx,
+                });
                 self.llm_round_started_at_ms = Some(*started_at_ms);
                 self.frozen_round_ms = None;
             }
+            SessionEvent::LlmAttemptReset => {
+                if let Some(saved) = &self.attempt_snapshot {
+                    self.blocks.truncate(saved.start);
+                    self.blocks.extend(saved.blocks.iter().cloned());
+                    self.turn_block_start = saved.start;
+                    self.context_used = saved.context_used;
+                    self.round_assistant_idx = saved.assistant;
+                }
+            }
             SessionEvent::LlmRoundEnd => {
+                self.attempt_snapshot = None;
                 if let Some(anchor) = self.llm_round_started_at_ms.take() {
                     self.frozen_round_ms =
                         Some(((opencoder_core::message::now_ms() - anchor).max(0)) as u64);
@@ -83,7 +120,7 @@ impl ChatView {
             }
             // Stream the summary into an expanded block so it is visible while
             // the summarizing LLM call runs. The final `Compaction(summary)`
-            // event (below) finalizes + collapses it.
+            // event replaces the text without changing disclosure state.
             SessionEvent::CompactionDelta(t) => {
                 self.open_compaction_streaming(&sanitize_multiline(t));
             }
@@ -92,7 +129,13 @@ impl ChatView {
                     return;
                 }
                 self.finalize_assistant();
-                self.blocks.push(ChatBlock::Tool {
+                // The round's pending Thinking blocks become this round's
+                // step-thinking (rendered markdown, step-local, out of the
+                // main flow). The backwards walk crosses Assistant blocks
+                // (the turn's own speech) but stops at any other block, so
+                // the previous user segment's thinking is never absorbed.
+                let thinking = steps::absorb_pending_thinking(&mut self.blocks);
+                let call = ToolCall {
                     id: id.clone(),
                     header: Line::from(vec![
                         Span::styled(
@@ -104,10 +147,16 @@ impl ChatView {
                         Span::styled(summarize(input), Style::default().fg(theme::muted())),
                     ]),
                     output: Vec::new(),
-                    collapsed: true,
-                    started_at_ms: opencoder_core::message::now_ms(),
+                    started_at_ms: Some(opencoder_core::message::now_ms()),
                     elapsed_ms: None,
-                });
+                    expanded: false,
+                };
+                // Every non-task call in this admitted user turn joins its
+                // ONE canonical group; Say and presentation blocks are not
+                // structural boundaries. Calls keep accumulating in the
+                // current Step until a later Thinking run opens the next.
+                steps::merge_turn_call(&mut self.blocks, self.turn_block_start, thinking, call);
+                steps::set_turn_progress(&mut self.blocks, self.turn_block_start, true);
             }
             SessionEvent::ToolEnd {
                 id,
@@ -125,38 +174,63 @@ impl ChatView {
                 } else {
                     theme::muted()
                 };
-                let clean_output = sanitize_multiline(output);
-                let out: Vec<Line<'static>> = clean_output
-                    .lines()
-                    .take(TOOL_OUTPUT_LINES)
-                    .map(|l| Line::from(Span::styled(format!("  {l}"), Style::default().fg(color))))
-                    .collect();
-                if let Some(ChatBlock::Tool {
-                    output: o,
-                    started_at_ms,
-                    elapsed_ms,
-                    ..
-                }) = self
-                    .blocks
-                    .iter_mut()
-                    .rev()
-                    .find(|b| matches!(b, ChatBlock::Tool { id: bid, .. } if bid == id))
-                {
-                    o.extend(out);
-                    *elapsed_ms =
-                        Some(((opencoder_core::message::now_ms() - *started_at_ms).max(0)) as u64);
-                } else {
-                    self.blocks.push(ChatBlock::Tool {
-                        id: id.clone(),
-                        header: Line::from(Span::styled(
-                            "\u{25b8} (output)",
-                            Style::default().fg(theme::accent()),
-                        )),
-                        output: out,
-                        collapsed: true,
-                        started_at_ms: opencoder_core::message::now_ms(),
-                        elapsed_ms: None,
-                    });
+                // Shared capture: trailing blank lines are dropped so the
+                // structural blank after the expanded output stays the only one.
+                let out = tool_output_lines(output, color);
+                // Route by id: walk groups newest-first, steps newest-first,
+                // calls newest-first, so parallel calls each land in their
+                // own slot.
+                let target = self.blocks.iter().enumerate().rev().find_map(|(gi, blk)| {
+                    if let ChatBlock::StepGroup { steps, .. } = blk {
+                        steps
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find_map(|(si, s)| {
+                                s.calls.iter().rposition(|c| c.id == *id).map(|ci| (si, ci))
+                            })
+                            .map(|(si, ci)| (gi, si, ci))
+                    } else {
+                        None
+                    }
+                });
+                match target {
+                    Some((gi, si, ci)) => {
+                        if let ChatBlock::StepGroup { steps, .. } = &mut self.blocks[gi] {
+                            let c = &mut steps[si].calls[ci];
+                            c.output.extend(out);
+                            if let Some(started) = c.started_at_ms {
+                                c.elapsed_ms = Some(
+                                    ((opencoder_core::message::now_ms() - started).max(0)) as u64,
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        // Orphan ToolEnd (lost ToolStart): synthesize a
+                        // finished single-call step so the output is kept,
+                        // folded into the trailing group when one exists —
+                        // the same fold replay's `coalesce_steps` applies to
+                        // adjacent groups — so the transcript renders
+                        // identically before and after resume.
+                        let call = ToolCall {
+                            id: id.clone(),
+                            header: Line::from(Span::styled(
+                                "\u{25b8} (output)",
+                                Style::default().fg(theme::accent()),
+                            )),
+                            output: out,
+                            started_at_ms: None,
+                            elapsed_ms: Some(0),
+                            expanded: false,
+                        };
+                        steps::merge_turn_call(
+                            &mut self.blocks,
+                            self.turn_block_start,
+                            Vec::new(),
+                            call,
+                        );
+                    }
                 }
                 // Render tool-returned images inline after the text output.
                 for url in images {
@@ -201,18 +275,9 @@ impl ChatView {
                 self.subagents_running = self.subagents_running.saturating_add(1);
                 self.subagents_total = self.subagents_total.saturating_add(1);
                 self.finalize_assistant();
-                // On the SECOND concurrent subagent, begin withholding the
-                // parent's preamble assistant text (issue #5). It renders zero
-                // lines until every sibling finishes, then reappears in one shot.
-                if self.subagents_running == 2 && self.hidden_assistant_idx.is_none() {
-                    self.hidden_assistant_idx = self
-                        .blocks
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find(|(_, b)| matches!(b, ChatBlock::Assistant { .. }))
-                        .map(|(i, _)| i);
-                }
+                // The task-tool round streams no absorbable ToolStart: flush
+                // its pending Thinking into the ladder (never outside it).
+                self.flush_pending_thinking();
                 self.blocks.push(ChatBlock::Subagent {
                     id: id.clone(),
                     child_session_id: child_session_id.clone(),
@@ -259,51 +324,47 @@ impl ChatView {
                 // Mark done immediately — each subagent's status/summary should
                 // surface as soon as it finishes, not be buffered behind siblings.
                 self.mark_subagent_done(id, *ok, *cancelled, summary);
-                if self.subagents_running == 0 {
-                    self.hidden_assistant_idx = None;
-                }
             }
             SessionEvent::Done => {
                 self.llm_round_started_at_ms = None;
                 self.frozen_round_ms = None;
                 self.subagents_running = 0;
-                self.hidden_assistant_idx = None;
+                // Turn complete: its echo must never resurface on a later
+                // rebuild (a bare `/act_clear_context` mid-run would
+                // otherwise resurrect the previous turn's prompt).
+                self.pending_turn_echo = None;
                 self.reconcile_orphaned_subagents();
                 self.finalize_assistant();
-                self.blocks.push(ChatBlock::Marker(vec![Line::from("")]));
+                steps::set_turn_progress(&mut self.blocks, self.turn_block_start, false);
+                // A round with no tool call (pure-text turn, or the turn's
+                // final Say round) folds its pending Thinking into a call-less
+                // step — thinking never survives outside the ladder.
+                self.flush_pending_thinking();
+                // Exactly one blank after the turn (User:-block parity): a
+                // tool-final turn ends on its ladder's own trailing blank, so
+                // the boundary marker must not stack a second one.
+                if !self.last_block_ends_blank() {
+                    self.blocks.push(ChatBlock::Marker(vec![Line::from("")]));
+                }
             }
             SessionEvent::Error(e) => {
                 self.llm_round_started_at_ms = None;
                 self.frozen_round_ms = None;
                 self.subagents_running = 0;
-                self.hidden_assistant_idx = None;
+                self.pending_turn_echo = None;
                 self.reconcile_orphaned_subagents();
                 self.finalize_assistant();
+                steps::set_turn_progress(&mut self.blocks, self.turn_block_start, false);
+                self.flush_pending_thinking();
                 self.blocks
                     .push(ChatBlock::Marker(vec![Line::from(Span::styled(
                         format!("error: {}", sanitize_single_line(e)),
                         Style::default().fg(theme::err_color()),
                     ))]));
             }
-            SessionEvent::PlanHandoff(plan) => {
-                // Dedup: don't stack a second plan card on a replayed PlanHandoff.
-                if self
-                    .blocks
-                    .iter()
-                    .any(|b| matches!(b, ChatBlock::Plan { .. }))
-                {
-                    return;
-                }
-                self.finalize_assistant();
-                let clean_plan = sanitize_multiline(plan);
-                let rendered = crate::markdown::render(&clean_plan);
-                if !rendered.is_empty() {
-                    self.blocks.push(ChatBlock::Plan {
-                        rendered,
-                        raw: clean_plan.into_owned(),
-                    });
-                }
-            }
+            // Legacy persisted `plan_handoff` SSE events parse to `None` and
+            // never reach the display layer; the surviving handoff card comes
+            // from replaying `meta.handoff_plan` (see session_ui::replay).
             SessionEvent::TranscriptReset(_) => {
                 // The view is rebuilt from the new message list via the
                 // replay path, which reconstructs provider truth from the
@@ -311,64 +372,69 @@ impl ChatView {
             }
             SessionEvent::QueueConsumed { .. } => {}
             SessionEvent::SteerConsumed { seq, text } => {
+                // Model-facing echo only: a compound control command's tail,
+                // nothing for a bare command (applied inline, never
+                // recorded). Legacy persisted events fall back to the local
+                // mirror through the same normalization.
                 let display = if !text.is_empty() {
-                    sanitize_multiline(text).into_owned()
+                    opencoder_session::consumed_echo_text(text)
                 } else {
                     self.steer_items
                         .iter()
                         .find(|(s, _)| s == seq)
-                        .map(|(_, d)| d.clone())
-                        .unwrap_or_default()
+                        .and_then(|(_, d)| opencoder_session::consumed_echo_text(d))
                 };
+                let display = display
+                    .map(|d| sanitize_multiline(&d).into_owned())
+                    .unwrap_or_default();
                 if !display.is_empty() {
+                    // Segment boundary: the pre-boundary pending Thinking can
+                    // never be absorbed by a later ToolStart (the walk stops
+                    // here) — fold it into the ladder before the echo lands.
+                    self.flush_pending_thinking();
                     self.blocks.push(ChatBlock::User {
                         rendered: crate::markdown::render(&display),
                     });
                     self.push_marker(Line::from(""));
+                    // Remember the echo across a TranscriptReset rebuild (a
+                    // steered `/act_clear_context <tail>` resets the view
+                    // right after this event, before the tail is recorded).
+                    self.pending_turn_echo = Some(display.clone());
+                    // The echoed steer is a NEW user input: per the Turn
+                    // contract (1 turn = n steps + say) the rounds it
+                    // triggers own a FRESH ladder below the echo — they must
+                    // never merge into the previous turn's group. The
+                    // pre-steer ladder is complete (it never gets its own
+                    // say), so its progress animation is frozen here.
+                    self.reanchor_turn_after_user_echo();
                 }
                 self.steer_items.retain(|(s, _)| s != seq);
             }
             SessionEvent::AutoPilot { phase, iteration } => {
                 self.status = format!("autopilot: {:?} #{}", phase, iteration);
             }
+            // Sidecar frames fold into the panel field `chat.sidecar` (see
+            // `sidecar::fold_sidecar`): Start claims/creates the panel,
+            // Child routes into the panel's nested view, Turn finalizes it.
+            // Bare `LlmUsage` is NOT a sidecar frame — it already took the
+            // parent arm above, which is exactly how the sidecar's cost is
+            // accounted to the main task (tokens_total).
+            SessionEvent::SidecarStart { .. }
+            | SessionEvent::SidecarChild { .. }
+            | SessionEvent::SidecarTurn { .. } => {
+                sidecar::fold_sidecar(self, ev);
+            }
         }
     }
 
     /// Fold an agent switch into the view state: finalize any open assistant
-    /// block, reflect the new agent, and reset `plan_submitted` on plan
-    /// entries (a fresh plan phase has no delivered requirement yet).
+    /// block and reflect the new agent.
     ///
-    /// Split out of the `AgentSwitch` event arm so the optimistic switch path
-    /// (`app_loop::handle_switch_agent`) can fold synchronously at flip time.
-    /// Without that, `plan_submitted` stays stale-true across a rapid
-    /// Shift+Tab act→plan→act double-tap until the worker's `AgentSwitch`
-    /// event round-trips back to the UI — and a second tap inside that window
-    /// would fire a bogus plan→act handoff that drains the input box and
-    /// collapses the transcript around a fabricated plan.
+    /// Split out of the `AgentSwitch` event arm so other paths can fold the
+    /// switch synchronously at flip time.
     pub fn fold_agent_switch(&mut self, to: &str) {
         self.finalize_assistant();
         self.agent = sanitize_single_line(to).into_owned();
-        if to == "plan" {
-            // Entering plan starts a FRESH phase: any stale arm from a
-            // previous phase collapses here. The ONLY path back to armed is
-            // the consumption-time re-arm (TurnDone(plan) reads the
-            // persisted `plan_input_count`, which increments when a real
-            // requirement is delivered to the plan agent).
-            self.plan_submitted = false;
-        }
-    }
-
-    /// Record that a user requirement was delivered to the current agent.
-    /// In plan mode this arms the plan→act handoff, so Shift+Tab collapses the
-    /// planning transcript (only the final plan carries over). Only the
-    /// Enter idle-submit path calls this — the submit immediately starts the
-    /// run that consumes the input. Steer/queue submits must NOT arm here:
-    /// they arm at consumption (see [`ChatView::fold_agent_switch`]) so a
-    /// stranded, never-consumed row can never arm a handoff.
-    pub fn note_requirement_submitted(&mut self) {
-        if self.agent == "plan" {
-            self.plan_submitted = true;
-        }
     }
 
     /// Begin a new turn. The single owner of the turn-start invariant: any
@@ -376,17 +442,40 @@ impl ChatView {
     /// the previous turn) must be cleared so it does not leak into the status
     /// bar of the freshly-started turn. The transcript blocks are untouched.
     pub fn begin_turn(&mut self) {
+        // A missing terminal display event must not leave the previous turn's
+        // progress animation alive after a new prompt is admitted.
+        steps::set_turn_progress(&mut self.blocks, self.turn_block_start, false);
         self.submitted = true;
         self.status.clear();
         self.turn_block_start = self.blocks.len();
+        // A new admitted turn invalidates the previous run's Say anchor: a
+        // repair without a fresh Say must insert, not overwrite.
+        self.round_assistant_idx = None;
         self.llm_round_started_at_ms = Some(opencoder_core::message::now_ms());
         self.frozen_round_ms = None;
+    }
+
+    /// Re-anchor the live ladder floor after a user echo landed mid-flow
+    /// (steer consumption, queue consumption): the echoed input opens a NEW
+    /// Turn, so later steps/calls build a fresh `StepGroup` below the echo
+    /// instead of merging into the previous turn's group. The previous
+    /// group's progress animation is frozen — that turn ended without its
+    /// own say and will never animate again. Mirrors the SPA's
+    /// user-boundary rule in `steps/reducer.js` (`lastUserBoundary`).
+    pub fn reanchor_turn_after_user_echo(&mut self) {
+        steps::set_turn_progress(&mut self.blocks, self.turn_block_start, false);
+        self.turn_block_start = self.blocks.len();
+        // The echo opens a new turn boundary — same invalidation as
+        // `begin_turn`: the pre-echo Say anchor must not survive as a
+        // repair target for the post-echo run.
+        self.round_assistant_idx = None;
     }
 
     /// Push a non-streamed line and ensure the next TextDelta starts a new
     /// assistant block instead of merging into a prior one.
     pub fn push_marker(&mut self, line: Line<'static>) {
         self.finalize_assistant();
+        self.flush_pending_thinking();
         self.blocks
             .push(ChatBlock::Marker(vec![sanitize_line(line)]));
     }
@@ -396,6 +485,7 @@ impl ChatView {
     /// commands (e.g. `/ps`) whose multi-line echo never reaches the model.
     pub fn push_marker_lines(&mut self, lines: Vec<Line<'static>>) {
         self.finalize_assistant();
+        self.flush_pending_thinking();
         self.blocks.push(ChatBlock::Marker(
             lines.into_iter().map(sanitize_line).collect(),
         ));
@@ -409,299 +499,71 @@ impl ChatView {
         }
     }
 
-    /// Toggle collapse on the tool-output block at `block_idx` (mouse click
-    /// handler). No-op if the index is out of range or not a Tool block.
-    pub fn toggle_tool_at(&mut self, block_idx: usize) {
-        if let Some(ChatBlock::Tool { collapsed, .. }) = self.blocks.get_mut(block_idx) {
-            *collapsed = !*collapsed;
+    /// Toggle the click target at flat index `call_idx` inside the StepGroup
+    /// at `block_idx` (mouse click handler on a rendered ladder row). The
+    /// index walks the turn's VISIBLE rows — the turn row, then (while it is
+    /// open) each step row, then (while a step is open) its calls aggregation
+    /// row, then (while that list is open) each function-call row, in render
+    /// order — exactly what `visible_targets` and
+    /// `collect_headers` enumerate, so the toggled row is the row that was
+    /// clicked. A turn target flips its steps; a step target flips that
+    /// step; a calls target flips the aggregate list; a call target toggles
+    /// that single call's result. No-op if either index is out of range.
+    pub fn toggle_tool_call_at(&mut self, block_idx: usize, call_idx: usize) {
+        let Some(ChatBlock::StepGroup { open, steps, .. }) = self.blocks.get_mut(block_idx) else {
+            return;
+        };
+        let Some(target) = steps::visible_targets(*open, steps).get(call_idx).copied() else {
+            return;
+        };
+        match target {
+            StepTarget::Group => *open = !*open,
+            StepTarget::Step(si) => {
+                if let Some(s) = steps.get_mut(si) {
+                    s.open = !s.open;
+                    if s.open {
+                        steps::render_step_thinking(s);
+                    }
+                }
+            }
+            StepTarget::Calls(si) => {
+                if let Some(s) = steps.get_mut(si) {
+                    s.calls_open = !s.calls_open;
+                }
+            }
+            StepTarget::Call(si, ci) => {
+                if let Some(c) = steps.get_mut(si).and_then(|s| s.calls.get_mut(ci)) {
+                    c.expanded = !c.expanded;
+                }
+            }
         }
     }
 
-    /// Collapse every collapsible block (Thinking + Tool output) in this view.
-    /// Bound to Ctrl+L: clears any expanded reasoning/tool-output blocks in one
-    /// keystroke (also applied to a child subagent view before exiting it).
+    /// Collapse every collapsible block (Thinking + Compaction + StepGroup)
+    /// in this view. Bound to Ctrl+L: clears any expanded reasoning blocks
+    /// and closes every level of the tool ladder — turn fold, step folds,
+    /// calls-list folds and expanded call results — in one keystroke (the turn row itself
+    /// always stays rendered; also applied to a child
+    /// subagent view before exiting it).
     pub fn collapse_all_collapsible(&mut self) {
         for block in &mut self.blocks {
             match block {
-                ChatBlock::Thinking { collapsed, .. }
-                | ChatBlock::Tool { collapsed, .. }
-                | ChatBlock::Compaction { collapsed, .. } => {
+                ChatBlock::Thinking { collapsed, .. } | ChatBlock::Compaction { collapsed, .. } => {
                     *collapsed = true;
+                }
+                ChatBlock::StepGroup { open, steps, .. } => {
+                    *open = false;
+                    for s in steps {
+                        s.open = false;
+                        s.calls_open = false;
+                        for c in &mut s.calls {
+                            c.expanded = false;
+                        }
+                    }
                 }
                 _ => {}
             }
         }
-    }
-
-    /// Accumulate estimated token counts for this view's OWN transcript only.
-    /// Child subagent tokens are excluded — each child ChatView tracks its own
-    /// subtree via its own `apply` (events route through `SubagentChild`).
-    fn track_context(&mut self, ev: &SessionEvent) {
-        // Note: TextDelta/ReasoningDelta are intentionally NOT counted here.
-        // Counting per-delta made the status bar's ctx% indicator jump on
-        // every token.
-        // Instead they are counted once at round boundaries via
-        // `finalize_assistant` (and `append_text_delta` for the
-        // reasoning → text transition). The discrete events below are kept
-        // immediate since they are low-frequency and not part of streaming.
-        match ev {
-            SessionEvent::ToolStart { input, .. } => {
-                self.context_used += estimate(&input.to_string()) as u64;
-            }
-            SessionEvent::ToolEnd { output, .. } => {
-                self.context_used += estimate(output) as u64;
-            }
-            SessionEvent::SubagentEnd { summary, .. } => {
-                self.context_used += estimate(summary) as u64;
-            }
-            SessionEvent::Compaction(c) => {
-                self.context_used = estimate(c) as u64;
-            }
-            SessionEvent::PlanHandoff(plan) => {
-                self.context_used += estimate(plan) as u64;
-            }
-            // Queue-consumed and steer-consumed prompts are real user messages
-            // the model sees in context. Previously they were echoed as
-            // ChatBlock::User but silently absent from context_used, causing
-            // the ctx meter to under-report by the full token size of every
-            // queued/steered prompt — the main source of "displayed 70k but
-            // compaction triggered at 128k" confusion.
-            SessionEvent::QueueConsumed { text, .. } => {
-                self.context_used += estimate(text) as u64;
-            }
-            SessionEvent::SteerConsumed { text, .. } => {
-                self.context_used += estimate(text) as u64;
-            }
-            _ => {}
-        }
-    }
-
-    /// Flatten all blocks into a single `Vec<Line>` for rendering, using
-    /// `anim_tick` only to advance the running-subagent spinner. Delegated to
-    /// by `flatten()` (which passes `0`) for non-render callers (selection,
-    /// scroll-counting, tests) — line counts are identical across tick values,
-    /// so hit-rects and selection math stay aligned with the live render.
-    pub fn flatten_with(&self, anim_tick: u32, now_ms: i64) -> Vec<Line<'static>> {
-        let mut out = Vec::with_capacity(self.blocks.len() * 2);
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            match block {
-                ChatBlock::Marker(lines) => out.extend(lines.iter().cloned()),
-                ChatBlock::User { rendered } => {
-                    out.push(Line::from(Span::styled(
-                        ROLE_USER_HEADER,
-                        Style::default()
-                            .fg(theme::user_color())
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                    out.extend(types::indented(rendered, 4));
-                }
-                ChatBlock::Assistant {
-                    raw,
-                    rendered,
-                    done,
-                } => {
-                    // Withheld while multiple subagents run (issue #5): render
-                    // zero lines so hit-rect/selection indices stay aligned.
-                    if self.is_withheld(block_idx) {
-                        continue;
-                    }
-                    // Visual header so assistant output has its own labelled region,
-                    // mirroring the `user:` marker on user prompts.
-                    out.push(Line::from(Span::styled(
-                        ROLE_SAY_HEADER,
-                        Style::default()
-                            .fg(theme::ok_color())
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                    let indent = Span::raw("    ");
-                    if *done {
-                        out.extend(types::indented(rendered, 4));
-                    } else {
-                        // Mirrors `flush_code` (markdown.rs): split the raw
-                        // stream on `\n` and drop only the single trailing
-                        // empty element produced by a terminating newline, so
-                        // it does not render as an extra blank body line.
-                        // Interior blank lines are preserved. Shared with
-                        // `collect_headers` so the two can never diverge.
-                        let rows = assistant_rows(raw);
-                        for l in rows {
-                            let l = l.strip_suffix('\r').unwrap_or(l);
-                            out.push(Line::from(vec![indent.clone(), Span::raw(l.to_string())]));
-                        }
-                    }
-                }
-                ChatBlock::Thinking {
-                    text, collapsed, ..
-                } => {
-                    out.extend(render_collapsible(
-                        "\u{1f4ad}",
-                        "Thinking",
-                        text,
-                        *collapsed,
-                        Style::default()
-                            .fg(theme::pink())
-                            .add_modifier(Modifier::BOLD),
-                        Style::default().fg(theme::muted()),
-                    ));
-                }
-                ChatBlock::Compaction {
-                    text, collapsed, ..
-                } => {
-                    out.extend(render_collapsible(
-                        "\u{1f4dd}",
-                        "Compaction",
-                        text,
-                        *collapsed,
-                        Style::default().fg(theme::compaction_color()),
-                        Style::default().fg(theme::compaction_color()),
-                    ));
-                }
-                ChatBlock::Tool {
-                    header,
-                    output,
-                    collapsed,
-                    ..
-                } => {
-                    if *collapsed {
-                        let n = output.len();
-                        let mut spans = header.spans.clone();
-                        if n > 0 {
-                            spans.push(Span::styled(
-                                format!(" [\u{2193} {n}]"),
-                                Style::default().fg(theme::muted()),
-                            ));
-                        }
-                        out.push(Line::from(spans));
-                    } else {
-                        let mut spans = header.spans.clone();
-                        // Expanded: flip the header's leading prefix arrow
-                        // from U+25B8 (right-pointing) to U+25BE (down-
-                        // pointing) so the prefix mirrors the toggle state.
-                        if let Some(first) = spans.first_mut() {
-                            let flipped = match first.content.strip_prefix('\u{25b8}') {
-                                Some(rest) => format!("\u{25be}{rest}"),
-                                None => first.content.to_string(),
-                            };
-                            first.content = flipped.into();
-                        }
-                        spans.push(Span::styled(
-                            " [\u{2191}]",
-                            Style::default().fg(theme::muted()),
-                        ));
-                        out.push(Line::from(spans));
-                        out.extend(output.iter().cloned());
-                        out.push(Line::from(""));
-                    }
-                }
-                ChatBlock::Image { filename, rendered } => {
-                    out.push(Line::from(Span::styled(
-                        format!("[image: {filename}]"),
-                        Style::default().fg(theme::muted()),
-                    )));
-                    if rendered.is_empty() {
-                        out.push(Line::from(Span::styled(
-                            "  (unable to render)",
-                            Style::default().fg(theme::muted()),
-                        )));
-                    } else {
-                        out.extend(types::indented(rendered, 4));
-                    }
-                    out.push(Line::from(""));
-                }
-                ChatBlock::Plan { rendered, .. } => {
-                    out.push(Line::from(Span::styled(
-                        PLAN_HEADER,
-                        Style::default()
-                            .fg(theme::warn_color())
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                    out.extend(types::indented(rendered, 2));
-                    out.push(Line::from(""));
-                }
-                ChatBlock::Subagent {
-                    kind,
-                    prompt,
-                    view,
-                    done,
-                    ok,
-                    cancelled,
-                    summary,
-                    started_at_ms,
-                    elapsed_ms,
-                    ..
-                } => {
-                    let tool_count = view
-                        .blocks
-                        .iter()
-                        .filter(|b| matches!(b, ChatBlock::Tool { .. }))
-                        .count();
-                    // Status badge: animated spinner/check/cross/cancelled +
-                    // word. The running spinner uses the live anim_tick.
-                    let (mark, mark_color, status_word) = if *cancelled {
-                        ("\u{2298}", theme::muted(), "cancelled")
-                    } else if *done {
-                        if *ok {
-                            ("\u{2714}", theme::ok_color(), "done")
-                        } else {
-                            ("\u{2718}", theme::err_color(), "failed")
-                        }
-                    } else {
-                        (
-                            SPINNER[(anim_tick as usize) % SPINNER.len()],
-                            theme::warn_color(),
-                            "running",
-                        )
-                    };
-                    let mut spans = vec![
-                        Span::styled(
-                            "\u{2937} subagent ",
-                            Style::default()
-                                .fg(theme::info_color())
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!("[{kind}] "), Style::default().fg(theme::accent())),
-                        Span::styled(prompt.clone(), Style::default().fg(theme::muted())),
-                        Span::raw(" "),
-                        Span::styled(
-                            format!("{mark} {status_word}, {tool_count} tools"),
-                            Style::default().fg(mark_color),
-                        ),
-                    ];
-                    push_duration_span(&mut spans, *started_at_ms, *elapsed_ms, now_ms);
-                    spans.push(Span::styled(
-                        " [\u{2192} view]",
-                        Style::default().fg(theme::muted()),
-                    ));
-                    if *done && !summary.is_empty() {
-                        spans.push(Span::styled(
-                            format!("  {summary}"),
-                            Style::default().fg(if *cancelled || *ok {
-                                theme::muted()
-                            } else {
-                                theme::err_color()
-                            }),
-                        ));
-                    }
-                    out.push(Line::from(spans));
-                }
-            }
-        }
-        out
-    }
-
-    /// Non-animated flatten for callers that don't render (selection extract,
-    /// scroll-counting, tests). Line counts match `flatten_with` exactly.
-    pub fn flatten(&self) -> Vec<Line<'static>> {
-        self.flatten_with(0, opencoder_core::message::now_ms())
-    }
-
-    /// Whether the block at `idx` is currently withheld from the rendered
-    /// output — the parent's preamble assistant block while MULTIPLE
-    /// subagents are in flight (issue #5). `flatten_with` and both header
-    /// line-accounting functions consult this so hit-rects stay aligned with
-    /// what's on screen.
-    fn is_withheld(&self, idx: usize) -> bool {
-        self.hidden_assistant_idx == Some(idx) && self.subagents_running >= 1
     }
 
     /// Mark the subagent block matching `id` as done. If no block exists
@@ -729,6 +591,10 @@ impl ChatView {
             *smry = sanitize_multiline(summary).into_owned();
             view.llm_round_started_at_ms = None;
             view.frozen_round_ms = None;
+            // A cancelled/failed child never emits its own LlmRoundEnd/Done:
+            // finalize its open Say here or the focused child view keeps
+            // showing raw markdown forever.
+            view.finalize_assistant();
             // Leftover child steer rows (steers queued while the child was
             // running but never claimed) would otherwise sit on the pending
             // panel forever — clear them with the block.

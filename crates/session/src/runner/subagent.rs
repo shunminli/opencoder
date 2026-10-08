@@ -2,10 +2,12 @@ use super::*;
 use tokio_util::sync::CancellationToken;
 
 /// Build the "Valid options" list for a subagent_type rejection error, gated
-/// by agent kind. Plan mode omits 'build' (it is read-only).
-pub(super) fn valid_subagent_options(plan: bool) -> String {
+/// by the same hide rule as the schema: plan mode omits 'build'
+/// (read-only), and so does an act session while the task-plan skill is
+/// active — the model is never told 'build' exists.
+pub(super) fn valid_subagent_options(hide_build: bool) -> String {
     let mut parts: Vec<&str> = vec!["'explore' (read-only)"];
-    if !plan {
+    if !hide_build {
         parts.push("'build' (full tools)");
     }
     match parts.len() {
@@ -41,12 +43,20 @@ pub(super) async fn run_subagent(
         .unwrap_or("explore")
         .to_string();
     let plan = parent.agent.kind == AgentKind::Plan;
+    let hide_build = crate::tools::hide_build_subagent(
+        parent.agent.kind,
+        parent.skill_prompt_cloned().as_deref(),
+    );
     // Plan mode may only spawn read-only subagents: 'explore' (filesystem).
     // 'build' stays rejected so the model is never told it exists.
     if plan && kind != "explore" {
-        return ToolOutput::err(format!(
-            "Unknown subagent_type '{kind}'. Valid options: {}",
-            valid_subagent_options(plan)
+        return ToolOutput::err(crate::bash_guard::plan_denial(
+            "task",
+            &format!(
+                "requested subagent_type '{kind}' can perform implementation writes; \
+                 the only valid option here is {}",
+                valid_subagent_options(hide_build)
+            ),
         ));
     }
     let agent = match resolve_agent(&kind) {
@@ -54,7 +64,7 @@ pub(super) async fn run_subagent(
         None => {
             return ToolOutput::err(format!(
                 "Unknown subagent_type '{kind}'. Valid options: {}",
-                valid_subagent_options(plan)
+                valid_subagent_options(hide_build)
             ));
         }
     };
@@ -117,10 +127,11 @@ pub(super) async fn run_subagent(
         // Seed the child session row so the FK on subagent_tasks resolves.
         let _ = store
             .create_session(&opencoder_store::SessionMeta {
+                kind: None,
                 id: child_session_id.clone(),
                 title: Some(prompt.chars().take(60).collect()),
                 agent: Some(kind.clone()),
-                model: Some(parent.config.model_id().to_string()),
+                model: Some(parent.config.model.clone()),
 
                 autopilot_mode: None,
                 workdir_hash: None,
@@ -134,8 +145,6 @@ pub(super) async fn run_subagent(
                 skill: None,
                 task_type: Some(opencoder_store::TASK_TYPE_SUBAGENT.to_string()),
                 requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
             })
             .await;
         // Mark the child session as already created so persist() doesn't

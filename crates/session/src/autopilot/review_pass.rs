@@ -1,19 +1,20 @@
 //! One-shot automatic review pass (`autopilot.mode = "review"`): after the
-//! initial task completes, switch to the plan agent, activate the review
-//! skill, inject a synthetic review prompt, run a single `run_loop`, then
-//! clear the skill and finish. Unlike [`crate::autopilot::drive`] there is no
-//! ACT/VERIFY loop — exactly one review turn, then control returns.
+//! initial task completes, activate the review skill, inject a synthetic
+//! review prompt, run a single `run_loop`, then clear the skill and finish.
+//! Unlike [`crate::autopilot::drive`] there is no ACT/VERIFY loop — exactly
+//! one review turn, then control returns.
 //!
-//! Act-only gate: the runner dispatch layer admits this pass only after the
-//! ACT agent completes the initial task (see `runner::run_with_registry`);
-//! plan-mode and other non-act primary sessions never dispatch it.
+//! The pass is read-only and agent-agnostic: the runner dispatch layer admits
+//! it for ANY primary agent (the reviewer stays on whatever agent ran the
+//! initial task — no switch, no fold). `review` is dispatched after a
+//! completed run regardless of whether that agent was `act` or `plan`.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
 use opencoder_core::{Message, ToolArc};
 
-use super::phases::{activate_review_skill, switch_agent};
+use super::phases::activate_review_skill;
 use super::prompts::review_prompt;
 use super::state::ApPhase;
 use crate::runner::{new_id, SessionEvent};
@@ -36,13 +37,13 @@ pub async fn review_pass(
 ) -> Result<()> {
     // Pre-flight cancel check, mirroring drive's loop-top guard: a cancel
     // tripped before the pass starts (e.g. during the initial task's final
-    // LLM call) must not burn a review turn or leave the session on the
-    // plan agent with a residual synthetic prompt. Zero pass side effects —
-    // no AutoPilot marker, no agent switch, no injected message — just the
-    // same terminal bookkeeping (skill clear + Done) drive's cancel path
-    // uses, so surfaces see a uniform end marker either way.
+    // LLM call) must not burn a review turn or leave the session with a
+    // residual synthetic prompt. Zero pass side effects — no AutoPilot
+    // marker, no injected message — just the same terminal bookkeeping
+    // (skill clear + Done) drive's cancel path uses, so surfaces see a
+    // uniform end marker either way.
     if super::is_cancelled(session) {
-        super::clear_injected_skill(session).await;
+        super::clear_injected_skill(session, on_event).await;
         on_event(SessionEvent::Done);
         return Ok(());
     }
@@ -50,8 +51,13 @@ pub async fn review_pass(
         phase: ApPhase::Review,
         iteration: REVIEW_ITERATION,
     });
-    switch_agent(session, "plan", on_event);
+    // No agent switch: the reviewer stays on whatever agent completed the
+    // initial task (review is read-only, so act and plan both qualify).
     activate_review_skill(session);
+    // The prompt's "do NOT run tests" directive is instructional, not an
+    // enforced sandbox: the reviewer stays on the task's original agent (act
+    // keeps bash), so the logic-only scope rests on this prompt plus the
+    // review skill contract, not on tool gating.
     let goal = super::extract_goal(session);
     let mut msg = Message::user(new_id(), review_prompt(&goal));
     msg.synthetic = true;
@@ -64,7 +70,7 @@ pub async fn review_pass(
     // drive() error path, which runs the same terminal bookkeeping before
     // propagating. A cancel mid-review surfaces via run_loop's own
     // interruption handling.
-    super::clear_injected_skill(session).await;
+    super::clear_injected_skill(session, on_event).await;
     on_event(SessionEvent::Done);
     run
 }

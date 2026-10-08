@@ -10,7 +10,8 @@ Run `opencoder` to enter the TUI:
 
 - **`Enter`** — submit the composer input
 - **`Tab`** — while running, submits a follow-up that is queued and injected at the next turn boundary (same as a normal submit when idle)
-- **`/plan <content>`** — compound submit: switch to plan mode with content attached, e.g. `/plan implement an LRU cache`
+- **`/sandbox <content>`** — compound submit: switch to the sandbox (read-only) agent with content attached, e.g. `/sandbox review the login module`
+- **`/act_clear_context <content>`** — collapse the context (the current agent stays unchanged) and run with the content in the fresh context; alias `/clear_context`
 - **`/task`** — open the session picker to switch/resume sessions
 
 ### Headless
@@ -34,9 +35,9 @@ opencoder --image screenshot.png "look at this screenshot"  # attach an image (v
 ### Remote and tmux
 
 ```bash
-# Remote: one machine runs the server, another connects with the client
-opencoder server --host 0.0.0.0 --port 8080
-opencoder client --remote http://127.0.0.1:8080 "summarize this repo's architecture"
+# Fleet: one machine runs the server, another connects an execution node
+opencoder-server --host 0.0.0.0 --port 8080 --token-file /secure/path/token
+opencoder-agent --remote http://SERVER:8080 --name worker-1 --token-file /secure/path/token
 
 # tmux: the session survives SSH disconnects and reattaches on reconnect
 opencoder ts          # create/resume a tmux session

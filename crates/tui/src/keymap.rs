@@ -1,6 +1,6 @@
 //! Keymap engine: parses key-spec strings (e.g. `"ctrl+h"`) into `KeyCombo`
 //! structs that can match `KeyEvent` values. Used by `key_handler.rs` and
-//! `app_helpers.rs` to drive all 19 re-bindable shortcuts from config.
+//! `app_helpers.rs` to drive all 17 re-bindable shortcuts from config.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use opencoder_core::{Config, KeymapConfig};
@@ -107,7 +107,7 @@ fn normalize(mods: KeyModifiers, code: KeyCode) -> (KeyModifiers, KeyCode) {
     }
 }
 
-/// Parse a key-spec string like `"ctrl+h"`, `"alt+tab"`, `"ctrl+shift+tab"`
+/// Parse a key-spec string like `"ctrl+h"`, `"alt+tab"`, `"ctrl+t"`
 /// into a `KeyCombo`. Returns `None` on unparseable input.
 pub(crate) fn parse_key_spec(spec: &str) -> Option<KeyCombo> {
     let spec = spec.trim().to_lowercase();
@@ -245,7 +245,7 @@ pub(crate) fn key_event_to_spec(k: KeyEvent) -> Option<String> {
     Some(parts.join("+"))
 }
 
-/// All 19 parsed key bindings, ready for O(1) matching in the event loop.
+/// All parsed key bindings, ready for O(1) matching in the event loop.
 pub(crate) struct KeyBindings {
     pub help: KeyCombo,
     pub quit: KeyCombo,
@@ -261,8 +261,6 @@ pub(crate) struct KeyBindings {
     pub redo: KeyCombo,
     pub forward_word: KeyCombo,
     pub backward_word: KeyCombo,
-    pub switch_mode_clear: KeyCombo,
-    pub switch_mode_keep: KeyCombo,
     pub collapse_blocks: KeyCombo,
     pub force_redraw: KeyCombo,
     pub copy_mode: KeyCombo,
@@ -289,8 +287,6 @@ impl KeyBindings {
             redo: parse_or_default(&km.redo, &d.redo),
             forward_word: parse_or_default(&km.forward_word, &d.forward_word),
             backward_word: parse_or_default(&km.backward_word, &d.backward_word),
-            switch_mode_clear: parse_or_default(&km.switch_mode_clear, &d.switch_mode_clear),
-            switch_mode_keep: parse_or_default(&km.switch_mode_keep, &d.switch_mode_keep),
             collapse_blocks: parse_or_default(&km.collapse_blocks, &d.collapse_blocks),
             force_redraw: parse_or_default(&km.force_redraw, &d.force_redraw),
             copy_mode: parse_or_default(&km.copy_mode, &d.copy_mode),

@@ -1,0 +1,281 @@
+// main.jsx — app shell: antd Layout with brand Header + connection badge,
+// left Sider (category Segmented on top, then the page Menu scoped to the
+// active category), Content switching per page, and the login gate. The
+// whole navigation derives from nav.js NAV_CATEGORIES; the active category
+// is derived from `page` itself, so there is no second navigation state to
+// keep in sync (mobile renders the same two levels as Segmented + Select).
+// The last explicitly chosen page is mirrored to localStorage through the
+// usehooks-ts `useLocalStorage` hook (nav.js NAV_STORAGE_KEY) and restored
+// pre-paint on mount, so 项目 / Agent / 节点 selections survive a reload.
+// Visual identity lives in theme.js (antd ThemeConfig) + app.css --oc-*;
+// no component here carries an inline color.
+//
+// The shell is wrapped in antd <App> so context-held message/notification/
+// modal APIs see the theme and the zh-CN locale; panels reach it through
+// ui/appMessage.js useMessage() (which falls back to the static API when a
+// DOM test mounts one standalone). component={false} keeps it a Fragment:
+// no extra .ant-app div between #root and .fleet-root, so the 100vh flex
+// chain and every existing landmark query stay byte-identical.
+
+import { Alert, App as AntdApp, Badge, Button, ConfigProvider, Layout, Menu, Select, Tooltip, Typography } from 'antd';
+import { MenuFoldOutlined, MenuUnfoldOutlined } from '@ant-design/icons';
+import zhCN from 'antd/locale/zh_CN';
+import dayjs from 'dayjs';
+import { useCallback, useEffect, useLayoutEffect, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import 'dayjs/locale/zh-cn';
+import { useLocalStorage } from 'usehooks-ts';
+import { apiGet } from './api.js';
+import { LoginModal } from './login.jsx';
+import './app.css';
+import {
+  ALL_PAGES,
+  allowedPages,
+  categoryHome,
+  menuItemsOf,
+  NAV_STORAGE_KEY,
+  selectItemsOf,
+  visibleCategories,
+} from './nav.js';
+import { PANELS } from './shell/panels.jsx';
+import { CategoryTabs } from './shell/categoryTabs.jsx';
+import { clearCredentials, setState, setIdentity, useStore } from './store.js';
+import { UsersDrawer } from './admin/usersDrawer.jsx';
+import { normalizeNotice } from './notice.js';
+import { theme } from './theme.js';
+import { bootUrlCredential } from './boot.js';
+
+// zh-CN everywhere: antd built-ins (Modal/Popconfirm buttons) + dayjs
+// relative dates (fromNow lands in iteration 3).
+dayjs.locale('zh-cn');
+
+const { Header, Sider, Content } = Layout;
+const { Text } = Typography;
+
+const CONN_BADGE = {
+  ok: { status: 'success', text: '已连接' },
+  fail: { status: 'error', text: '连接断开' },
+  init: { status: 'default', text: '未连接' },
+};
+
+function ConnectionBadge() {
+  const { conn } = useStore();
+  const b = CONN_BADGE[conn] || CONN_BADGE.init;
+  return <Badge status={b.status} text={b.text} />;
+}
+
+/// Server base readout for the Header. Empty base = same-origin requests,
+/// which is the default embedded deployment; spell that out instead of an
+/// awkward blank chip.
+function ServerBase() {
+  const { base } = useStore();
+  const sameOrigin = !base;
+  return (
+    <Tooltip title={sameOrigin ? '使用同源请求（未配置外部地址）' : 'API 请求指向该地址'}>
+      <Text type="secondary" style={{ fontSize: 12 }}>{sameOrigin ? '同源' : base}</Text>
+    </Tooltip>
+  );
+}
+
+/// identity.role → 中文标签（GET /api/me 的词表：admin/root/user）。
+const ROLE_LABELS = { admin: '管理员', root: 'Root', user: '普通用户' };
+
+/// Authenticated identity readout for the Header: 「name · 角色」; nothing
+/// before the login probe resolves an identity.
+function IdentityBadge() {
+  const { identity } = useStore();
+  if (!identity?.name) {
+    return null;
+  }
+  return <Text type="secondary" style={{ fontSize: 12 }}>{identity.name} · {ROLE_LABELS[identity.role] || identity.role}</Text>;
+}
+
+function PageBody({ page, onNotice }) {
+  const Panel = PANELS[page] || PANELS.chat;
+  return <Panel onNotice={onNotice} />;
+}
+
+/// Pages whose panels render bare flex surfaces (no Card of their own).
+/// They get a white sheet (.fleet-sheet) docked to the viewport bottom:
+/// Content drops its own bottom padding (fleet-content--flush) and the sheet
+/// squares off its bottom corners, so the panel reads as flush with the
+/// screen edge. Card-bearing pages float their own white surfaces directly
+/// inside the padded pane.
+const SHEET_PAGES = new Set(['chat']);
+
+function App() {
+  const { token, page, identity } = useStore();
+  // 项目 / Agent / 节点 分类选择的持久化：显式导航（goPage）经 usehooks-ts 的
+  // useLocalStorage 把所选页写入 `oc_nav_page`（键与校验集都在 nav.js）；重新
+  // 挂载时在首帧绘制前恢复进 store——useLayoutEffect 先于绘制执行，默认页不
+  // 闪现。brain_run 深链优先于存储值；ALL_PAGES 之外的陌生/损坏值一律忽略。
+  // localStorage 的读写全部在 hook 库内完成，本文件不自管 getItem/setItem。
+  const [storedPage, setStoredPage] = useLocalStorage(NAV_STORAGE_KEY, null);
+  useLayoutEffect(() => {
+    const deepLink = new URLSearchParams(window.location.search).has('brain_run');
+    if (!deepLink && ALL_PAGES.includes(storedPage) && storedPage !== page) {
+      setState({ page: storedPage });
+    }
+    // 引导只做一次：后续 page 变化由 goPage 单向镜像，恢复不回环。
+  }, []);
+  const [navCollapsed, setNavCollapsed] = useState(false);
+  // Panel→shell notices carry {type, text} (notice.js); normalizeNotice
+  // keeps legacy bare-string call sites safe. Empty text (the onNotice('')
+  // clear convention) renders nothing.
+  const [notice, setNotice] = useState(null);
+  // 后台管理抽屉（平台用户），仅 admin 身份可见入口。
+  const [usersOpen, setUsersOpen] = useState(false);
+  const [identityError, setIdentityError] = useState('');
+  const [identityRevision, setIdentityRevision] = useState(0);
+  // Stable identity: panels key useCallback/useEffect deps on onNotice — a
+  // fresh inline arrow per render would re-arm their load effects forever.
+  const notify = useCallback((v) => setNotice(normalizeNotice(v)), []);
+  // Permission-scoped IA (nav.js): non-admin identities only ever see the
+  // Agent category's 全部执行 page; a stored page outside the allowed set
+  // renders the topics panel instead (highlight never dangles).
+  const visible = visibleCategories(identity);
+  const allowed = allowedPages(identity);
+  const shownPage = allowed.includes(page) ? page : 'topics';
+  const category = visible.find((c) => c.items.some((i) => i.page === shownPage)) || visible[0];
+  const categoryOptions = visible.map((c) => ({ value: c.key, label: c.label }));
+
+  // Explicit navigation (Sider Segmented/Menu, mobile Segmented/Select) is
+  // the single writer of the persisted selection; programmatic jumps keep
+  // the store-only semantics they already had.
+  const goPage = (key) => {
+    setStoredPage(key);
+    setState({ page: key });
+  };
+
+  // Refresh / link-login sessions start with a stored token but no identity
+  // (the store never persists /api/me): probe once per token so the badge,
+  // admin entries, and role-scoped nav survive a reload without re-login.
+  // A 401 clears the credential via api.js (login modal reopens); other
+  // failures keep the shell and surface through the connection badge.
+  useEffect(() => {
+    if (!token) {
+      return undefined;
+    }
+    let live = true;
+    setIdentityError('');
+    apiGet('/api/me')
+      .then((me) => {
+        if (live) {
+          if (typeof me?.name !== 'string' || !me.name || !['admin', 'root', 'user'].includes(me.role)) throw new Error('登录身份响应格式错误，请重试');
+          setIdentityError('');
+          setIdentity(me);
+        }
+      })
+      .catch((failure) => { if (live) setIdentityError(failure.message); });
+    return () => {
+      live = false;
+    };
+  }, [token, identityRevision]);
+
+  return (
+    <ConfigProvider theme={theme} locale={zhCN}>
+      <AntdApp component={false}>
+      <div className="fleet-root">
+        <Layout className="fleet-layout">
+          <Header className="fleet-header">
+            <span className="fleet-brand">⛵ Opencoder Fleet</span>
+            <div className="fleet-header-side">
+              <ConnectionBadge />
+              <ServerBase />
+              <IdentityBadge />
+              {identity?.role === 'admin' ? (
+                <Button size="small" onClick={() => setUsersOpen(true)}>后台管理</Button>
+              ) : null}
+              <Button size="small" type="text" onClick={clearCredentials}>退出</Button>
+            </div>
+          </Header>
+          <Layout style={{ minHeight: 0 }}>
+            {identity && <Sider
+              className="fleet-sidebar"
+              width={200}
+              collapsedWidth={64}
+              collapsible
+              collapsed={navCollapsed}
+              onCollapse={setNavCollapsed}
+              trigger={null}
+              theme="light"
+            >
+              <div className="fleet-nav-category" aria-hidden={navCollapsed}>
+                <CategoryTabs
+                  value={category.key}
+                  options={categoryOptions}
+                  onChange={(v) => goPage(categoryHome(v))}
+                />
+              </div>
+              <Menu
+                id="fleet-page-menu"
+                mode="inline"
+                theme="light"
+                selectedKeys={[shownPage]}
+                items={menuItemsOf(category.items)}
+                onClick={({ key }) => goPage(key)}
+                style={{ borderRight: 0 }}
+              />
+              <Button
+                className="fleet-nav-toggle"
+                type="text"
+                icon={navCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+                aria-label={navCollapsed ? '展开菜单' : '收起菜单'}
+                aria-expanded={!navCollapsed}
+                aria-controls="fleet-page-menu"
+                title={navCollapsed ? '展开菜单' : '收起菜单'}
+                onClick={() => setNavCollapsed((value) => !value)}
+              >
+                {navCollapsed ? null : '收起菜单'}
+              </Button>
+            </Sider>}
+            <Content className={SHEET_PAGES.has(shownPage) ? 'fleet-content fleet-content--flush' : 'fleet-content'}>
+              {identity && <CategoryTabs
+                className="fleet-mobile-nav"
+                value={category.key}
+                options={categoryOptions}
+                onChange={(v) => goPage(categoryHome(v))}
+              />}
+              {identity && <Select
+                className="fleet-mobile-nav"
+                aria-label="页面导航"
+                value={shownPage}
+                options={selectItemsOf(category.items)}
+                onChange={goPage}
+              />}
+              {notice && notice.text ? (
+                <Alert
+                  className="fleet-notice"
+                  type={notice.type}
+                  showIcon
+                  closable={{ 'aria-label': '关闭' }}
+                  title={notice.text}
+                  onClose={() => setNotice(null)}
+                />
+              ) : null}
+              {token && !identity && <Alert type={identityError ? 'error' : 'info'} showIcon title={identityError ? `身份确认失败：${identityError}` : '正在确认登录身份…'}
+                action={identityError ? <Button onClick={() => { setIdentityError(''); setIdentityRevision((value) => value + 1); }}>重试身份确认</Button> : null} />}
+              {token && identity ? (
+                <div className={SHEET_PAGES.has(shownPage) ? 'fleet-sheet' : undefined}>
+                  <PageBody page={shownPage} onNotice={notify} />
+                </div>
+              ) : null}
+            </Content>
+          </Layout>
+        </Layout>
+        <LoginModal open={!token} onConnected={() => setNotice(null)} />
+        <UsersDrawer open={usersOpen} onClose={() => setUsersOpen(false)} onNotice={notify} />
+      </div>
+      </AntdApp>
+    </ConfigProvider>
+  );
+}
+
+export default App;
+
+// Link login bootstraps BEFORE mount (see boot.js — stale-token 401 race).
+bootUrlCredential();
+
+// Mount the app — without this the shell serves an empty #root in every
+// browser (caught by real-browser acceptance, guarded by an html.rs test).
+createRoot(document.getElementById('root')).render(<App />);

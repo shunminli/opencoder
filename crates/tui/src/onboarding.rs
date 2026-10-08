@@ -15,7 +15,7 @@ use opencoder_llm::ChatClient;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use crate::input::spawn_input_pump;
 use crate::model_menu::{handle_model_key, ModelMenu, ModelOutcome, ProviderForm};
@@ -74,14 +74,7 @@ pub(crate) fn build_ready_client(config: &Config) -> Result<ChatClient, StartupF
             .with_context(|| format!("invalid value for header `{name}`"))
             .map_err(StartupFailure::Unbuildable)?;
     }
-    ChatClient::new_with_read_timeout(
-        &ep.base_url,
-        &ep.api_key,
-        &ep.headers,
-        config.stream_idle_timeout(),
-        config.network.proxy.as_deref(),
-    )
-    .map_err(StartupFailure::Unbuildable)
+    ChatClient::from_config(config, &ep).map_err(StartupFailure::Unbuildable)
 }
 
 /// Fallback `ChatStream` used when the model client is unbuildable but the
@@ -168,6 +161,16 @@ pub(crate) async fn run(
     .await;
 
     active.store(false, Ordering::Relaxed);
+    // Quit-path quiesce for the wizard's own exit: without this, the release
+    // report of the quitting keypress (Esc / Ctrl+D) strands in the tty input
+    // queue and the shell echoes it as `0;5:3u`-style garbage — same failure
+    // the app loop guards against with its post-loop `drain_shutdown`. The
+    // `Ready` arm needs no absorb: it hands the live terminal to `run_app`,
+    // whose own pump keeps draining the tty. Only `Exit` (and the pump-gone
+    // `Exit`) leaves the tty unowned, so quiesce exactly those paths.
+    if matches!(result, Ok(OnboardingOutcome::Exit)) {
+        crate::input::drain_shutdown(&mut input_rx).await;
+    }
     drop(input_rx);
     result
 }
@@ -219,7 +222,8 @@ fn render(frame: &mut ratatui::Frame, form: &ProviderForm) {
             Line::raw(format!(" Settings will be saved to {path}")),
             Line::raw(" Fill provider/model/base URL/API key, then select [Save]."),
             Line::raw(" API key accepts a literal secret or an ENV_VAR name. Esc/Ctrl-D exits."),
-        ]),
+        ])
+        .wrap(Wrap { trim: false }),
         header,
     );
     crate::model_menu::render_model_popup(
@@ -241,6 +245,7 @@ mod tests {
         providers.insert(
             "demo".into(),
             ProviderConfig {
+                protocol: "chat_completions".into(),
                 base_url: "https://example.com/v1".into(),
                 api_key: Some("sk-onboarding-secret-1234".into()),
                 model: Some("model-x".into()),
@@ -340,6 +345,7 @@ mod tests {
             reason: "invalid proxy '::not a proxy::'".into(),
         };
         let request = ChatRequest {
+            purpose: opencoder_llm::RequestPurpose::Conversation,
             model: "demo/model-x".into(),
             messages: Vec::new(),
             tools: Vec::new(),
@@ -471,7 +477,33 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(text.contains("configure your first model"));
-        assert!(text.contains(".opencoder/config.json"));
+        assert!(text.contains(&format!(
+            ".opencoder{}config.json",
+            std::path::MAIN_SEPARATOR
+        )));
+        assert!(!text.contains("sk-onboarding-secret-1234"));
+    }
+
+    #[test]
+    fn onboarding_wraps_long_config_path_without_losing_filename() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let home = std::path::PathBuf::from(format!("/{}", "long-home-".repeat(7)));
+        let _isolation = scoped_config_home(home);
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        let form = ProviderForm::new_onboarding(&ready_config());
+        terminal.draw(|frame| render(frame, &form)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains(&format!(
+            ".opencoder{}config.json",
+            std::path::MAIN_SEPARATOR
+        )));
         assert!(!text.contains("sk-onboarding-secret-1234"));
     }
 }

@@ -61,17 +61,19 @@ fn isolated_home() -> Option<PathBuf> {
 }
 
 /// Resolve the home dir for config discovery: the thread-local override when a
-/// test set it, otherwise the real `dirs::home_dir()`.
+/// test set it, otherwise the real `crate::platform::home_dir()`.
 fn config_home_dir() -> Option<PathBuf> {
-    isolated_home().or_else(dirs::home_dir)
+    isolated_home().or_else(crate::platform::home_dir)
 }
 
 /// The binary's own config home (`~/.opencoder`): the directory that owns
 /// [`primary_global_config_path`] *and* the domain config files
 /// (`mcp.json` / `cli.json` / `skills.json`). Kept here so domain-file
 /// discovery shares the exact home resolution (and therefore the
-/// [`scoped_config_home`] test override) of `config.json`.
-pub(super) fn global_opencode_home() -> Option<PathBuf> {
+/// [`scoped_config_home`] test override) of `config.json`. `pub(crate)` so
+/// sibling modules outside `config` (e.g. `agent::meta`'s agents root) share
+/// the exact same home resolution instead of re-deriving it.
+pub(crate) fn global_opencoder_home() -> Option<PathBuf> {
     config_home_dir().map(|home| home.join(".opencoder"))
 }
 
@@ -81,20 +83,20 @@ pub(super) fn global_opencode_home() -> Option<PathBuf> {
 /// [`scoped_config_home`] therefore isolates both discovery and first-run
 /// creation without mutating process-wide environment variables.
 pub(super) fn primary_global_config_path() -> Option<PathBuf> {
-    global_opencode_home().map(|home| home.join("config.json"))
+    global_opencoder_home().map(|home| home.join("config.json"))
 }
 
 /// Resolve the XDG config dir: the thread-local override when a test set it
 /// (mirrors the tests that pointed both `HOME` and `XDG_CONFIG_HOME` at one
-/// tempdir), otherwise the real `dirs::config_dir()`.
+/// tempdir), otherwise the real `crate::platform::config_dir()`.
 fn config_xdg_dir() -> Option<PathBuf> {
-    isolated_home().or_else(dirs::config_dir)
+    isolated_home().or_else(crate::platform::config_dir)
 }
 
 /// Read an env var, *unless* a test isolation override is active on this
 /// thread — in which case return `None` so host env never contaminates the
 /// isolated config under test.
-pub(super) fn env_get(name: &str) -> Option<String> {
+pub(crate) fn env_get(name: &str) -> Option<String> {
     if isolated_home().is_some() {
         None
     } else {
@@ -102,34 +104,37 @@ pub(super) fn env_get(name: &str) -> Option<String> {
     }
 }
 
+/// Candidate chain: project files first, then `~/.opencoder/`, then XDG.
 pub(super) fn config_candidates(working_dir: &Path) -> Vec<PathBuf> {
-    config_candidates_with(working_dir, super::envs::active_env().as_deref())
+    candidates_with_home(working_dir, None)
 }
 
-/// Candidate chain with an explicit env layer override. `Some(name)` inserts
-/// `~/.opencoder/envs/<name>/config.json` between the project files and the
-/// global home (project > env > ~/.opencoder > XDG); `None` is the base chain
-/// — also what env capture snapshots run against, avoiding self-reference.
-pub(super) fn config_candidates_with(working_dir: &Path, active: Option<&str>) -> Vec<PathBuf> {
+/// [`config_candidates`] with the global home explicitly redirected: the
+/// `~/.opencoder` (and XDG fallback) entries resolve inside `home` instead
+/// of the real user home. Project candidates still resolve against
+/// `working_dir`. The explicit override wins over the thread-local test
+/// isolation, so production callers stay deterministic. Operator execution
+/// isolation (`Config::load_with_home`) uses this to pin a session's global
+/// config view to its frozen snapshot.
+pub(super) fn candidates_with_home(
+    working_dir: &Path,
+    home_override: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut v = vec![
         working_dir.join(".opencoder").join("config.json"),
         working_dir.join("opencoder.json"),
     ];
-    if let (Some(home), Some(name)) = (config_home_dir(), active) {
-        v.push(
-            home.join(".opencoder")
-                .join("envs")
-                .join(name)
-                .join("config.json"),
-        );
-    }
-    if let Some(home) = config_home_dir() {
+    let home = home_override
+        .map(Path::to_path_buf)
+        .or_else(config_home_dir);
+    if let Some(home) = home {
         // ~/.opencoder/ (this binary's own config home) — highest-priority global,
         // so `opencoder` runs directly from any directory with no project config.
         v.push(home.join(".opencoder").join("config.json"));
         v.push(home.join(".opencoder").join("opencoder.json"));
     }
-    if let Some(cfg) = config_xdg_dir() {
+    let xdg = home_override.map(Path::to_path_buf).or_else(config_xdg_dir);
+    if let Some(cfg) = xdg {
         v.push(cfg.join("opencoder").join("config.json"));
     }
     v
@@ -148,6 +153,11 @@ pub(super) fn apply_env(cfg: &mut Config) {
     if let Some(m) = env_get("OPENCODER_SMALL_MODEL") {
         if !m.is_empty() {
             cfg.small_model = Some(m);
+        }
+    }
+    if let Some(m) = env_get("OPENCODER_EMBEDDING_MODEL") {
+        if !m.is_empty() {
+            cfg.embedding_model = Some(m);
         }
     }
     if let Some(b) = env_get("OPENAI_BASE_URL") {
@@ -188,6 +198,34 @@ pub(super) fn apply_env(cfg: &mut Config) {
             _ => {}
         }
     }
+    // opencoder-team overlay: workspace root + turn budgets. Same strictness
+    // as OPENCODER_CONTEXT_LIMIT — a non-numeric turn budget is warned about
+    // rather than silently coerced.
+    if let Some(v) = env_get("OPENCODER_TEAM_ROOT") {
+        if !v.is_empty() {
+            cfg.team_root = PathBuf::from(v);
+        }
+    }
+    if let Some(v) = env_get("OPENCODER_TEAM_MAX_TURNS") {
+        match parse_plain_usize(&v) {
+            Some(n) => cfg.team_max_turns = n,
+            None if !v.is_empty() => tracing::warn!(
+                value = %v,
+                "invalid OPENCODER_TEAM_MAX_TURNS (expected a plain usize, e.g. `8`); ignoring"
+            ),
+            None => {}
+        }
+    }
+    if let Some(v) = env_get("OPENCODER_TEAM_MAX_SUB_TURNS") {
+        match parse_plain_usize(&v) {
+            Some(n) => cfg.team_max_sub_turns = n,
+            None if !v.is_empty() => tracing::warn!(
+                value = %v,
+                "invalid OPENCODER_TEAM_MAX_SUB_TURNS (expected a plain usize, e.g. `3`); ignoring"
+            ),
+            None => {}
+        }
+    }
     // Proxy overlay: explicit OPENCODER_PROXY wins, then ALL_PROXY. Only set
     // when the user has not already configured `network.proxy` directly.
     if cfg.network.proxy.is_none() {
@@ -221,9 +259,16 @@ pub(super) fn parse_context_limit(raw: &str) -> Option<u64> {
     raw.parse::<u64>().ok()
 }
 
+/// Parse an `OPENCODER_TEAM_MAX_TURNS` / `OPENCODER_TEAM_MAX_SUB_TURNS`
+/// value: a plain `usize` literal with the same strictness (no trimming,
+/// no sign, no exponents) as [`parse_context_limit`]. Pure.
+pub(super) fn parse_plain_usize(raw: &str) -> Option<usize> {
+    raw.parse::<usize>().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_context_limit;
+    use super::{parse_context_limit, parse_plain_usize};
 
     #[test]
     fn parse_context_limit_accepts_plain_u64() {
@@ -257,5 +302,21 @@ mod tests {
             None,
             "u64 overflow"
         );
+    }
+
+    #[test]
+    fn parse_plain_usize_accepts_and_rejects_like_context_limit() {
+        assert_eq!(parse_plain_usize("8"), Some(8));
+        assert_eq!(parse_plain_usize("0"), Some(0));
+        assert_eq!(
+            parse_plain_usize("18446744073709551615"),
+            Some(usize::MAX),
+            "usize::MAX literal is still a plain usize"
+        );
+        assert_eq!(parse_plain_usize("abc"), None, "non-numeric");
+        assert_eq!(parse_plain_usize(""), None, "empty is not a number");
+        assert_eq!(parse_plain_usize("-1"), None, "negative");
+        assert_eq!(parse_plain_usize(" 8"), None, "leading space: no trimming");
+        assert_eq!(parse_plain_usize("8 "), None, "trailing space: no trimming");
     }
 }

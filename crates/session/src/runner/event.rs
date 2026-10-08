@@ -18,6 +18,8 @@ pub enum SessionEvent {
     /// The current provider/model round finished, including every tool call
     /// requested by its assistant message.
     LlmRoundEnd,
+    /// Discard only the current uncommitted attempt before a stream retry.
+    LlmAttemptReset,
     /// Real token usage of one completed provider round, emitted right after
     /// the assistant message (with its `usage`) is persisted. Carries the
     /// provider-reported `total_tokens` (input+output, incl. cache) so display
@@ -87,22 +89,50 @@ pub enum SessionEvent {
         id: String,
         ev: Box<SessionEvent>,
     },
+    /// A sidecar loop answered its first question: the temporary observer
+    /// session (`sidecar-<ulid>`) was created from a snapshot of the main
+    /// session's context and the question was handed to it. Display-only
+    /// lifecycle frame — never persisted (see [`SessionEvent::is_sidecar_frame`]).
+    SidecarStart {
+        id: String,
+        question: String,
+    },
+    /// A content frame from a running sidecar, tagged with the sidecar id so
+    /// the TUI can route it into the sidecar's foldable view. Like
+    /// `SubagentChild`, but the payload is **never** persisted: sidecar
+    /// content stays in memory, and its token cost reaches the durable layer
+    /// through the bare forwarded `LlmUsage` instead.
+    SidecarChild {
+        id: String,
+        ev: Box<SessionEvent>,
+    },
+    /// One sidecar question finished. `rounds` is the number of LLM rounds
+    /// the sidecar ran for this question and `total_tokens` the usage it
+    /// consumed (already accounted to the main task via the bare forwarded
+    /// `LlmUsage` frames). `answer` is the final assistant text (empty on
+    /// failure). Display-only — never persisted.
+    SidecarTurn {
+        id: String,
+        ok: bool,
+        answer: String,
+        elapsed_ms: u64,
+        total_tokens: u64,
+        rounds: usize,
+    },
     /// Emitted after compaction rewrites the transcript. Carries the new
     /// message list so display surfaces can rebuild their view.
     TranscriptReset(Vec<Message>),
-    /// Emitted after plan→act handoff. Carries the plan text (markdown) for the
-    /// display layer to render as a read-only card. Paired with a preceding
-    /// TranscriptReset that rebuilds the clean view.
-    PlanHandoff(String),
     /// A queued follow-up was consumed (drained) at an idle boundary. Carries
     /// the consumed input's row seq so the TUI can drop it from its pending
     /// mirror instead of leaving a stale `[queued]` row until `Done`.
     QueueConsumed {
         seq: i64,
-        /// The consumed prompt text so display surfaces can echo it at the
+        /// The model-facing echo text so display surfaces can echo it at the
         /// exact activation instant — without this, stateless clients (web /
         /// CLI) cannot show the text until the turn finishes and `/messages`
-        /// is re-fetched. Defaults to empty for old persisted events.
+        /// is re-fetched. Carries only what entered context: a compound
+        /// control command's tail; a bare command echoes nothing (empty
+        /// text). Defaults to empty for old persisted events.
         #[serde(default)]
         text: String,
     },
@@ -111,7 +141,8 @@ pub enum SessionEvent {
     /// mirror instead of leaving a stale `steer` row until `Done`.
     SteerConsumed {
         seq: i64,
-        /// The promoted steer prompt text, same rationale as `QueueConsumed`.
+        /// The promoted steer prompt's model-facing echo text, same rationale
+        /// as `QueueConsumed` (compound tail only; bare commands stay empty).
         #[serde(default)]
         text: String,
     },
@@ -134,6 +165,7 @@ impl SessionEvent {
         match self {
             SessionEvent::LlmRoundStart { .. } => "llm_round_start",
             SessionEvent::LlmRoundEnd => "llm_round_end",
+            SessionEvent::LlmAttemptReset => "llm_attempt_reset",
             SessionEvent::LlmUsage { .. } => "llm_usage",
             SessionEvent::TextDelta(_) => "text_delta",
             SessionEvent::ReasoningDelta(_) => "reasoning_delta",
@@ -149,8 +181,10 @@ impl SessionEvent {
             SessionEvent::SubagentStart { .. } => "subagent_start",
             SessionEvent::SubagentEnd { .. } => "subagent_end",
             SessionEvent::SubagentChild { .. } => "subagent_child",
+            SessionEvent::SidecarStart { .. } => "sidecar_start",
+            SessionEvent::SidecarChild { .. } => "sidecar_child",
+            SessionEvent::SidecarTurn { .. } => "sidecar_turn",
             SessionEvent::AutoPilot { .. } => "autopilot",
-            SessionEvent::PlanHandoff(_) => "plan_handoff",
             SessionEvent::TranscriptReset(_) => "transcript_reset",
             SessionEvent::QueueConsumed { .. } => "queue_consumed",
             SessionEvent::SteerConsumed { .. } => "steer_consumed",
@@ -165,7 +199,7 @@ impl SessionEvent {
             SessionEvent::LlmRoundStart { started_at_ms } => {
                 serde_json::json!({ "started_at_ms": started_at_ms })
             }
-            SessionEvent::LlmRoundEnd => serde_json::json!({}),
+            SessionEvent::LlmRoundEnd | SessionEvent::LlmAttemptReset => serde_json::json!({}),
             SessionEvent::LlmUsage {
                 total_tokens,
                 input_tokens,
@@ -215,10 +249,26 @@ impl SessionEvent {
             SessionEvent::SubagentChild { id, ev } => {
                 serde_json::json!({ "id": id, "event": ev })
             }
+            SessionEvent::SidecarStart { id, question } => {
+                serde_json::json!({ "id": id, "question": question })
+            }
+            SessionEvent::SidecarChild { id, ev } => {
+                serde_json::json!({ "id": id, "event": ev })
+            }
+            SessionEvent::SidecarTurn {
+                id,
+                ok,
+                answer,
+                elapsed_ms,
+                total_tokens,
+                rounds,
+            } => serde_json::json!({
+                "id": id, "ok": ok, "answer": answer, "elapsed_ms": elapsed_ms,
+                "total_tokens": total_tokens, "rounds": rounds
+            }),
             SessionEvent::AutoPilot { phase, iteration } => {
                 serde_json::json!({ "phase": phase, "iteration": iteration })
             }
-            SessionEvent::PlanHandoff(plan) => serde_json::json!({ "plan": plan }),
             SessionEvent::TranscriptReset(_) => serde_json::json!({}),
             SessionEvent::QueueConsumed { seq, text } => {
                 serde_json::json!({ "seq": seq, "text": text })
@@ -231,7 +281,7 @@ impl SessionEvent {
 
     /// Reconstruct a `SessionEvent` from an SSE event-name (`sse_kind`) and its
     /// payload (`sse_data`). This is the inverse of `sse_kind()` + `sse_data()`,
-    /// letting a remote client (`opencode client`) rebuild the structured event
+    /// letting a remote client (`opencoder client`) rebuild the structured event
     /// stream from a server's `/events` SSE wire format.
     ///
     /// Returns `None` for an unrecognized `kind`. `TranscriptReset` carries no
@@ -245,6 +295,7 @@ impl SessionEvent {
                 started_at_ms: data.get("started_at_ms")?.as_i64()?,
             },
             "llm_round_end" => SessionEvent::LlmRoundEnd,
+            "llm_attempt_reset" => SessionEvent::LlmAttemptReset,
             "llm_usage" => SessionEvent::LlmUsage {
                 total_tokens: data.get("total_tokens")?.as_u64()?,
                 // Old payloads carry only total_tokens; the split defaults to 0.
@@ -302,7 +353,25 @@ impl SessionEvent {
                     ev: Box::new(ev),
                 }
             }
-            "plan_handoff" => SessionEvent::PlanHandoff(data.get("plan")?.as_str()?.to_string()),
+            "sidecar_start" => SessionEvent::SidecarStart {
+                id: data.get("id")?.as_str()?.to_string(),
+                question: data.get("question")?.as_str()?.to_string(),
+            },
+            "sidecar_child" => {
+                let ev: SessionEvent = serde_json::from_value(data.get("event")?.clone()).ok()?;
+                SessionEvent::SidecarChild {
+                    id: data.get("id")?.as_str()?.to_string(),
+                    ev: Box::new(ev),
+                }
+            }
+            "sidecar_turn" => SessionEvent::SidecarTurn {
+                id: data.get("id")?.as_str()?.to_string(),
+                ok: data.get("ok")?.as_bool().unwrap_or(false),
+                answer: data.get("answer")?.as_str()?.to_string(),
+                elapsed_ms: data.get("elapsed_ms")?.as_u64().unwrap_or(0),
+                total_tokens: data.get("total_tokens")?.as_u64().unwrap_or(0),
+                rounds: data.get("rounds").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            },
             "transcript_reset" => {
                 // Wire payload is `{}`; the rebuilt message list is intentionally
                 // empty (see method doc). Callers re-fetch /messages if needed.
@@ -338,7 +407,8 @@ impl SessionEvent {
     /// Coarse [`EventKind`] for backward-compatible DB `type` column.
     pub fn coarse_kind(&self) -> EventKind {
         match self {
-            SessionEvent::LlmRoundStart { .. }
+            SessionEvent::LlmAttemptReset
+            | SessionEvent::LlmRoundStart { .. }
             | SessionEvent::LlmRoundEnd
             | SessionEvent::LlmUsage { .. } => EventKind::Step,
             SessionEvent::TextDelta(_) => EventKind::TextDelta,
@@ -355,12 +425,29 @@ impl SessionEvent {
             SessionEvent::SubagentStart { .. }
             | SessionEvent::SubagentEnd { .. }
             | SessionEvent::SubagentChild { .. }
-            | SessionEvent::PlanHandoff(_)
+            | SessionEvent::SidecarStart { .. }
+            | SessionEvent::SidecarChild { .. }
+            | SessionEvent::SidecarTurn { .. }
             | SessionEvent::AutoPilot { .. }
             | SessionEvent::QueueConsumed { .. }
             | SessionEvent::SteerConsumed { .. } => EventKind::Step,
             SessionEvent::TranscriptReset(_) => EventKind::Compaction,
         }
+    }
+
+    /// Sidecar content frames: display-only, **never persisted**. The
+    /// persistence gate (`EventSink::push`) drops them at the door, while
+    /// each sidecar LLM round is still accounted to the main task through
+    /// the bare forwarded `LlmUsage` event. Keeping this predicate in one
+    /// place lets every future persistence surface (session sink, TUI
+    /// mirror) derive the same rule instead of re-deriving it per site.
+    pub fn is_sidecar_frame(&self) -> bool {
+        matches!(
+            self,
+            SessionEvent::SidecarStart { .. }
+                | SessionEvent::SidecarChild { .. }
+                | SessionEvent::SidecarTurn { .. }
+        )
     }
 }
 
@@ -375,289 +462,5 @@ pub(super) const DOOM_THRESHOLD: usize = 20;
 pub(super) type Sink<'a> = Arc<Mutex<&'a mut (dyn FnMut(SessionEvent) + Send)>>;
 
 #[cfg(test)]
-mod from_sse_tests {
-    use super::*;
-
-    /// `from_sse` is the exact inverse of `sse_kind()` + `sse_data()` for every
-    /// variant EXCEPT `TranscriptReset`, whose payload is `{}` on the wire
-    /// (the rebuilt message list cannot be carried over SSE and must be
-    /// re-fetched). Pin both the roundtrip and that documented lossiness.
-    #[test]
-    fn from_sse_roundtrips_all_variants() {
-        let cases: Vec<SessionEvent> = vec![
-            SessionEvent::LlmRoundStart {
-                started_at_ms: 1234,
-            },
-            SessionEvent::LlmRoundEnd,
-            SessionEvent::LlmUsage {
-                total_tokens: 123_456,
-                input_tokens: 100_000,
-                output_tokens: 23_456,
-            },
-            SessionEvent::TextDelta("hi".into()),
-            SessionEvent::ReasoningDelta("think".into()),
-            SessionEvent::ToolStart {
-                id: "t1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({"command": "ls"}),
-            },
-            SessionEvent::ToolEnd {
-                id: "t1".into(),
-                name: "bash".into(),
-                output: "done".into(),
-                is_error: false,
-                images: Vec::new(),
-            },
-            SessionEvent::ToolEnd {
-                id: "t2".into(),
-                name: "bash".into(),
-                output: "boom".into(),
-                is_error: true,
-                images: Vec::new(),
-            },
-            SessionEvent::AgentSwitch("plan".into()),
-            SessionEvent::ModelSwitch("openai/gpt-4o".into()),
-            SessionEvent::Compaction("summary".into()),
-            SessionEvent::CompactionDelta("cdelta".into()),
-            SessionEvent::Status("running".into()),
-            SessionEvent::SubagentStart {
-                id: "s1".into(),
-                kind: "explore".into(),
-                prompt: "find x".into(),
-                child_session_id: "child-1".into(),
-            },
-            SessionEvent::SubagentEnd {
-                id: "s1".into(),
-                ok: true,
-                cancelled: false,
-                summary: "found".into(),
-            },
-            SessionEvent::SubagentChild {
-                id: "s1".into(),
-                ev: Box::new(SessionEvent::TextDelta("child text".into())),
-            },
-            SessionEvent::PlanHandoff("# plan".into()),
-            SessionEvent::TranscriptReset(vec![Message::assistant("m1")]),
-            SessionEvent::QueueConsumed {
-                seq: 7,
-                text: "q".into(),
-            },
-            SessionEvent::SteerConsumed {
-                seq: 9,
-                text: "s".into(),
-            },
-            SessionEvent::AutoPilot {
-                phase: ApPhase::Plan,
-                iteration: 0,
-            },
-            SessionEvent::Done,
-            SessionEvent::Error("kaboom".into()),
-        ];
-        let mut kinds: Vec<&str> = cases.iter().map(|e| e.sse_kind()).collect();
-        kinds.sort();
-        kinds.dedup();
-        assert_eq!(
-            kinds.len(),
-            22,
-            "expected all 22 unique kinds, got {kinds:?}"
-        );
-
-        for ev in &cases {
-            let kind = ev.sse_kind();
-            let data = ev.sse_data();
-            let back = SessionEvent::from_sse(kind, data.clone())
-                .unwrap_or_else(|| panic!("from_sse returned None for kind={kind} data={data}"));
-            if matches!(ev, SessionEvent::TranscriptReset(_)) {
-                // documented lossiness: no messages on the wire
-                assert!(matches!(back, SessionEvent::TranscriptReset(ref v) if v.is_empty()));
-            } else {
-                assert_eq!(
-                    serde_json::to_string(&back).unwrap(),
-                    serde_json::to_string(ev).unwrap(),
-                    "roundtrip mismatch for kind={kind}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn from_sse_unknown_kind_is_none() {
-        assert!(SessionEvent::from_sse("no_such_kind", serde_json::json!({})).is_none());
-    }
-
-    /// Backward compatibility: llm_usage payloads persisted before the
-    /// input/output split must still deserialize (split fields default to 0)
-    /// — both on the SSE wire form and the direct enum form used by the store.
-    #[test]
-    fn llm_usage_old_payload_defaults_split_fields_to_zero() {
-        let ev = SessionEvent::from_sse("llm_usage", serde_json::json!({ "total_tokens": 42 }))
-            .expect("old llm_usage payload must parse");
-        match ev {
-            SessionEvent::LlmUsage {
-                total_tokens,
-                input_tokens,
-                output_tokens,
-            } => {
-                assert_eq!(total_tokens, 42);
-                assert_eq!(input_tokens, 0);
-                assert_eq!(output_tokens, 0);
-            }
-            other => panic!("expected LlmUsage, got {other:?}"),
-        }
-        let stored: SessionEvent =
-            serde_json::from_str(r#"{"LlmUsage":{"total_tokens":42}}"#).unwrap();
-        assert!(matches!(
-            stored,
-            SessionEvent::LlmUsage {
-                total_tokens: 42,
-                input_tokens: 0,
-                output_tokens: 0,
-            }
-        ));
-    }
-
-    #[test]
-    fn from_sse_missing_field_is_none() {
-        // tool_start without the required `name` field
-        assert!(SessionEvent::from_sse("tool_start", serde_json::json!({"id":"x"})).is_none());
-    }
-
-    #[test]
-    fn queue_consumed_carries_text_through_sse() {
-        let ev = SessionEvent::QueueConsumed {
-            seq: 5,
-            text: "hello queued".into(),
-        };
-        let kind = ev.sse_kind();
-        assert_eq!(kind, "queue_consumed");
-        let data = ev.sse_data();
-        assert_eq!(data["text"], "hello queued");
-        assert_eq!(data["seq"], 5);
-        let back = SessionEvent::from_sse(kind, data).expect("roundtrip");
-        match back {
-            SessionEvent::QueueConsumed { seq, text } => {
-                assert_eq!(seq, 5);
-                assert_eq!(text, "hello queued");
-            }
-            other => panic!("expected QueueConsumed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn steer_consumed_carries_text_through_sse() {
-        let ev = SessionEvent::SteerConsumed {
-            seq: 9,
-            text: "steered away".into(),
-        };
-        let kind = ev.sse_kind();
-        assert_eq!(kind, "steer_consumed");
-        let data = ev.sse_data();
-        assert_eq!(data["text"], "steered away");
-        assert_eq!(data["seq"], 9);
-        let back = SessionEvent::from_sse(kind, data).expect("roundtrip");
-        match back {
-            SessionEvent::SteerConsumed { seq, text } => {
-                assert_eq!(seq, 9);
-                assert_eq!(text, "steered away");
-            }
-            other => panic!("expected SteerConsumed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn queue_consumed_without_text_field_is_backward_compatible() {
-        // Old persisted events predate the `text` field. A queue_consumed SSE
-        // payload without the key must still deserialize (defaults to empty).
-        let data = serde_json::json!({ "seq": 11 });
-        let ev = SessionEvent::from_sse("queue_consumed", data).expect("old event");
-        match ev {
-            SessionEvent::QueueConsumed { seq, text } => {
-                assert_eq!(seq, 11);
-                assert!(text.is_empty(), "missing text must default to empty");
-            }
-            other => panic!("expected QueueConsumed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn steer_consumed_without_text_field_is_backward_compatible() {
-        let data = serde_json::json!({ "seq": 13 });
-        let ev = SessionEvent::from_sse("steer_consumed", data).expect("old event");
-        match ev {
-            SessionEvent::SteerConsumed { seq, text } => {
-                assert_eq!(seq, 13);
-                assert!(text.is_empty());
-            }
-            other => panic!("expected SteerConsumed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tool_end_images_roundtrip_through_sse() {
-        let ev = SessionEvent::ToolEnd {
-            id: "img-1".into(),
-            name: "view_image".into(),
-            output: "Loaded image: cat.png".into(),
-            is_error: false,
-            images: vec![
-                "data:image/png;base64,iVBORw0KGgo=".into(),
-                "https://example.com/photo.jpg".into(),
-            ],
-        };
-        let kind = ev.sse_kind();
-        let data = ev.sse_data();
-        let back = SessionEvent::from_sse(kind, data).expect("roundtrip");
-        match back {
-            SessionEvent::ToolEnd { images, .. } => {
-                assert_eq!(images.len(), 2, "images must survive roundtrip");
-                assert_eq!(images[0], "data:image/png;base64,iVBORw0KGgo=");
-                assert_eq!(images[1], "https://example.com/photo.jpg");
-            }
-            other => panic!("expected ToolEnd, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tool_end_without_images_field_is_backward_compatible() {
-        // Old persisted events predate the `images` field. A tool_end SSE
-        // payload without the key must still deserialize (defaults to empty).
-        let data = serde_json::json!({
-            "id": "old",
-            "name": "bash",
-            "output": "done",
-            "is_error": false,
-        });
-        let ev = SessionEvent::from_sse("tool_end", data).expect("old event");
-        match ev {
-            SessionEvent::ToolEnd { images, .. } => {
-                assert!(
-                    images.is_empty(),
-                    "missing images field must default to empty"
-                );
-            }
-            other => panic!("expected ToolEnd, got {other:?}"),
-        }
-    }
-
-    /// P2-6: `from_sse` must saturate `iteration` to u32::MAX when the JSON
-    /// value exceeds u32's range (e.g. u64::MAX). The old `as u32` cast
-    /// silently wrapped to a small number, producing a wrong iteration index.
-    #[test]
-    fn from_sse_autopilot_large_iteration_saturates() {
-        let data = serde_json::json!({
-            "phase": "act",
-            "iteration": u64::MAX,
-        });
-        let ev = SessionEvent::from_sse("autopilot", data).expect("must parse");
-        match ev {
-            SessionEvent::AutoPilot { iteration, .. } => {
-                assert_eq!(
-                    iteration,
-                    u32::MAX,
-                    "iteration must saturate to u32::MAX, not wrap"
-                );
-            }
-            other => panic!("expected AutoPilot, got {other:?}"),
-        }
-    }
-}
+#[path = "event/tests.rs"]
+mod from_sse_tests;

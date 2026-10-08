@@ -182,6 +182,7 @@ async fn fold_error_resyncs_steer_mirror_from_store() {
         &store,
         "test-session",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -260,9 +261,13 @@ fn apply_done_reinserts_after_done_overwrite_race() {
             temp_seq: -1,
             result: Ok(7),
             display: "queued-A".into(),
+            session_id: "s".into(),
+            steer: false,
         },
         &mut queue_items,
+        &mut vec![],
         &mut pending_images,
+        "s",
     );
 
     assert!(flash.is_none(), "success path never flashes");

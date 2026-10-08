@@ -17,7 +17,6 @@ use crate::attach_badge::AttachDelBtn;
 use crate::cache_salt_menu::CacheSaltMenu;
 use crate::chat::ChatView;
 use crate::command::CommandMenu;
-use crate::composer;
 use crate::copy_wrap::{WrapAwareBackend, WrapPlan};
 use crate::keymap_menu::KeymapMenu;
 use crate::menu::SkillMenu;
@@ -26,6 +25,7 @@ use crate::queue_panel::QueueBtn;
 use crate::render_viewport::ViewportCache;
 use crate::task::TaskPicker;
 use crate::theme;
+use crate::{composer, copy_mode};
 
 /// Production terminal type: the wrap-aware backend that lets copy mode
 /// suppress `MoveTo` at display-only wrap boundaries (see `copy_wrap`).
@@ -35,62 +35,13 @@ pub(crate) type Term = Terminal<WrapAwareBackend<Stdout>>;
 mod status_bar;
 use status_bar::render_status;
 pub(crate) use status_bar::resolve_ctx_used;
+pub(crate) use status_bar::SPINNER;
 
 /// Mouse hit-targets exported by `render` for the event loop to test clicks
-/// and wheel scrolls against. Recomputed every frame.
-#[derive(Default)]
-pub(crate) struct MouseHits {
-    pub jump_btn: Option<Rect>,
-    pub top_btn: Option<Rect>,
-    pub body: Option<Rect>,
-    /// Queue/steer panel area (Some while the panel is visible), used by the
-    /// scroll-wheel handler to scroll the panel instead of the body.
-    pub queue_panel: Option<Rect>,
-    /// Cached total pending entries (steer + queue) from the last render.
-    /// Mirrors `total_rows` for the body: lets the wheel handler clamp the
-    /// queue scroll without re-deriving the panel contents.
-    pub queue_total: usize,
-    pub queue_btns: Vec<QueueBtn>,
-    /// Clickable ✕ delete buttons on pending-image attachment badges; one
-    /// per attachment row, recomputed every frame.
-    pub attach_del_btns: Vec<AttachDelBtn>,
-    /// Clickable Thinking-block header rows; clicking toggles collapse.
-    /// One entry per Thinking block currently visible in the body viewport.
-    pub thinking_btns: Vec<ThinkingBtn>,
-    /// Clickable Subagent-block header rows; clicking toggles collapse.
-    pub subagent_btns: Vec<SubagentBtn>,
-    /// Clickable Tool-block header rows; clicking toggles collapse.
-    /// One entry per Tool block currently visible in the body viewport.
-    pub tool_btns: Vec<ToolBtn>,
-    /// Clickable Compaction-block header rows; clicking toggles collapse.
-    pub compaction_btns: Vec<CompactionBtn>,
-    pub keymap_btns: Vec<Rect>,
-    /// Cached total content rows from the last render_body call. Used by
-    /// the scroll-wheel handler to clamp scroll without re-flattening.
-    pub total_rows: usize,
-}
-
-/// A clickable Thinking-block header. `block_idx` indexes `ChatView::blocks`;
-/// `rect` is the on-screen row of the header line.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ThinkingBtn {
-    pub block_idx: usize,
-    pub rect: Rect,
-}
-
-/// A clickable Subagent-block header.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SubagentBtn {
-    pub block_idx: usize,
-    pub rect: Rect,
-}
-
-/// A clickable Tool-block header.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ToolBtn {
-    pub block_idx: usize,
-    pub rect: Rect,
-}
+/// and wheel scrolls against. Recomputed every frame. The struct and the
+/// button types live in `render_hits.rs` next to their recorders; re-exported
+/// here so `crate::render::MouseHits` paths stay stable.
+pub(crate) use hit_records::{CompactionBtn, MouseHits, SubagentBtn, ThinkingBtn, ToolCallBtn};
 
 pub(crate) fn in_rect(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
@@ -120,10 +71,9 @@ pub(crate) fn render<B: Backend + 'static>(
     skill_menu: Option<&SkillMenu>,
     task_picker: Option<&TaskPicker>,
     command_menu: Option<&CommandMenu>,
-    file_menu: Option<&crate::file_menu::FileMenu>,
+    agent_menu: Option<&crate::agent_menu::AgentMenu>,
     model_menu: Option<&ModelMenu>,
     mcp_menu: Option<&crate::mcp_menu::McpMenu>,
-    envs_menu: Option<&crate::envs_menu::EnvsMenu>,
     cli_menu: Option<&crate::cli_menu::CliMenu>,
     skill_toggle_menu: Option<&crate::skill_menu::SkillMenu>,
     ap_menu: Option<&crate::ap_menu::ApMenu>,
@@ -136,15 +86,17 @@ pub(crate) fn render<B: Backend + 'static>(
     copy_mode: bool,
     pending_images: &[(String, String)],
     input_disabled: bool,
-    plan_mode: Option<&str>,
+    plan_edit_mode: Option<&str>,
     edit_title: Option<&str>,
     tail_ms: u64,
     task_ms: u64,
     is_top_level: bool,
     ap_mode: opencoder_core::ApMode,
     display_mode: &str,
+    plan_skill_active: bool,
     notepad: Option<&crate::notepad::NotepadView>,
 ) -> Result<()> {
+    crate::boot_clock::note_first_frame();
     let wrap_plan = crate::copy_wrap::frame_plan(terminal, copy_mode);
     terminal.draw(|f| {
         let area = f.area();
@@ -166,7 +118,7 @@ pub(crate) fn render<B: Backend + 'static>(
             hits.attach_del_btns.clear();
             hits.thinking_btns.clear();
             hits.subagent_btns.clear();
-            hits.tool_btns.clear();
+            hits.tool_call_btns.clear();
             hits.compaction_btns.clear();
             hits.keymap_btns.clear();
             // Copy mode: undecorated fullscreen editor text — no tree
@@ -191,10 +143,10 @@ pub(crate) fn render<B: Backend + 'static>(
         let prompt_w = 2u16;
         let inner_w = draw_area.width.saturating_sub(2);
         let input_rows = composer::display_rows(input, inner_w, prompt_w).max(2);
-        let plan_active = plan_mode.is_some();
+        let plan_active = plan_edit_mode.is_some();
         // The attachment badge consumes one inner line per pending image,
         // capped by the composer's minimum height so the input area is never
-        // squeezed away; must mirror the plan-mode filter applied at the
+        // squeezed away; must mirror the plan editor filter applied at the
         // render_composer call site below.
         let badge_h: u16 = if !plan_active {
             (pending_images.len() as u16).min((draw_area.height / 3).saturating_sub(2))
@@ -251,7 +203,7 @@ pub(crate) fn render<B: Backend + 'static>(
         hits.attach_del_btns.clear();
         hits.thinking_btns.clear();
         hits.subagent_btns.clear();
-        hits.tool_btns.clear();
+        hits.tool_call_btns.clear();
         hits.compaction_btns.clear();
         hits.keymap_btns.clear();
         if !plan_active {
@@ -269,7 +221,7 @@ pub(crate) fn render<B: Backend + 'static>(
                 &mut hits.top_btn,
                 &mut hits.thinking_btns,
                 &mut hits.subagent_btns,
-                &mut hits.tool_btns,
+                &mut hits.tool_call_btns,
                 &mut hits.compaction_btns,
                 viewport,
                 is_top_level,
@@ -314,13 +266,13 @@ pub(crate) fn render<B: Backend + 'static>(
             composer_scroll,
             inner_w,
             prompt_w,
-            if plan_mode.is_some() {
+            if plan_edit_mode.is_some() {
                 &[]
             } else {
                 pending_images
             },
             input_disabled,
-            plan_mode,
+            plan_edit_mode,
             edit_title,
             title,
             wrap_plan.as_ref(),
@@ -333,6 +285,7 @@ pub(crate) fn render<B: Backend + 'static>(
             f,
             chunks[ci],
             display_mode,
+            plan_skill_active,
             running,
             status,
             anim_tick,
@@ -349,10 +302,9 @@ pub(crate) fn render<B: Backend + 'static>(
             hits,
             task_picker,
             command_menu,
-            file_menu,
+            agent_menu,
             model_menu,
             mcp_menu,
-            envs_menu,
             cli_menu,
             skill_toggle_menu,
             ap_menu,
@@ -364,9 +316,11 @@ pub(crate) fn render<B: Backend + 'static>(
             render_status_chip(f, composer_area, label, theme::local_color());
         }
         if let Some(text) = mode_flash {
-            // Two-colour ONLY for the definite "→ plan mode" switch flash;
-            // every other flash (busy hint, text containing "plan") = accent.
-            let is_plan = text.starts_with("\u{2192} plan mode");
+            // Warn hue for the plan (read-only) side of the family: the
+            // agent-switch flash "→ plan mode" and the plan-text editor
+            // flash "→ edit plan" (the editor is entered from the plan
+            // agent). Every other flash (busy hint, "→ act mode") = accent.
+            let is_plan = crate::frame::is_warn_flash(text);
             render_status_chip(f, composer_area, text, theme::mode_flash_bg(is_plan));
         }
         if shift_held {
@@ -376,7 +330,7 @@ pub(crate) fn render<B: Backend + 'static>(
             render_status_chip(
                 f,
                 composer_area,
-                if plan_mode.is_some() {
+                if plan_edit_mode.is_some() {
                     "COPY MODE: Ctrl+G/Esc"
                 } else {
                     "COPY: ↑↓ PgUp/PgDn · Ctrl+G/Esc"
@@ -394,7 +348,6 @@ pub(crate) fn render<B: Backend + 'static>(
             && question_menu.is_none()
             && cli_menu.is_none()
             && mcp_menu.is_none()
-            && envs_menu.is_none()
             && skill_toggle_menu.is_none()
         {
             let position = composer::cursor_screen_position(
@@ -428,7 +381,7 @@ fn render_body(
     top_btn: &mut Option<Rect>,
     thinking_btns: &mut Vec<ThinkingBtn>,
     subagent_btns: &mut Vec<SubagentBtn>,
-    tool_btns: &mut Vec<ToolBtn>,
+    tool_call_btns: &mut Vec<ToolCallBtn>,
     compaction_btns: &mut Vec<CompactionBtn>,
     viewport: &mut Option<ViewportCache>,
     is_top_level: bool,
@@ -461,7 +414,11 @@ fn render_body(
     // It vanishes automatically once the first block appears.
     if is_top_level && chat.blocks.is_empty() && !chat.submitted {
         f.render_widget(block, area);
-        crate::welcome::render_tutorial_in_body(f, inner);
+        if chat.remote {
+            crate::welcome::render_remote_tutorial_in_body(f, inner);
+        } else {
+            crate::welcome::render_tutorial_in_body(f, inner);
+        }
         return;
     }
 
@@ -475,7 +432,7 @@ fn render_body(
     let cache = viewport.as_ref().unwrap();
     let total_rows = cache.total_rows();
 
-    // The [turn cost] timer lives on the bottom border (after [tok cost], see
+    // The [call cost] timer lives on the bottom border (after [tok cost], see
     // rounded_block_line_tok), so the content window takes the full height.
     let content_h = visible_h;
 
@@ -507,8 +464,15 @@ fn render_body(
         inner.y,
         subagent_btns,
     );
-    hit_records::record_tool_hits(
-        chat, cache, text_w, scroll_y, content_h, inner.x, inner.y, tool_btns,
+    hit_records::record_tool_call_hits(
+        chat,
+        cache,
+        text_w,
+        scroll_y,
+        content_h,
+        inner.x,
+        inner.y,
+        tool_call_btns,
     );
     hit_records::record_compaction_hits(
         chat,
@@ -628,7 +592,7 @@ fn render_composer(
     prompt_w: u16,
     pending_images: &[(String, String)],
     disabled: bool,
-    plan_mode: Option<&str>,
+    plan_edit_mode: Option<&str>,
     edit_title: Option<&str>,
     top_title: &Line<'static>,
     wrap_plan: Option<&Rc<RefCell<WrapPlan>>>,
@@ -638,7 +602,7 @@ fn render_composer(
     // glyph, no attachment badge — so terminal-native selection spans
     // exactly the typed text (mirrors the body's clean view).
     if copy_mode {
-        crate::copy_mode::render_composer_clean(f, area, input, plan_mode.is_some(), wrap_plan);
+        copy_mode::render_composer_clean(f, area, input, plan_edit_mode.is_some(), wrap_plan);
         return;
     }
     if disabled {
@@ -661,7 +625,7 @@ fn render_composer(
         );
         return;
     }
-    let block = if let Some(label) = plan_mode {
+    let block = if let Some(label) = plan_edit_mode {
         let is_annotation = edit_title == Some("edit annotation");
         let border_fg = if is_annotation {
             theme::ok_color()
@@ -711,7 +675,7 @@ fn render_composer(
     for (ri, vr) in rows.iter().enumerate() {
         let mut spans: Vec<Span> = Vec::new();
         if ri == 0 {
-            let prompt_color = if plan_mode.is_some() {
+            let prompt_color = if plan_edit_mode.is_some() {
                 if edit_title == Some("edit annotation") {
                     theme::ok_color()
                 } else {
@@ -774,7 +738,6 @@ fn render_status_chip(f: &mut Frame, composer_area: Rect, text: &str, bg: Color)
 mod hit_records;
 #[path = "render_popups.rs"]
 mod popups;
-pub(crate) use hit_records::CompactionBtn;
 #[cfg(test)]
 #[path = "render_tests/mod.rs"]
 mod tests;

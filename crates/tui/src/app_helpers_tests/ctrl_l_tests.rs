@@ -3,10 +3,11 @@
 //! iteration caps.
 
 use crate::app_helpers::pre_key_intercept;
-use crate::chat::{ChatBlock, ChatView};
+use crate::chat::{ChatBlock, ChatView, SidecarPanel};
 use crate::keymap::KeyBindings;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use opencoder_session::SessionEvent;
+use tokio::sync::mpsc;
 
 /// Build a parent view with a collapsible thinking block and one Subagent
 /// block whose child view also has an (expanded) thinking block.
@@ -61,6 +62,7 @@ fn ctrl_l_exits_subagent_and_returns_to_follow_mode() {
     let mut input = "hello".to_string();
     let mut cursor = 5usize;
     let mut needs_clear = false;
+    let (sidecar_tx, _sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
     let consumed = pre_key_intercept(
         KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
         &KeyBindings::default(),
@@ -71,6 +73,7 @@ fn ctrl_l_exits_subagent_and_returns_to_follow_mode() {
         &mut input,
         &mut cursor,
         &mut needs_clear,
+        &sidecar_tx,
     );
 
     assert!(consumed, "Ctrl+L must be consumed by pre_key_intercept");
@@ -102,6 +105,105 @@ fn ctrl_l_exits_subagent_and_returns_to_follow_mode() {
     assert_all_thinking_collapsed(&chat);
 }
 
+/// Ctrl+L resets every StepGroup (parent AND focused child) to the collapsed
+/// state — open steps and expanded call outputs are one keystroke away from
+/// the static marker + closed step rows.
+#[test]
+fn ctrl_l_resets_tool_groups_to_collapsed() {
+    use opencoder_session::SessionEvent;
+
+    let (mut chat, sub_idx) = chat_with_subagent();
+    // Give both views a finished tool group, open its step and the call.
+    chat.apply(&SessionEvent::ToolStart {
+        id: "p".into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": "ls"}),
+    });
+    chat.apply(&SessionEvent::ToolEnd {
+        id: "p".into(),
+        name: "bash".into(),
+        output: "out".into(),
+        is_error: false,
+        images: Vec::new(),
+    });
+    if let ChatBlock::Subagent { view, .. } = &mut chat.blocks[sub_idx] {
+        view.apply(&SessionEvent::ToolStart {
+            id: "c".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": "ls"}),
+        });
+        view.apply(&SessionEvent::ToolEnd {
+            id: "c".into(),
+            name: "bash".into(),
+            output: "out".into(),
+            is_error: false,
+            images: Vec::new(),
+        });
+        for b in view.blocks.iter_mut() {
+            if let ChatBlock::StepGroup { steps, open, .. } = b {
+                *open = true;
+                steps[0].open = true;
+                steps[0].calls_open = true;
+                steps[0].calls[0].expanded = true;
+            }
+        }
+    }
+    for b in chat.blocks.iter_mut() {
+        if let ChatBlock::StepGroup { steps, open, .. } = b {
+            *open = true;
+            steps[0].open = true;
+            steps[0].calls_open = true;
+            // A flushed thinking-only step (no calls) has no call levels.
+            if !steps[0].calls.is_empty() {
+                steps[0].calls[0].expanded = true;
+            }
+        }
+    }
+
+    let mut subagent_focus = Some(sub_idx);
+    let mut follow = false;
+    let mut last_esc = None;
+    let mut input = String::new();
+    let mut cursor = 0usize;
+    let mut needs_clear = false;
+    let (sidecar_tx, _sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
+    let consumed = pre_key_intercept(
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        &KeyBindings::default(),
+        &mut subagent_focus,
+        &mut follow,
+        &mut last_esc,
+        &mut chat,
+        &mut input,
+        &mut cursor,
+        &mut needs_clear,
+        &sidecar_tx,
+    );
+    assert!(consumed, "Ctrl+L must be consumed");
+
+    let all_collapsed = |v: &ChatView| {
+        v.blocks.iter().all(|b| match b {
+            ChatBlock::StepGroup { steps, open, .. } => {
+                !*open
+                    && steps
+                        .iter()
+                        .all(|s| !s.open && !s.calls_open && s.calls.iter().all(|c| !c.expanded))
+            }
+            _ => true,
+        })
+    };
+    assert!(
+        all_collapsed(&chat),
+        "parent step groups must be collapsed after Ctrl+L"
+    );
+    if let ChatBlock::Subagent { view, .. } = &chat.blocks[sub_idx] {
+        assert!(
+            all_collapsed(view),
+            "child step groups must be collapsed after Ctrl+L"
+        );
+    }
+}
+
 /// Esc exits a focused subagent view back to the parent at FOLLOW MODE
 /// (bottom of the view) — same reset-to-live semantics as Ctrl+L, without
 /// the collapse / input-clear side effects.
@@ -115,6 +217,7 @@ fn esc_exits_subagent_and_returns_to_follow_mode() {
     let mut input = "draft".to_string();
     let mut cursor = 2usize;
     let mut needs_clear = false;
+    let (sidecar_tx, _sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
     let consumed = pre_key_intercept(
         KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         &KeyBindings::default(),
@@ -125,6 +228,7 @@ fn esc_exits_subagent_and_returns_to_follow_mode() {
         &mut input,
         &mut cursor,
         &mut needs_clear,
+        &sidecar_tx,
     );
 
     assert!(consumed, "Esc must be consumed by pre_key_intercept");
@@ -155,6 +259,7 @@ fn ctrl_l_without_subagent_returns_to_follow_mode() {
     let mut input = "draft".to_string();
     let mut cursor = 3usize;
     let mut needs_clear = false;
+    let (sidecar_tx, _sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
     let consumed = pre_key_intercept(
         KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
         &KeyBindings::default(),
@@ -165,6 +270,7 @@ fn ctrl_l_without_subagent_returns_to_follow_mode() {
         &mut input,
         &mut cursor,
         &mut needs_clear,
+        &sidecar_tx,
     );
 
     assert!(consumed, "Ctrl+L must be consumed by pre_key_intercept");
@@ -176,4 +282,111 @@ fn ctrl_l_without_subagent_returns_to_follow_mode() {
     assert!(input.is_empty(), "Ctrl+L must clear the input");
     assert_eq!(cursor, 0, "Ctrl+L must reset the cursor");
     assert_all_thinking_collapsed(&chat);
+}
+
+/// ESC on a focused sidecar DESTROYS the panel: `SidecarCmd::Reset` reaches
+/// the actor (in-flight turn aborted, conversation dropped) and the panel
+/// field is cleared.
+#[test]
+fn esc_destroys_the_sidecar_panel() {
+    let (sidecar_tx, mut sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
+    let mut chat = ChatView {
+        sidecar_focus: true,
+        ..ChatView::default()
+    };
+    chat.sidecar = Some(SidecarPanel {
+        id: "sc-1".into(),
+        question: "q".into(),
+        ..Default::default()
+    });
+
+    let mut subagent_focus: Option<usize> = None;
+    let mut follow = false;
+    let mut last_esc = None;
+    let mut input = "草稿".to_string();
+    let mut cursor = 2usize;
+    let mut needs_clear = false;
+    let consumed = pre_key_intercept(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &KeyBindings::default(),
+        &mut subagent_focus,
+        &mut follow,
+        &mut last_esc,
+        &mut chat,
+        &mut input,
+        &mut cursor,
+        &mut needs_clear,
+        &sidecar_tx,
+    );
+
+    assert!(consumed);
+    assert!(matches!(
+        sidecar_rx.try_recv(),
+        Ok(crate::sidecar_ui::SidecarCmd::Reset)
+    ));
+    assert!(chat.sidecar.is_none(), "ESC must destroy the sidecar panel");
+    assert!(!chat.sidecar_focus, "focus released");
+    assert!(follow);
+    assert_eq!(input, "草稿".to_string(), "draft untouched");
+}
+
+/// Ctrl+L on a focused sidecar exits + destroys it, THEN still runs the
+/// parent-wide collapse (thinking/tool blocks collapse too).
+#[test]
+fn ctrl_l_destroys_the_sidecar_then_collapses_parent() {
+    let (sidecar_tx, mut sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
+    let mut chat = ChatView {
+        sidecar_focus: true,
+        ..ChatView::default()
+    };
+    chat.sidecar = Some(SidecarPanel {
+        id: "sc-1".into(),
+        question: "q".into(),
+        ..Default::default()
+    });
+    chat.blocks.push(ChatBlock::Thinking {
+        text: "思考中...".into(),
+        collapsed: false,
+        sealed: false,
+    });
+
+    let mut subagent_focus: Option<usize> = None;
+    let mut follow = false;
+    let mut last_esc = None;
+    let mut input = "hello".to_string();
+    let mut cursor = 5usize;
+    let mut needs_clear = false;
+    let consumed = pre_key_intercept(
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        &KeyBindings::default(),
+        &mut subagent_focus,
+        &mut follow,
+        &mut last_esc,
+        &mut chat,
+        &mut input,
+        &mut cursor,
+        &mut needs_clear,
+        &sidecar_tx,
+    );
+
+    assert!(consumed);
+    assert!(matches!(
+        sidecar_rx.try_recv(),
+        Ok(crate::sidecar_ui::SidecarCmd::Reset)
+    ));
+    assert!(
+        chat.sidecar.is_none(),
+        "Ctrl+L must destroy the sidecar panel"
+    );
+    assert!(!chat.sidecar_focus);
+    assert!(
+        matches!(
+            chat.blocks.first(),
+            Some(ChatBlock::Thinking {
+                collapsed: true,
+                ..
+            })
+        ),
+        "parent collapse still ran"
+    );
 }

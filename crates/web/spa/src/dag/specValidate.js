@@ -1,0 +1,223 @@
+// specValidate.js — PURE client-side validation of a DagSpec JSON draft
+// (mirror of crates/dag/src/spec.rs rules) before it is POSTed to
+// /api/dag/defs. Returns a list of Chinese problem strings; [] means the
+// draft may be submitted (the server remains authoritative — its 400
+// problem list is surfaced by the editor too).
+
+import { dependsOn, specSteps } from '../dagProjection.js';
+
+export const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+/// Upper bound for agent how_append payloads, in UTF-8 bytes (mirror of
+/// crates/dag/src/spec.rs MAX_HOW_APPEND_BYTES).
+export const MAX_HOW_APPEND_BYTES = 8 * 1024;
+
+/// Whole-run concurrency bounds (mirror of crates/dag/src/policies.rs
+/// MAX_CONCURRENCY; default_concurrency is 4 server-side).
+export const MAX_CONCURRENCY = 30;
+
+const RESERVED_STEPS = new Set(['workspace', 'upper', 'work', 'bundle', 'private', 'runc-state', 'rootfs-upper', 'rootfs-work', 'resources']);
+
+function unknownFields(value, allowed, where, problems) {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) problems.push(where + ' 不支持字段: ' + key);
+  }
+}
+
+/// parseSpecDraft(text) → {spec} on success or {error} with a readable
+/// Chinese message (JSON.parse's own message is English/noisy).
+export function parseSpecDraft(text) {
+  const raw = String(text || '').trim();
+  if (!raw) {
+    return { error: '请输入工作流 JSON' };
+  }
+  let v;
+  try {
+    v = JSON.parse(raw);
+  } catch (e) {
+    return { error: 'JSON 解析失败: ' + (e && e.message ? e.message : String(e)) };
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) {
+    return { error: 'spec 必须是 JSON 对象' };
+  }
+  return { spec: v };
+}
+
+/// validateSpec(spec) → problem string list. Checks, in server order:
+/// name/description shape, whole-run max_concurrency bounds, non-empty
+/// steps, per-step slug + kind payloads, depends_on references, self-deps
+/// and cycles.
+export function validateSpec(spec) {
+  const problems = [];
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+    return ['spec 必须是 JSON 对象'];
+  }
+  if (spec.max_concurrency !== undefined) {
+    const mc = spec.max_concurrency;
+    if (typeof mc !== 'number' || !Number.isInteger(mc) || mc < 1 || mc > MAX_CONCURRENCY) {
+      problems.push(`spec.max_concurrency 必须是 1..=${MAX_CONCURRENCY} 的整数`);
+    }
+  }
+  unknownFields(spec, ['name', 'description', 'steps', 'max_concurrency'], 'spec', problems);
+  if (typeof spec.name !== 'string' || !spec.name.trim()) {
+    problems.push('spec.name 必须是非空字符串');
+  }
+  if (spec.description !== undefined && spec.description !== null && typeof spec.description !== 'string') {
+    problems.push('spec.description 只能是字符串');
+  }
+  if (!Array.isArray(spec.steps) || spec.steps.length === 0) {
+    problems.push('spec.steps 必须是非空数组');
+    return problems;
+  }
+  const names = new Set();
+  spec.steps.forEach((s, i) => {
+    const where = 'steps[' + i + ']';
+    if (!s || typeof s !== 'object') {
+      problems.push(where + ' 必须是对象');
+      return;
+    }
+    unknownFields(s, ['name', 'kind', 'depends_on', 'timeout_secs', 'trigger_rule'], where, problems);
+    if (typeof s.name !== 'string' || !SLUG_RE.test(s.name) || RESERVED_STEPS.has(s.name)) {
+      problems.push(where + '.name 必须匹配 [a-z0-9][a-z0-9-]{0,63}: ' + JSON.stringify(s.name));
+    } else if (names.has(s.name)) {
+      problems.push(where + '.name 重复: ' + s.name);
+    }
+    names.add(s.name);
+    if (!s.kind || typeof s.kind !== 'object') {
+      problems.push(where + '.kind 必须是对象');
+      return;
+    }
+    let kind = s.kind;
+    if (s.trigger_rule !== undefined && !['all_success', 'all_done'].includes(s.trigger_rule)) {
+      problems.push(where + '.trigger_rule 必须是 all_success | all_done');
+    }
+    if (kind.type === 'dynamic') {
+      unknownFields(kind, ['type', 'source', 'template', 'failure_policy'], where + '.kind', problems);
+      if (kind.failure_policy !== undefined && !['fail_fast', 'collect_all'].includes(kind.failure_policy)) {
+        problems.push(where + '.kind.failure_policy 必须是 fail_fast | collect_all');
+      }
+      const source = kind.source || {};
+      unknownFields(source, source.type === 'input' ? ['type', 'pointer'] : ['type', 'pointer', 'step'], where + '.source', problems);
+      if (!['input', 'step_output'].includes(source.type)) problems.push(where + ' 派生来源必须是 input | step_output');
+      if (typeof source.pointer !== 'string' || (source.pointer && !source.pointer.startsWith('/')) || /~(?![01])/u.test(source.pointer)) problems.push(where + ' 数组路径必须是有效 JSON pointer');
+      if (source.type === 'step_output' && !dependsOn(s).includes(source.step)) problems.push(where + ' 上游来源必须在 depends_on 中');
+      kind = kind.template || {};
+      if (!['agent', 'binary'].includes(kind.type)) problems.push(where + ' 动态模板必须是 agent | binary');
+    }
+    if (kind.type === 'agent') {
+      unknownFields(kind, ['type', 'prompt', 'agent', 'model', 'how_append'], where + '.kind', problems);
+      if (typeof kind.prompt !== 'string' || !kind.prompt.trim()) {
+        problems.push(where + ' (agent) 需要 non-empty kind.prompt');
+      }
+      if (kind.agent !== undefined && typeof kind.agent !== 'string') {
+        problems.push(where + '.kind.agent 只能是字符串');
+      }
+      if (kind.model !== undefined && typeof kind.model !== 'string') {
+        problems.push(where + '.kind.model 只能是字符串');
+      }
+      if (kind.how_append !== undefined) {
+        if (typeof kind.how_append !== 'string') {
+          problems.push(where + '.kind.how_append 只能是字符串');
+        } else if (new Blob([kind.how_append]).size > MAX_HOW_APPEND_BYTES) {
+          problems.push(
+            where + ' (agent) kind.how_append 超过 ' + MAX_HOW_APPEND_BYTES + ' 字节上限',
+          );
+        }
+      }
+    } else if (kind.type === 'binary') {
+      unknownFields(kind, ['type', 'resource', 'args'], where + '.kind', problems);
+      if (typeof kind.resource !== 'string' || !/^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,47}(?:@v[1-9][0-9]*)?$/.test(kind.resource) || Number(kind.resource.split('@v')[1] || 1) > 4294967295) {
+        problems.push(where + ' (binary) 需要有效的 kind.resource');
+      }
+      if (kind.args !== undefined && (!Array.isArray(kind.args) || kind.args.some((arg) => typeof arg !== 'string' || arg.includes('\0')))) {
+        problems.push(where + '.kind.args 必须是字符串数组');
+      }
+      if (kind.sandbox !== undefined || kind.command !== undefined) problems.push(where + ' 包含已移除的字段');
+    } else {
+      problems.push(where + '.kind.type 必须是 agent | binary | dynamic');
+    }
+    if (s.timeout_secs !== undefined && !(Number.isInteger(s.timeout_secs) && s.timeout_secs > 0)) {
+      problems.push(where + '.timeout_secs 必须是正整数');
+    }
+    if (s.depends_on !== undefined && !Array.isArray(s.depends_on)) {
+      problems.push(where + '.depends_on 只能是字符串数组');
+    }
+  });
+  // depends_on references, self-deps, cycles — only meaningful when names parse.
+  const known = new Set(specSteps(spec).map((s) => s.name));
+  for (const s of specSteps(spec)) {
+    dependsOn(s).forEach((d, j) => {
+      if (d === s.name) {
+        problems.push('steps ' + s.name + ' depends_on 不能包含自身');
+      } else if (!known.has(d)) {
+        problems.push('steps ' + s.name + ' depends_on 未定义步骤: ' + d);
+      }
+    });
+    if (s.depends_on && Array.isArray(s.depends_on) && new Set(s.depends_on).size !== s.depends_on.length) {
+      problems.push('steps ' + s.name + ' depends_on 存在重复项');
+    }
+  }
+  const cycle = findCycle(spec);
+  if (cycle) {
+    problems.push('依赖存在环: ' + cycle.join(' → '));
+  }
+  return problems;
+}
+
+/// findCycle(spec) → first cycle as a step-name path, or null. DFS with
+/// colors; unknown dep names are ignored (reported above instead).
+export function findCycle(spec) {
+  const steps = specSteps(spec);
+  const deps = new Map(steps.map((s) => [s.name, dependsOn(s)]));
+  const state = new Map(); // 1 on stack, 2 done
+  const path = [];
+  const visit = (id) => {
+    state.set(id, 1);
+    path.push(id);
+    for (const d of deps.get(id) || []) {
+      if (!deps.has(d)) {
+        continue;
+      }
+      if (!state.has(d)) {
+        const found = visit(d);
+        if (found) {
+          return found;
+        }
+      } else if (state.get(d) === 1) {
+        return [...path.slice(path.indexOf(d)), d];
+      }
+    }
+    path.pop();
+    state.set(id, 2);
+    return null;
+  };
+  for (const s of steps) {
+    if (!state.has(s.name)) {
+      const found = visit(s.name);
+      if (found) {
+        return found;
+      }
+    }
+  }
+  return null;
+}
+
+/// problemsFromApiError(e) → string list for a rejected POST /api/dag/defs.
+/// The server's 400 carries a problem list; degrade gracefully to whatever
+/// error text is available.
+export function problemsFromApiError(e) {
+  const body = e && e.body;
+  if (body && Array.isArray(body.problems) && body.problems.length) {
+    return body.problems.map((p) => (typeof p === 'string' ? p : JSON.stringify(p)));
+  }
+  if (body && typeof body.error === 'string' && body.error) {
+    return [body.error];
+  }
+  if (e && typeof e.message === 'string' && e.message) {
+    return [e.message];
+  }
+  if (typeof e === 'string' && e) {
+    return [e];
+  }
+  return ['提交失败'];
+}

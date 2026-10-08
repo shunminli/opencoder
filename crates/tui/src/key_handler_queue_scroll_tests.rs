@@ -16,8 +16,6 @@ fn shift_page_up_scrolls_queue_panel_not_body() {
     let mut skill_menu: Option<SkillMenu> = None;
     let mut undo_state = crate::undo::init("", 0);
     let mut queue_scroll: u32 = 2;
-    let mut file_menu: Option<crate::file_menu::FileMenu> = None;
-    let workdir = std::path::Path::new(".");
 
     let action = handle_key(
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
@@ -26,6 +24,7 @@ fn shift_page_up_scrolls_queue_panel_not_body() {
         &mut cursor,
         &history,
         &mut hist_idx,
+        false,
         false,
         "act",
         &mut scroll,
@@ -36,10 +35,10 @@ fn shift_page_up_scrolls_queue_panel_not_body() {
         2,
         false,
         false,
+        false,
         &mut undo_state,
         &mut queue_scroll,
-        &mut file_menu,
-        workdir,
+        &mut None,
     );
     assert!(matches!(action, KeyAction::None));
     assert_eq!(queue_scroll, 1, "Shift+PageUp looks at older entries (top)");
@@ -59,8 +58,6 @@ fn shift_page_down_advances_toward_newest() {
     let mut skill_menu: Option<SkillMenu> = None;
     let mut undo_state = crate::undo::init("", 0);
     let mut queue_scroll: u32 = 3;
-    let mut file_menu: Option<crate::file_menu::FileMenu> = None;
-    let workdir = std::path::Path::new(".");
 
     let action = handle_key(
         KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT),
@@ -69,6 +66,7 @@ fn shift_page_down_advances_toward_newest() {
         &mut cursor,
         &history,
         &mut hist_idx,
+        false,
         false,
         "act",
         &mut scroll,
@@ -79,10 +77,10 @@ fn shift_page_down_advances_toward_newest() {
         2,
         false,
         false,
+        false,
         &mut undo_state,
         &mut queue_scroll,
-        &mut file_menu,
-        workdir,
+        &mut None,
     );
     assert!(matches!(action, KeyAction::None));
     assert_eq!(
@@ -107,8 +105,6 @@ fn shift_page_up_floors_at_zero() {
     let mut skill_menu: Option<SkillMenu> = None;
     let mut undo_state = crate::undo::init("", 0);
     let mut queue_scroll: u32 = 1;
-    let mut file_menu: Option<crate::file_menu::FileMenu> = None;
-    let workdir = std::path::Path::new(".");
 
     for _ in 0..2 {
         let action = handle_key(
@@ -119,6 +115,7 @@ fn shift_page_up_floors_at_zero() {
             &history,
             &mut hist_idx,
             false,
+            false,
             "act",
             &mut scroll,
             &mut follow,
@@ -128,10 +125,10 @@ fn shift_page_up_floors_at_zero() {
             2,
             false,
             false,
+            false,
             &mut undo_state,
             &mut queue_scroll,
-            &mut file_menu,
-            workdir,
+            &mut None,
         );
         assert!(matches!(action, KeyAction::None));
     }
@@ -152,8 +149,6 @@ fn plain_page_up_still_scrolls_body() {
     let mut skill_menu: Option<SkillMenu> = None;
     let mut undo_state = crate::undo::init("", 0);
     let mut queue_scroll: u32 = 0;
-    let mut file_menu: Option<crate::file_menu::FileMenu> = None;
-    let workdir = std::path::Path::new(".");
 
     let action = handle_key(
         KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
@@ -162,6 +157,7 @@ fn plain_page_up_still_scrolls_body() {
         &mut cursor,
         &history,
         &mut hist_idx,
+        false,
         false,
         "act",
         &mut scroll,
@@ -172,10 +168,10 @@ fn plain_page_up_still_scrolls_body() {
         2,
         false,
         false,
+        false,
         &mut undo_state,
         &mut queue_scroll,
-        &mut file_menu,
-        workdir,
+        &mut None,
     );
     assert!(matches!(action, KeyAction::None));
     assert_eq!(scroll, 30, "plain PageUp scrolls the body");

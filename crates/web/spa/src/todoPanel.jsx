@@ -1,0 +1,315 @@
+// todoPanel.jsx — 菜单页「TODO 管理」: 两个 tab。
+//   模板 — templates 表 + 展开行版本列表（编辑/设为当前/新版本/删除版本/
+//           运行）；新建/编辑都从右侧滑出 100% 宽抽屉（不叠卡片）。
+//   运行 — todoRunsPanel.jsx 的工作流列表 + 事件流。
+// 版本行上的「运行」成功后带 workflow_id 跳到「运行」tab 并聚焦该工作流。
+
+import { Button, Drawer, Input, Modal, Popconfirm, Space, Table, Tabs, Tag, Typography } from 'antd';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { apiDel, apiGet, apiPost, apiPut } from './api.js';
+import { newId } from './fleet/model.js';
+import { TodoEditor } from './todoEditor.jsx';
+import { TodoRunsPanel } from './todoRunsPanel.jsx';
+import { TodoEnvsPanel } from './envs/todoPanel.jsx';
+import { err, info } from './notice.js';
+import {FileProblems,errorProblems} from './todo/directory/problems.jsx';
+
+const { Text } = Typography;
+
+export { EXAMPLE_SPEC } from './todo/directory/model.js';
+
+/// 展开行：某模板的版本列表（env 绑定来自 GET /api/todo/templates/:name）。
+function VersionsBlock({ template, onNotice, onEdit, onChanged, initialPrompt = '' }) {
+  const [detail, setDetail] = useState(null);
+  const name = template.name;
+  const attempts = useRef(new Map());
+  const [fileProblems,setFileProblems]=useState([]);
+  const [problemVersion,setProblemVersion]=useState(template.current);
+  const [prompt,setPrompt]=useState(initialPrompt);
+
+  useEffect(() => {
+    let alive = true;
+    apiGet(`/api/todo/templates/${encodeURIComponent(name)}`)
+      .then((j) => {
+        if (alive) {
+          setDetail(j || null);
+        }
+      })
+      .catch((e) => {setFileProblems(errorProblems(e,'todo.json'));onNotice(err('获取模板详情失败: ' + (e && e.message)));});
+    return () => {
+      alive = false;
+    };
+  }, [name, onNotice]);
+
+  const envBy = (detail && detail.env_by_version) || {};
+  const versions = (detail && detail.template && detail.template.versions)
+    || template.versions
+    || [];
+
+  const setCurrent = async (v) => {
+    try {
+      await apiPut(`/api/todo/templates/${encodeURIComponent(name)}/todo.json`, { current: v });
+      onNotice(err(''));
+      onChanged();
+    } catch (e) {
+      onNotice(err('设为当前失败: ' + (e && e.message)));
+    }
+  };
+
+  const newVersion = async (sourceVersion) => {
+    // 低频操作：备注用 window.prompt 收集，取消即放弃。
+    const note = window.prompt('新版本备注', '');
+    if (note === null) {
+      return;
+    }
+    try {
+      await apiPost(`/api/todo/templates/${encodeURIComponent(name)}/new-version`,
+        sourceVersion ? { source_version: sourceVersion, note } : { note });
+      onNotice(err(''));
+      onChanged();
+    } catch (e) {
+      setProblemVersion(sourceVersion||template.current);setFileProblems(errorProblems(e));
+      onNotice(err('新建版本失败: ' + (e && e.message)));
+    }
+  };
+
+  const deleteVersion = async (v) => {
+    try {
+      await apiDel(`/api/todo/templates/${encodeURIComponent(name)}/${encodeURIComponent(v)}`);
+      onNotice(err(''));
+      onChanged();
+    } catch (e) {
+      // 409 = 删除当前版本
+      onNotice(err(`删除版本 ${v} 失败: ` + (e && e.message)));
+    }
+  };
+
+  const run = async (v) => {
+    setProblemVersion(v);
+    const key = JSON.stringify([v, prompt.trim()]);
+    if (attempts.current.get(v)?.key !== key) attempts.current.set(v, { key, id: newId('todos') });
+    try {
+      const bundle=await apiGet(`/api/todo/templates/${encodeURIComponent(name)}/${encodeURIComponent(v)}/files`);
+      if(bundle.diagnostics?.length){setFileProblems(bundle.diagnostics);return;}
+      await apiPost('/api/todo/validate-files',{files:bundle.files});
+      const j = await apiPost(`/api/todo/templates/${encodeURIComponent(name)}/${encodeURIComponent(v)}/run`, { id: attempts.current.get(v).id, ...(prompt.trim() ? { input: { prompt: prompt.trim() } } : {}) });
+      attempts.current.delete(v);
+      onNotice(info(`已启动工作流: ${(j && j.workflow_id) || ''}`));
+      onChanged((j && j.workflow_id) || '');
+    } catch (e) {
+      setFileProblems(errorProblems(e));
+      onNotice(err('运行失败: ' + (e && e.message)));
+    }
+  };
+
+  return (
+    <div style={{ padding: '4px 0' }}>
+      {initialPrompt && <Input.TextArea aria-label="工作流任务要求" rows={4} value={prompt} onChange={(event) => setPrompt(event.target.value)} />}
+      <Text type="secondary">仅保留最近 10 个版本，超出的旧版本自动清理</Text>
+      {(versions || []).length === 0 ? <Text type="secondary">暂无版本</Text> : versions.map((v) => (
+        <div key={v.version} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '2px 0' }}>
+          <Tag color={template.current === v.version ? 'blue' : 'default'}>{v.version}</Tag>
+          <Text style={{ flex: 1, minWidth: 0 }} ellipsis>{v.note || '(无备注)'}</Text>
+          {envBy[v.version] ? <Tag color="purple">env: {envBy[v.version]}</Tag> : <Tag>未绑定 env</Tag>}
+          <Space size={0}>
+            <Button size="small" type="link" onClick={() => onEdit(name, v.version)}>编辑</Button>
+            <Button size="small" type="link" disabled={template.current === v.version} onClick={() => setCurrent(v.version)}>设为当前</Button>
+            <Button size="small" type="link" onClick={() => newVersion(v.version)}>新版本</Button>
+            <Popconfirm title={`删除版本 ${v.version}？`} onConfirm={() => deleteVersion(v.version)}>
+              <Button size="small" type="link" danger>删除版本</Button>
+            </Popconfirm>
+            <Button size="small" type="link" onClick={() => run(v.version)}>运行</Button>
+          </Space>
+        </div>
+      ))}
+      <Button size="small" type="dashed" style={{ marginTop: 6 }} onClick={() => newVersion('')}>+ 从当前新建版本</Button>
+      <FileProblems problems={fileProblems} onClose={()=>setFileProblems([])} onLocate={()=>onEdit(name,problemVersion)}/>
+    </div>
+  );
+}
+
+function TemplatesTab({ onNotice, onRan, initialPrompt = '' }) {
+  const [rows, setRows] = useState([]);
+  const [listProblems,setListProblems]=useState([]);
+  const [loading, setLoading] = useState(false);
+  const [editing, setEditing] = useState(null); // {name, version} → TodoEditor
+  const [creating, setCreating] = useState(false);
+  const [search, setSearch] = useState('');
+  const dirty=useRef(false);
+  const onDirtyChange=useCallback(value=>{dirty.current=value;},[]);
+  const closeDraft=callback=>{
+    if(dirty.current)Modal.confirm({title:'放弃未保存的修改？',okText:'放弃修改',cancelText:'继续编辑',onOk:()=>{dirty.current=false;callback();}});
+    else callback();
+  };
+  const [bump, setBump] = useState(0);
+
+  const load = useCallback(async (silent) => {
+    if (!silent) {
+      setLoading(true);
+    }
+    try {
+      const j = await apiGet('/api/todo/templates');
+      setRows((j && j.templates) || []);
+    } catch (e) {
+      if (!silent) {
+        setListProblems(errorProblems(e,'todo.json'));
+        onNotice(err('获取模板列表失败: ' + (e && e.message)));
+      }
+    } finally {
+      if (!silent) {
+        setLoading(false);
+      }
+    }
+  }, [onNotice]);
+
+  useEffect(() => {
+    load(false);
+  }, [load, bump]);
+
+  const deleteTemplate = async (name) => {
+    try {
+      await apiDel(`/api/todo/templates/${encodeURIComponent(name)}`);
+      onNotice(err(''));
+      setBump((n) => n + 1);
+    } catch (e) {
+      onNotice(err('删除模板失败: ' + (e && e.message)));
+    }
+  };
+
+  const closeEditor = () => closeDraft(()=>{setEditing(null);setBump(n=>n+1);});
+  const closeCreate = () => closeDraft(()=>setCreating(false));
+
+  const columns = [
+    { title: '名称', dataIndex: 'name', key: 'name' },
+    { title: '描述', dataIndex: 'description', key: 'description', ellipsis: true },
+    { title: '当前版本', dataIndex: 'current', key: 'current', width: 100,
+      render: (v) => <Tag color="blue">{v || '-'}</Tag> },
+    { title: '版本数', key: 'versions', width: 80,
+      render: (_, r) => <span>{(r.versions || []).length}</span> },
+    { title: '操作', key: 'ops', width: 120, render: (_, r) => (
+      <Popconfirm title={`删除模板 ${r.name}？`} onConfirm={() => deleteTemplate(r.name)}>
+        <Button size="small" danger>删除模板</Button>
+      </Popconfirm>
+    ) },
+  ];
+
+  // 搜索框为受控组件：按模板名称/描述（忽略大小写）过滤本地列表，不入服务端。
+  const query = search.trim().toLowerCase();
+  const visible = query
+    ? rows.filter((r) => [r.name, r.description].some((v) => String(v || '').toLowerCase().includes(query)))
+    : rows;
+
+  return (
+    <div>
+      <Space style={{ marginBottom: 12 }}>
+        <Input.Search
+          allowClear
+          style={{ minWidth: 220 }}
+          placeholder="搜索模板名称 / 描述"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          aria-label="todo-template-search"
+        />
+        <Button type="primary" onClick={() => setCreating(true)}>新建模板</Button>
+      </Space>
+      <FileProblems problems={listProblems} onClose={()=>setListProblems([])}/>
+      <Table
+        rowKey="name"
+        size="small"
+        loading={loading}
+        columns={columns}
+        dataSource={visible}
+        pagination={false}
+        expandable={{
+          expandedRowRender: (r) => (
+            <VersionsBlock
+              template={r}
+              initialPrompt={initialPrompt}
+              onNotice={onNotice}
+              onEdit={(name, version) => setEditing({ name, version })}
+              onChanged={(workflowId) => {
+                setBump((n) => n + 1);
+                if (workflowId) {
+                  onRan(workflowId);
+                }
+              }}
+            />
+          ),
+        }}
+      />
+      <Drawer
+        closable={false}
+        placement="right"
+        open={creating}
+        onClose={closeCreate}
+        size="100%"
+        styles={{ wrapper: { maxWidth: '100vw' } }}
+        destroyOnHidden
+      >
+        <TodoEditor
+          creating
+          onDirtyChange={onDirtyChange}
+          onNotice={onNotice}
+          onClose={closeCreate}
+          onCreated={() => {
+            dirty.current=false;
+            setCreating(false);
+            setBump((n) => n + 1);
+          }}
+        />
+      </Drawer>
+      <Drawer
+        closable={false}
+        placement="right"
+        open={!!editing}
+        onClose={closeEditor}
+        size="100%"
+        styles={{ wrapper: { maxWidth: '100vw' } }}
+        destroyOnHidden
+      >
+        {editing ? (
+          <TodoEditor
+            onDirtyChange={onDirtyChange}
+            templateName={editing.name}
+            version={editing.version}
+            onNotice={onNotice}
+            onClose={closeEditor}
+          />
+        ) : null}
+      </Drawer>
+    </div>
+  );
+}
+
+export function TodoPanel({ onNotice, onCreated, initialPrompt = '' }) {
+  const [tab, setTab] = useState('templates');
+  const [focusWorkflowId, setFocusWorkflowId] = useState('');
+
+  const onRan = useCallback((workflowId) => {
+    setFocusWorkflowId(workflowId || '');
+    setTab('runs');
+    if (workflowId) onCreated?.(workflowId);
+  }, [onCreated]);
+
+  return (
+    <Tabs
+      activeKey={tab}
+      onChange={setTab}
+      items={[
+        { key: 'envs', label: '模板环境与工具', children: <TodoEnvsPanel onNotice={onNotice} /> },
+        { key: 'templates', label: '模板', children: <TemplatesTab onNotice={onNotice} onRan={onRan} initialPrompt={initialPrompt} /> },
+        {
+          key: 'runs',
+          label: '运行',
+          children: (
+            <TodoRunsPanel
+              onNotice={onNotice}
+              focusWorkflowId={focusWorkflowId}
+              onFocusConsumed={() => setFocusWorkflowId('')}
+            />
+          ),
+        },
+      ]}
+    />
+  );
+}

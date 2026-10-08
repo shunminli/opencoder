@@ -8,14 +8,19 @@ pub(super) fn has_editable_key(root: &serde_json::Value) -> bool {
         Some(o) => o,
         None => return false,
     };
-    if obj.contains_key("model")
+    if obj.contains_key("ontology")
+        || obj.contains_key("model")
+        || obj.contains_key("opencoder_server")
         || obj.contains_key("small_model")
+        || obj.contains_key("embedding_model")
+        || obj.contains_key("embedding_provider")
         || obj.contains_key("max_tokens")
         || obj.contains_key("reasoning_effort")
         || obj.contains_key("interleaved_thinking")
         || obj.contains_key("context_limit")
         || obj.contains_key("fps")
         || obj.contains_key("enable_tmux_session")
+        || obj.contains_key("local_memory")
         || obj.contains_key("stream_idle_timeout_secs")
         || obj.contains_key("task_timeout_secs")
         || obj.contains_key("replay_timeout_secs")
@@ -26,7 +31,9 @@ pub(super) fn has_editable_key(root: &serde_json::Value) -> bool {
     if obj
         .get("provider")
         .and_then(|v| v.as_object())
-        .is_some_and(|p| p.contains_key("base_url") || p.contains_key("api_key"))
+        .is_some_and(|p| {
+            p.contains_key("base_url") || p.contains_key("api_key") || p.contains_key("protocol")
+        })
     {
         return true;
     }
@@ -44,8 +51,7 @@ pub(super) fn has_editable_key(root: &serde_json::Value) -> bool {
     if obj
         .get("agent")
         .and_then(|v| v.as_object())
-        // `agent.default` (string) is the only subkey merge_into applies, but
-        // any non-empty `agent` object signals user-intended config here.
+        // Any non-empty `agent` object signals user-intended config here.
         .is_some_and(|a| !a.is_empty())
     {
         return true;
@@ -115,11 +121,21 @@ pub(super) fn merge_json(dst: &mut serde_json::Value, patch: &serde_json::Value)
     }
 }
 
-/// The legacy domain keys (`mcp_servers` / `cli` / `skills` / `autopilot`)
-/// present in a parsed config.json object with non-`null` values, in fixed
-/// order. Pure input inspection — callers decide what to do with the result.
+pub(super) fn merge_fields<T>(current: &T, patch: &serde_json::Value) -> Option<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut merged = serde_json::to_value(current).ok()?;
+    merge_json(&mut merged, patch);
+    serde_json::from_value(merged).ok()
+}
+
+/// The domain keys (`mcp_servers` / `cli` / `skills` / `autopilot` /
+/// `schedules`) present in a parsed config.json object with non-`null`
+/// values, in fixed order. Pure input inspection — callers decide what to do
+/// with the result.
 fn legacy_domain_keys(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<&'static str> {
-    ["mcp_servers", "cli", "skills", "autopilot"]
+    ["mcp_servers", "cli", "skills", "autopilot", "schedules"]
         .into_iter()
         .filter(|k| obj.get(*k).is_some_and(|v| !v.is_null()))
         .collect()
@@ -129,6 +145,14 @@ fn legacy_domain_keys(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<&
 /// keys present in `value` are overwritten; everything else is left as-is.
 pub(super) fn merge_into(cfg: &mut Config, value: serde_json::Value) {
     if let Some(obj) = value.as_object() {
+        if let Some(server) = obj.get("opencoder_server") {
+            if let Some(enabled) = server.get("enabled").and_then(|v| v.as_bool()) {
+                cfg.opencoder_server.enabled = enabled;
+            }
+            if let Some(url) = server.get("url").and_then(|v| v.as_str()) {
+                cfg.opencoder_server.url = url.to_owned();
+            }
+        }
         // Legacy domain keys are hard-cut below (silent, pinned by test);
         // surface a one-shot migration hint so the drop is visible. Every
         // production caller feeds config.json-shaped candidates here —
@@ -149,6 +173,12 @@ pub(super) fn merge_into(cfg: &mut Config, value: serde_json::Value) {
         }
         if let Some(small) = obj.get("small_model").and_then(|v| v.as_str()) {
             cfg.small_model = Some(small.to_string());
+        }
+        if let Some(embedding) = obj.get("embedding_model").and_then(|v| v.as_str()) {
+            cfg.embedding_model = Some(embedding.to_string());
+        }
+        if let Some(provider) = obj.get("embedding_provider").and_then(|v| v.as_str()) {
+            cfg.embedding_provider = Some(provider.to_string());
         }
         if let Some(cl) = obj.get("context_limit").and_then(|v| v.as_u64()) {
             cfg.context_limit = Some(cl);
@@ -173,10 +203,31 @@ pub(super) fn merge_into(cfg: &mut Config, value: serde_json::Value) {
         if let Some(v) = obj.get("enable_tmux_session").and_then(|v| v.as_bool()) {
             cfg.enable_tmux_session = Some(v);
         }
+        if let Some(v) = obj.get("local_memory").and_then(|v| v.as_bool()) {
+            cfg.local_memory = v;
+        }
         if let Some(fps) = obj.get("fps").and_then(|v| v.as_u64()) {
             cfg.fps = Some(fps.clamp(1, 30) as u32);
         }
+        if let Some(p) = obj.get("team_root").and_then(|v| v.as_str()) {
+            if !p.is_empty() {
+                cfg.team_root = std::path::PathBuf::from(p);
+            }
+        }
+        if let Some(v) = obj.get("team_max_turns").and_then(|v| v.as_u64()) {
+            cfg.team_max_turns = v.min(usize::MAX as u64) as usize;
+        }
+        if let Some(v) = obj.get("team_max_sub_turns").and_then(|v| v.as_u64()) {
+            cfg.team_max_sub_turns = v.min(usize::MAX as u64) as usize;
+        }
         if let Some(p) = obj.get("provider").and_then(|v| v.as_object()) {
+            if let Some(v) = p.get("protocol") {
+                cfg.provider.protocol = if v.is_null() {
+                    "chat_completions".into()
+                } else {
+                    v.as_str().unwrap_or("invalid protocol type").to_owned()
+                };
+            }
             if let Some(b) = p.get("base_url").and_then(|v| v.as_str()) {
                 cfg.provider.base_url = b.to_string();
             }
@@ -198,6 +249,13 @@ pub(super) fn merge_into(cfg: &mut Config, value: serde_json::Value) {
             for (name, pv) in providers {
                 if let Some(pcfg) = pv.as_object() {
                     let entry = cfg.providers.entry(name.clone()).or_default();
+                    if let Some(v) = pcfg.get("protocol") {
+                        entry.protocol = if v.is_null() {
+                            "chat_completions".into()
+                        } else {
+                            v.as_str().unwrap_or("invalid protocol type").to_owned()
+                        };
+                    }
                     if let Some(b) = pcfg.get("base_url").and_then(|v| v.as_str()) {
                         entry.base_url = b.to_string();
                     }
@@ -243,8 +301,83 @@ pub(super) fn merge_into(cfg: &mut Config, value: serde_json::Value) {
             }
         }
         if let Some(a) = obj.get("agent").and_then(|v| v.as_object()) {
+            if let Some(value) = a.get("codex") {
+                if let Some(settings) = super::agent::merge_codex(&cfg.agent.codex, value) {
+                    cfg.agent.codex = settings;
+                }
+            }
+            if let Some(value) = a.get("runtime") {
+                if let Some(settings) = super::agent::merge_runtime(&cfg.agent.runtime, value) {
+                    cfg.agent.runtime = settings;
+                }
+            }
             if let Some(d) = a.get("default").and_then(|v| v.as_str()) {
                 cfg.agent.default = d.to_string();
+            }
+            if let Some(d) = a.get("agents_dir").and_then(|v| v.as_str()) {
+                cfg.agent.agents_dir = Some(std::path::PathBuf::from(d));
+            }
+            if let Some(d) = a.get("share_dir").and_then(|v| v.as_str()) {
+                cfg.agent.share_dir = Some(std::path::PathBuf::from(d));
+            }
+            if let Some(t) = a.get("tools_scope") {
+                if let Ok(parsed) = serde_json::from_value(t.clone()) {
+                    cfg.agent.tools_scope = parsed;
+                }
+            }
+            // Only explicitly configured NFS fields override the global base.
+            if let Some(n) = a.get("nfs") {
+                if let Some(parsed) = merge_fields(&cfg.agent.nfs, n) {
+                    cfg.agent.nfs = parsed;
+                }
+            }
+        }
+        if let Some(ontology) = obj.get("ontology") {
+            let mut merged = serde_json::to_value(&cfg.ontology).unwrap_or_default();
+            if let (Some(target), Some(patch)) = (merged.as_object_mut(), ontology.as_object()) {
+                for (key, value) in patch {
+                    if key == "nfs" {
+                        if let (Some(base), Some(overrides)) = (
+                            target.get_mut(key).and_then(|v| v.as_object_mut()),
+                            value.as_object(),
+                        ) {
+                            base.extend(overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
+                        }
+                    } else {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            if let Ok(value) = serde_json::from_value(merged) {
+                cfg.ontology = value;
+            }
+        }
+        if let Some(d) = obj.get("dag").and_then(|v| v.as_object()) {
+            if let Some(dir) = d.get("binary_dir").and_then(|v| v.as_str()) {
+                cfg.dag.binary_dir = Some(std::path::PathBuf::from(dir));
+            }
+            for (key, target) in [
+                ("workspace_dir", &mut cfg.dag.workspace_dir),
+                ("rootfs_dir", &mut cfg.dag.rootfs_dir),
+                ("data_dir", &mut cfg.dag.data_dir),
+            ] {
+                if let Some(value) = d.get(key).and_then(|value| value.as_str()) {
+                    *target = Some(std::path::PathBuf::from(value));
+                }
+            }
+            if let Some(value) = d.get("workspace_nfs") {
+                if let Some(parsed) = merge_fields(&cfg.dag.workspace_nfs, value) {
+                    cfg.dag.workspace_nfs = parsed;
+                }
+            }
+            if let Some(root) = d.get("knowledge_root").and_then(|v| v.as_str()) {
+                cfg.dag.knowledge_root = Some(std::path::PathBuf::from(root));
+            }
+
+            if let Some(n) = d.get("nfs") {
+                if let Some(parsed) = merge_fields(&cfg.dag.nfs, n) {
+                    cfg.dag.nfs = parsed;
+                }
             }
         }
         if let Some(n) = obj.get("network").and_then(|v| v.as_object()) {
@@ -326,13 +459,14 @@ mod tests {
             "skills": {},
             "cli": {},
             "mcp_servers": {},
-            "autopilot": {}
+            "autopilot": {},
+            "schedules": {}
         }));
-        // Order is fixed (mcp_servers, cli, skills, autopilot) regardless of
-        // JSON order.
+        // Order is fixed (mcp_servers, cli, skills, autopilot, schedules)
+        // regardless of JSON order.
         assert_eq!(
             legacy_domain_keys(&all),
-            vec!["mcp_servers", "cli", "skills", "autopilot"]
+            vec!["mcp_servers", "cli", "skills", "autopilot", "schedules"]
         );
 
         let nulled = as_map(serde_json::json!({
@@ -449,5 +583,117 @@ mod tests {
         assert_eq!(cfg.provider.headers[0].value, "abc-123");
         assert_eq!(cfg.provider.headers[1].name, "X-Org");
         assert_eq!(cfg.provider.headers[1].value, "acme");
+    }
+
+    /// Regression for the `agent` block merge: previously only `default`
+    /// merged, so `agents_dir` / `share_dir` / `tools_scope` and the whole
+    /// `nfs` sub-block set in a config file were silently dropped — leaving
+    /// `agent.nfs.enabled` unreachable from disk (dead daemon autostart) and
+    /// `agents_dir` unable to steer the NFS export root.
+    #[test]
+    fn merge_agent_block_dirs_tools_scope_and_nfs() {
+        let mut cfg = Config::default();
+        let value = serde_json::json!({
+            "agent": {
+                "default": "plan",
+                "agents_dir": "/custom/agents",
+                "share_dir": "/mnt/share",
+                "tools_scope": "all",
+                "nfs": { "enabled": true, "port": 0, "host": "0.0.0.0" }
+            }
+        });
+        merge_into(&mut cfg, value);
+
+        assert_eq!(cfg.agent.default, "plan");
+        assert_eq!(
+            cfg.agent.agents_dir.as_deref(),
+            Some(std::path::Path::new("/custom/agents"))
+        );
+        assert_eq!(
+            cfg.agent.share_dir.as_deref(),
+            Some(std::path::Path::new("/mnt/share"))
+        );
+        assert_eq!(cfg.agent.tools_scope, crate::config::ToolsScope::All);
+        assert!(cfg.agent.nfs.enabled, "nfs.enabled must merge from disk");
+        assert_eq!(cfg.agent.nfs.port, 0);
+        assert_eq!(cfg.agent.nfs.host, "0.0.0.0");
+        // Unspecified nfs fields keep their serde defaults.
+        assert!(cfg.agent.nfs.read_only);
+    }
+
+    #[test]
+    fn merge_dag_block_binary_dir_and_nfs() {
+        let mut cfg = Config::default();
+        merge_into(
+            &mut cfg,
+            serde_json::json!({
+                "dag": { "binary_dir": "/custom/binaries", "nfs": { "enabled": true, "port": 0 } }
+            }),
+        );
+        assert_eq!(
+            cfg.dag.binary_dir.as_deref(),
+            Some(std::path::Path::new("/custom/binaries"))
+        );
+        assert!(cfg.dag.nfs.enabled);
+        assert_eq!(cfg.dag.nfs.port, 0);
+        // Unspecified nfs fields keep their serde defaults.
+        assert_eq!(cfg.dag.nfs.host, "127.0.0.1");
+        assert!(cfg.dag.nfs.read_only);
+
+        // The knowledge-root + agent-sandbox knobs merge too (node-local
+        // DAG sandbox configuration survives a config reload).
+        let mut cfg = Config::default();
+        merge_into(
+            &mut cfg,
+            serde_json::json!({ "dag": { "knowledge_root": "/kb/root" } }),
+        );
+        assert_eq!(
+            cfg.dag.knowledge_root.as_deref(),
+            Some(std::path::Path::new("/kb/root"))
+        );
+
+        // A partial dag block leaves the rest at defaults (no leakage
+        // between config files).
+        let mut cfg = Config::default();
+        merge_into(
+            &mut cfg,
+            serde_json::json!({ "dag": { "nfs": { "port": 1 } } }),
+        );
+        assert_eq!(cfg.dag.binary_dir, None);
+        assert_eq!(cfg.dag.knowledge_root, None);
+
+        assert!(!cfg.dag.nfs.enabled);
+        assert_eq!(cfg.dag.nfs.port, 1);
+    }
+    #[test]
+    fn local_memory_is_an_explicit_default_off_config_toggle() {
+        let mut cfg = Config::default();
+        assert!(!cfg.local_memory);
+        merge_into(&mut cfg, serde_json::json!({"local_memory": true}));
+        assert!(cfg.local_memory);
+        merge_into(&mut cfg, serde_json::json!({"local_memory": false}));
+        assert!(!cfg.local_memory);
+    }
+    #[test]
+    fn ontology_nested_overlays_keep_files_and_other_export_settings() {
+        let mut config = Config::default();
+        merge_into(
+            &mut config,
+            serde_json::json!({"ontology":{"files_dir":"/ontology","nfs":{"enabled":true,"port":2059}}}),
+        );
+        merge_into(
+            &mut config,
+            serde_json::json!({"ontology":{"nfs":{"host":"0.0.0.0"}}}),
+        );
+        assert_eq!(
+            config.ontology.files_dir.as_deref(),
+            Some(std::path::Path::new("/ontology"))
+        );
+        assert!(config.ontology.nfs.enabled);
+        assert_eq!(config.ontology.nfs.port, 2059);
+        assert_eq!(config.ontology.nfs.host, "0.0.0.0");
+        assert_eq!(config.agent.nfs.port, 2049);
+        assert_eq!(config.dag.nfs.port, 2050);
+        assert_eq!(config.dag.workspace_nfs.port, 2051);
     }
 }

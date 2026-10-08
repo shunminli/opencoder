@@ -20,7 +20,7 @@ async fn fresh() -> (TempDir, LibsqlStore) {
 
 async fn register(store: &LibsqlStore, name: &str, now_ms: i64) -> opencoder_store::NodeRecord {
     store
-        .register_node(name, Some("v1"), Some("/tmp/wd"), now_ms)
+        .register_node(name, Some("v1"), Some("/tmp/wd"), None, now_ms)
         .await
         .unwrap()
 }
@@ -65,8 +65,7 @@ fn sessmeta(id: &str, now: i64) -> SessionMeta {
         skill: None,
         task_type: None,
         requirement: None,
-        plan_snapshot: None,
-        plan_input_count: 0,
+        kind: None,
     }
 }
 

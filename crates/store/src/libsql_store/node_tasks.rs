@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use libsql::{params, Connection};
 
 use super::node_state::transition_allowed;
-use crate::types::{NodeTaskRecord, NodeTaskStatus, SessionMeta, TASK_TYPE_NODE};
+use crate::types::{ClearNodeDialogs, NodeTaskRecord, NodeTaskStatus, SessionMeta, TASK_TYPE_NODE};
 
 const TASK_COLS: &str = "id, node_id, session_id, title, prompt, agent, model, status, error, cancel_requested, created_at, claimed_at, finished_at";
 
@@ -33,6 +33,7 @@ pub async fn dispatch(
         super::sessions::create(
             conn,
             &SessionMeta {
+                kind: None,
                 id: session_id.to_string(),
                 title: title.map(str::to_string),
                 agent: agent.map(str::to_string),
@@ -49,23 +50,83 @@ pub async fn dispatch(
                 skill: None,
                 task_type: Some(TASK_TYPE_NODE.to_string()),
                 requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
             },
         )
         .await?;
-        conn.execute(
-            "INSERT INTO node_tasks (id, node_id, session_id, title, prompt, agent, model, status, error, cancel_requested, created_at, claimed_at, finished_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', NULL, 0, ?8, NULL, NULL)",
-            params![task_id, node_id, session_id, title, prompt, agent, model, now_ms],
+        insert_task_row(
+            conn, task_id, session_id, node_id, title, prompt, agent, model, now_ms,
         )
-        .await
-        .context("insert node_task")?;
+        .await?;
         get_task(conn, task_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("dispatch_node_task: row {task_id} vanished"))
     })
     .await
+}
+
+/// Enqueue a node task bound to an EXISTING session (dialog resume): the
+/// session row is reused untouched — only the `node_tasks` row appears. The
+/// in-transaction existence check keeps the FK honest even under a racing
+/// delete; the HTTP layer maps the error to 400.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_for_session(
+    conn: &Connection,
+    task_id: &str,
+    session_id: &str,
+    node_id: &str,
+    title: Option<&str>,
+    prompt: &str,
+    agent: Option<&str>,
+    model: Option<&str>,
+    now_ms: i64,
+) -> Result<NodeTaskRecord> {
+    super::tx::run_tx(conn, "BEGIN IMMEDIATE", || async move {
+        if !node_exists(conn, node_id).await? {
+            anyhow::bail!("dispatch_node_task: node {node_id} does not exist");
+        }
+        if !session_exists(conn, session_id).await? {
+            anyhow::bail!("dispatch_node_task: session {session_id} does not exist");
+        }
+        insert_task_row(
+            conn, task_id, session_id, node_id, title, prompt, agent, model, now_ms,
+        )
+        .await?;
+        get_task(conn, task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("dispatch_node_task: row {task_id} vanished"))
+    })
+    .await
+}
+
+/// Shared `INSERT INTO node_tasks` (pending, unclaimed).
+#[allow(clippy::too_many_arguments)]
+async fn insert_task_row(
+    conn: &Connection,
+    task_id: &str,
+    session_id: &str,
+    node_id: &str,
+    title: Option<&str>,
+    prompt: &str,
+    agent: Option<&str>,
+    model: Option<&str>,
+    now_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO node_tasks (id, node_id, session_id, title, prompt, agent, model, status, error, cancel_requested, created_at, claimed_at, finished_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', NULL, 0, ?8, NULL, NULL)",
+        params![task_id, node_id, session_id, title, prompt, agent, model, now_ms],
+    )
+    .await
+    .context("insert node_task")?;
+    Ok(())
+}
+
+async fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
+    let stmt = conn
+        .prepare("SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1")
+        .await?;
+    let mut rows = stmt.query(params![session_id]).await?;
+    Ok(rows.next().await?.is_some())
 }
 
 /// Atomically claim the oldest pending task of `node_id`. Returns `None`
@@ -237,6 +298,46 @@ pub async fn converge_lost(
     .await
 }
 
+/// Bulk-clear a node's console dialogs in one transaction: delete the
+/// sessions of every TERMINAL task (done | error | cancelled) of `node_id`;
+/// sessions of pending/running/cancelling tasks are kept and reported as
+/// `skipped`. The `sessions` delete cascades to the node_tasks row and all
+/// child tables, so no per-row work is needed.
+pub async fn clear_finished_sessions(conn: &Connection, node_id: &str) -> Result<ClearNodeDialogs> {
+    super::tx::run_tx(conn, "BEGIN IMMEDIATE", || async move {
+        let skipped = {
+            let stmt = conn
+                .prepare(
+                    "SELECT session_id FROM node_tasks
+                     WHERE node_id = ?1 AND status NOT IN ('done','error','cancelled')
+                     ORDER BY created_at DESC",
+                )
+                .await?;
+            let mut rows = stmt.query(params![node_id]).await?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().await? {
+                out.push(r.get::<String>(0)?);
+            }
+            out
+        };
+        let removed = conn
+            .execute(
+                "DELETE FROM sessions WHERE id IN (
+                   SELECT session_id FROM node_tasks
+                   WHERE node_id = ?1 AND status IN ('done','error','cancelled')
+                 )",
+                params![node_id],
+            )
+            .await
+            .context("clear finished node sessions")?;
+        Ok(ClearNodeDialogs {
+            removed: removed as u64,
+            skipped,
+        })
+    })
+    .await
+}
+
 /// Flag a pending/running task for cancellation; returns the previous status
 /// when the flag landed, else `None` (idempotent and harmless on repeats).
 pub async fn request_cancel(conn: &Connection, task_id: &str) -> Result<Option<NodeTaskStatus>> {
@@ -278,6 +379,57 @@ pub async fn list_tasks(
         out.push(row_to_task(&r)?);
     }
     Ok(out)
+}
+
+/// Fleet-wide listing with optional `node_id` / `status` filters, FIFO order
+/// (`created_at ASC, rowid ASC` — same drain order as [`claim_next`], with the
+/// same-ms `rowid` tiebreak).
+pub async fn list_tasks_filtered(
+    conn: &Connection,
+    node_id: Option<&str>,
+    status: Option<NodeTaskStatus>,
+    limit: u32,
+) -> Result<Vec<NodeTaskRecord>> {
+    let mut where_clauses: Vec<&str> = Vec::new();
+    let mut args: Vec<libsql::Value> = Vec::new();
+    if let Some(nid) = node_id {
+        where_clauses.push("node_id = ?");
+        args.push(nid.to_string().into());
+    }
+    if let Some(st) = status {
+        where_clauses.push("status = ?");
+        args.push(st.as_str().into());
+    }
+    let mut sql = format!("SELECT {TASK_COLS} FROM node_tasks");
+    if !where_clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clauses.join(" AND "));
+    }
+    sql.push_str(" ORDER BY created_at ASC, rowid ASC LIMIT ");
+    sql.push_str(&i64::from(limit.max(1)).to_string());
+    let stmt = conn.prepare(&sql).await?;
+    let mut rows = stmt.query(libsql::params::Params::Positional(args)).await?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().await? {
+        out.push(row_to_task(&r)?);
+    }
+    Ok(out)
+}
+
+/// Reverse lookup by the task's unique synthetic session (`session_id` is
+/// `UNIQUE` in the schema, so at most one task can match).
+pub async fn get_by_session(conn: &Connection, session_id: &str) -> Result<Option<NodeTaskRecord>> {
+    let stmt = conn
+        .prepare(&format!(
+            "SELECT {TASK_COLS} FROM node_tasks WHERE session_id = ?1
+             ORDER BY rowid DESC LIMIT 1"
+        ))
+        .await?;
+    let mut rows = stmt.query(params![session_id]).await?;
+    match rows.next().await? {
+        Some(r) => Ok(Some(row_to_task(&r)?)),
+        None => Ok(None),
+    }
 }
 
 pub async fn get_task(conn: &Connection, task_id: &str) -> Result<Option<NodeTaskRecord>> {

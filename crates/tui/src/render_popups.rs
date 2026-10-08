@@ -1,6 +1,6 @@
 //! Popup overlay cluster — every `Option<&Menu>` overlay drawn above the
 //! composer in one pass. Extracted verbatim from `render.rs` (plus the
-//! `@file` picker) to keep that file under the 800-line cap. Geometry and
+//! agent picker) to keep that file under the 800-line cap. Geometry and
 //! z-order (declaration order) are unchanged: each popup renders only when
 //! its `Some`, later popups over earlier ones.
 
@@ -9,7 +9,6 @@ use ratatui::Frame;
 
 use crate::cache_salt_menu::CacheSaltMenu;
 use crate::command::CommandMenu;
-use crate::file_menu::FileMenu;
 use crate::keymap_menu::KeymapMenu;
 use crate::model_menu::ModelMenu;
 use crate::render::MouseHits;
@@ -23,10 +22,9 @@ pub(crate) fn render_popups(
     hits: &mut MouseHits,
     task_picker: Option<&TaskPicker>,
     command_menu: Option<&CommandMenu>,
-    file_menu: Option<&FileMenu>,
+    agent_menu: Option<&crate::agent_menu::AgentMenu>,
     model_menu: Option<&ModelMenu>,
     mcp_menu: Option<&crate::mcp_menu::McpMenu>,
-    envs_menu: Option<&crate::envs_menu::EnvsMenu>,
     cli_menu: Option<&crate::cli_menu::CliMenu>,
     skill_toggle_menu: Option<&crate::skill_menu::SkillMenu>,
     ap_menu: Option<&crate::ap_menu::ApMenu>,
@@ -40,17 +38,14 @@ pub(crate) fn render_popups(
     if let Some(cm) = command_menu {
         crate::command::render_command_popup(f, area, composer_top, cm);
     }
-    if let Some(fm) = file_menu {
-        crate::file_menu::render_file_popup(f, area, composer_top, fm);
+    if let Some(ag) = agent_menu {
+        crate::agent_menu::render_agent_popup(f, area, composer_top, ag);
     }
     if let Some(mm) = model_menu {
         crate::model_menu::render_model_popup(f, area, composer_top, mm);
     }
     if let Some(mcp) = mcp_menu {
         crate::mcp_menu::render_mcp_popup(f, area, composer_top, mcp);
-    }
-    if let Some(envs) = envs_menu {
-        crate::envs_menu::render_envs_popup(f, area, composer_top, envs);
     }
     if let Some(cli) = cli_menu {
         crate::cli_menu::render_cli_popup(f, area, composer_top, cli);

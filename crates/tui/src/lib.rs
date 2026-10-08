@@ -1,12 +1,15 @@
+pub mod agent_menu;
 pub mod ap_menu;
 pub mod app;
 pub mod app_helpers;
 pub mod attach_badge;
 pub mod bash_exec;
+pub mod boot_clock;
 pub mod cache_salt_menu;
 pub mod chat;
 pub mod chat_plan;
 pub mod chat_req;
+pub mod clear_confirm;
 pub mod cli_menu;
 pub mod clipboard;
 pub mod command;
@@ -14,10 +17,9 @@ pub mod composer;
 pub mod control_helpers;
 pub mod copy_mode;
 pub mod copy_wrap;
-pub mod envs_menu;
-pub mod file_menu;
 pub mod fmt;
 pub mod frame;
+mod hooks;
 pub mod idle_rekick;
 pub mod image_chunk;
 pub mod image_render;
@@ -38,18 +40,27 @@ pub mod plan_edit;
 pub mod question_menu;
 pub mod queue_admitter;
 pub mod queue_panel;
+pub mod remote;
 pub mod render;
 pub mod render_viewport;
 pub mod resize;
 pub mod scope_dialog;
 pub mod scrollbar;
 pub mod session_ui;
+pub mod sidecar_ui;
+#[cfg(unix)]
+pub mod signal_guard;
+#[cfg(windows)]
+#[path = "windows_console.rs"]
+pub mod signal_guard;
 pub mod skill_display;
 pub mod skill_menu;
 pub mod skill_persist;
 pub mod skill_token;
+pub mod steer_admit;
 pub mod supervisor;
 pub mod task;
+pub mod task_row;
 pub mod terminal;
 pub mod terminal_text;
 pub mod theme;
@@ -61,24 +72,45 @@ pub mod vim;
 pub mod welcome;
 pub mod worker;
 
+#[cfg(test)]
+#[path = "sidecar_ui_tests.rs"]
+mod sidecar_ui_tests;
+
 use std::path::PathBuf;
 
 use anyhow::Result;
+use opencoder_core::Config;
 
 #[derive(Default)]
 pub struct TuiOpts {
+    pub harness: Option<opencoder_core::harness::Harness>,
+    pub envs: std::collections::BTreeMap<String, String>,
     pub workdir: Option<PathBuf>,
     pub session: Option<String>,
     pub model: Option<String>,
+    pub agent: Option<String>,
 }
 
 impl TuiOpts {
     pub fn new(workdir: Option<PathBuf>) -> Self {
         TuiOpts {
+            harness: None,
+            envs: Default::default(),
             workdir,
             session: None,
             model: None,
+            agent: None,
         }
+    }
+
+    pub fn with_harness(
+        mut self,
+        harness: Option<opencoder_core::harness::Harness>,
+        envs: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.harness = harness;
+        self.envs = envs;
+        self
     }
 
     pub fn with_session(mut self, session: Option<String>) -> Self {
@@ -90,8 +122,24 @@ impl TuiOpts {
         self.model = model;
         self
     }
+
+    pub fn with_agent(mut self, agent: Option<String>) -> Self {
+        self.agent = agent;
+        self
+    }
+}
+
+/// The initial agent name for a fresh TUI session: an explicit `--agent`
+/// override > the active file-agent marker > `config.agent.default` > "act"
+/// — the same effective-default chain the headless run path uses
+/// (`opencoder_core::agent::effective_default_agent`). Pure so the
+/// bootstrap choice is directly unit-testable.
+pub fn fresh_agent_name(opts: &TuiOpts, config: &Config) -> String {
+    opencoder_core::effective_default_agent(opts.agent.as_deref(), config)
 }
 
 pub async fn run_tui(opts: &TuiOpts) -> Result<()> {
+    #[cfg(windows)]
+    opencoder_session::tools::command::host::program().await?;
     app::run(opts).await
 }

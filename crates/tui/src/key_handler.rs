@@ -2,7 +2,6 @@
 //! within the 800-line limit. Contains the `KeyAction` enum, the main
 //! `handle_key` dispatcher, and the `move_hist` history-cycle helper.
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -12,7 +11,6 @@ use crate::keymap::KeyBindings;
 use opencoder_core::discover_skills;
 
 use crate::composer;
-use crate::file_menu::{handle_file_key, FileMenu, FileOutcome};
 use crate::menu::{handle_menu_key, MenuOutcome, SkillMenu};
 
 /// Window for double-Esc hard-abort (milliseconds).
@@ -35,14 +33,40 @@ pub(crate) enum KeyAction {
     /// the parent agent — so it is rejected here. The input box is left
     /// untouched so the user can press Enter to steer the subagent instead.
     QueueUnsupported,
-    /// A textual mode command was submitted while a running subagent is
-    /// focused (subagents have no mode concept, so it can neither steer the
-    /// child nor be deferred to a parent boundary). The input remains
-    /// untouched so the user can retry at an idle boundary.
+    /// A `/sidecar <question>` submission (or a follow-up typed inside the
+    /// focused sidecar box). Routed to the sidecar actor — never through
+    /// steer/queue/prompt — so the main task keeps running untouched.
+    /// An empty question is the bare `/sidecar` form: enter a FRESH panel
+    /// (destroy-on-entry: the previous conversation is reset and the empty
+    /// panel shows its enter hint).
+    SidecarAsk(String),
+    /// A bare act/plan switch (`/act`, `/plan`) was submitted while the
+    /// parent turn runs — refused with the busy flash: a mode switch never
+    /// applies mid-flight and is never queued. While a running subagent is
+    /// focused every mode command is blocked too (subagents have no mode
+    /// concept, so it can neither steer the child nor be deferred to a
+    /// parent boundary). The input remains untouched so the user can retry
+    /// at an idle boundary.
     ModeSwitchBlocked,
+    SelectAgent(String),
+    OpenTask,
+    /// Ctrl+T: preserve the transcript and toggle the parent between act and
+    /// plan. The dispatcher applies the switch when the parent is idle; while
+    /// running it refuses with the busy flash (mode switches never land
+    /// mid-flight).
     SwitchAgent(String),
-    SwitchAgentNoClear(String),
     Cancel,
+    /// Shift+Tab in plan mode: arm the clear-context countdown confirm instead
+    /// of firing outright — the plan is preserved and handed to act. (Shift+Tab
+    /// in act mode is the non-destructive way back: SwitchAgent("plan").)
+    /// The guard keeps that boundary visible and lets Esc 回撤 before it lands.
+    /// `rest` is the swallowed composer draft forwarded as the compound tail;
+    /// `draft` is the same raw (untrimmed) text kept for the guard's Esc 回撤
+    /// to put back into the composer verbatim.
+    ArmClearConfirm {
+        rest: Option<String>,
+        draft: Option<String>,
+    },
     /// Enter the plan-text editor (Shift+I in plan mode when idle).
     EnterPlanEdit,
     /// Activate a skill picked from the `$` menu, or clear the active skill
@@ -67,6 +91,11 @@ pub(crate) fn handle_key(
     history: &[String],
     hist_idx: &mut Option<usize>,
     running: bool,
+    // Whether any subagents are live (`chat.subagents_running > 0`). The
+    // parent turn may already report idle while its subagent batch is still
+    // draining (autopilot stage gap, cancel grace, reabsorb tail), so Tab's
+    // queue-vs-submit arm must treat live subagents as busy too.
+    subagents_running: bool,
     agent: &str,
     scroll: &mut u32,
     follow: &mut bool,
@@ -75,11 +104,14 @@ pub(crate) fn handle_key(
     inner_w: u16,
     prompt_w: u16,
     subagent_focused: bool,
+    // Whether the sidecar interaction box is focused (`chat.sidecar_focus`).
+    // Mutually exclusive with `subagent_focus`. While set, Enter always
+    // routes to the sidecar actor and Tab can never queue into the parent.
+    sidecar_focused: bool,
     input_disabled: bool,
     undo_state: &mut crate::undo::UndoState,
     queue_scroll: &mut u32,
-    file_menu: &mut Option<FileMenu>,
-    workdir: &Path,
+    agent_menu: &mut Option<crate::agent_menu::AgentMenu>,
 ) -> KeyAction {
     // Modal skill picker: intercept all keys while open.
     if skill_menu.is_some() {
@@ -104,28 +136,29 @@ pub(crate) fn handle_key(
             MenuOutcome::Idle => KeyAction::None,
         };
     }
-    // File-mention picker (`@`): intercept all keys while open, mirroring
-    // the `$` skill picker above. A pick inserts the `@relative/path `
-    // token at the cursor — the trigger `@` was consumed on open, so the
-    // pick re-emits it; the marker keeps the token expandable to an
-    // absolute path at submit time (mention_resolve).
-    if file_menu.is_some() {
-        return match handle_file_key(file_menu, k) {
-            FileOutcome::Pick(token) => {
-                let (s, i) = composer::insert_str(input, *cursor_idx, &token);
-                *input = s;
-                *cursor_idx = i;
-                crate::undo::snapshot(undo_state, input, *cursor_idx, false);
-                KeyAction::None
+    // Agent picker (`/agent`): intercept all keys while open, same slot
+    // pattern as the pickers above. A pick REPLACES the composer with the
+    // runner's `/agent <name> ` control head — the opener (command popup
+    // Enter or a bare `/agent` submit) left `/agent` behind, and the pick
+    // completes it with the chosen name so the normal submit path applies
+    // the switch at the runner's control boundary.
+    if agent_menu.is_some() {
+        return match crate::agent_menu::handle_agent_key(agent_menu, k) {
+            crate::agent_menu::AgentOutcome::Pick(name) => {
+                input.clear();
+                *cursor_idx = 0;
+                crate::undo::reset(undo_state, input, *cursor_idx);
+                KeyAction::SelectAgent(name)
             }
-            FileOutcome::Close | FileOutcome::Idle => KeyAction::None,
+            crate::agent_menu::AgentOutcome::Quit => KeyAction::Quit,
+            crate::agent_menu::AgentOutcome::Idle => KeyAction::None,
         };
     }
     // Queue/steer panel scroll keys: Shift+PageUp looks at older pending
     // entries (toward the top), Shift+PageDown moves toward newer ones
     // (toward the bottom). Plain PageUp/PageDown keep scrolling the body
     // (below). A stale offset is clamped on the next render, so these are
-    // safe even while the panel is hidden (plan mode).
+    // safe even while the panel is hidden.
     if k.modifiers.contains(KeyModifiers::SHIFT) {
         match k.code {
             KeyCode::PageUp => {
@@ -163,41 +196,10 @@ pub(crate) fn handle_key(
         if bindings.help.matches(&k) {
             return KeyAction::OpenKeymap;
         }
-        // Mode-switch keys stay live in the subagent-focus (input-disabled)
-        // view: leaving/switching mode must never be blocked by view state.
-        // All four funnel into handle_switch_agent, whose running gate
-        // blocks BOTH directions while a turn/subagent is live (busy hint).
-        // The `/plan <content>` compound-submit branch of
-        // the enabled path is intentionally skipped — input is disabled here.
-        // A plain BackTab carries no CTRL/ALT modifier, so it cannot
-        // mis-match the switch_mode_clear / switch_mode_keep bindings above
-        // (keymap `matches` requires exact modifiers besides lenient SHIFT).
-        if bindings.switch_mode_clear.matches(&k) {
-            let next = if agent == "plan" { "act" } else { "plan" };
-            return KeyAction::SwitchAgent(next.into());
-        }
-        if bindings.switch_mode_keep.matches(&k) {
-            let next = if agent == "plan" { "act" } else { "plan" };
-            return KeyAction::SwitchAgentNoClear(next.into());
-        }
-        // switch_mode (default ctrl+t): same NoClear semantics as the
-        // enabled path — a customized chord must not go dead just because
-        // a subagent is focused.
         if bindings.switch_mode.matches(&k) {
-            let next = if agent == "plan" { "act" } else { "plan" };
-            return KeyAction::SwitchAgentNoClear(next.into());
-        }
-        if k.code == KeyCode::BackTab {
-            let next = if agent == "plan" { "act" } else { "plan" };
-            return KeyAction::SwitchAgent(next.into());
+            return KeyAction::SwitchAgent(next_primary_agent(agent).into());
         }
         return KeyAction::None;
-    }
-
-    // switch_mode_clear (default: Alt+Tab): switches act <-> plan mode.
-    if bindings.switch_mode_clear.matches(&k) {
-        let next = if agent == "plan" { "act" } else { "plan" };
-        return KeyAction::SwitchAgent(next.into());
     }
 
     // forward_word / backward_word (default: Alt+F / Alt+B).
@@ -208,14 +210,6 @@ pub(crate) fn handle_key(
     if bindings.backward_word.matches(&k) {
         *cursor_idx = composer::backward_word(input, *cursor_idx);
         return KeyAction::None;
-    }
-
-    // switch_mode_keep (default: Ctrl+Shift+Tab): toggle act <-> plan mode
-    // WITHOUT clearing context. The `matches` method normalizes BackTab ≡
-    // Tab+SHIFT so both terminal variants are covered.
-    if bindings.switch_mode_keep.matches(&k) {
-        let next = if agent == "plan" { "act" } else { "plan" };
-        return KeyAction::SwitchAgentNoClear(next.into());
     }
 
     // --- Config-driven Ctrl bindings ---
@@ -257,8 +251,7 @@ pub(crate) fn handle_key(
         return KeyAction::None;
     }
     if bindings.switch_mode.matches(&k) {
-        let next = if agent == "plan" { "act" } else { "plan" };
-        return KeyAction::SwitchAgentNoClear(next.into());
+        return KeyAction::SwitchAgent(next_primary_agent(agent).into());
     }
     if bindings.paste_image.matches(&k) {
         return KeyAction::Clip;
@@ -290,24 +283,6 @@ pub(crate) fn handle_key(
         return KeyAction::None;
     }
     match k.code {
-        KeyCode::BackTab => {
-            // Shift+Tab = primary mode switch (codex-cli style), BUT a
-            // compound `/plan <content>` input is submitted as a plan-mode
-            // prompt rather than just toggling the agent (mirrors the
-            // Enter/Tab submit + buffer-clear flow).
-            if let Some(text) = crate::control_helpers::plan_compound_for_submit(input) {
-                // Submit even while running: app.rs routes a running Submit
-                // to the queue, so the mode switch lands at the next idle
-                // boundary instead of being refused at admission.
-                input.clear();
-                *cursor_idx = 0;
-                *hist_idx = None;
-                crate::undo::reset(undo_state, input, *cursor_idx);
-                return KeyAction::Submit(text);
-            }
-            let next = if agent == "plan" { "act" } else { "plan" };
-            KeyAction::SwitchAgent(next.into())
-        }
         KeyCode::Enter => {
             // Shift+Enter / Alt+Enter insert a newline (multi-line input).
             if k.modifiers
@@ -323,14 +298,71 @@ pub(crate) fn handle_key(
                 return KeyAction::None;
             }
             let text = input.trim().to_string();
-            // A mode command typed while a running subagent is focused stays
-            // blocked (subagents have no mode concept — it would otherwise
-            // steer the child as plain text). The parent session's running
-            // path steers freely: the runner applies the command at the next
-            // turn boundary.
-            if running && subagent_focused && opencoder_session::control_cmd::is_mode_control(&text)
+            if (agent.starts_with("agent:") || agent.starts_with("operator:")) && text == "/stop" {
+                input.clear();
+                *cursor_idx = 0;
+                *hist_idx = None;
+                crate::undo::reset(undo_state, input, *cursor_idx);
+                return KeyAction::Cancel;
+            }
+            if matches!(
+                crate::command::parse(&text),
+                Some(crate::command::SlashAction::Task)
+            ) {
+                input.clear();
+                *cursor_idx = 0;
+                *hist_idx = None;
+                crate::undo::reset(undo_state, input, *cursor_idx);
+                return KeyAction::OpenTask;
+            }
+            if is_agent_command(&text) {
+                input.clear();
+                *cursor_idx = 0;
+                *hist_idx = None;
+                crate::undo::reset(undo_state, input, *cursor_idx);
+                return KeyAction::SelectAgent(
+                    text.strip_prefix("/agent").unwrap_or("").trim().to_owned(),
+                );
+            }
+            // A bare act/plan switch while the parent turn runs is refused:
+            // a mid-flight switch would re-aim the session the worker is
+            // streaming into. Compound forms (`/plan review …`) are task
+            // submissions and steer as before. While a running subagent is
+            // focused every mode command stays blocked (subagents have no
+            // mode concept — it would otherwise steer the child as plain
+            // text). Either way the typed text stays for an idle retry.
+            if running
+                && (is_bare_mode_switch(&text)
+                    || (subagent_focused && opencoder_session::control_cmd::is_mode_control(&text)))
             {
                 return KeyAction::ModeSwitchBlocked;
+            }
+            // Sidecar focus: Enter is a follow-up question to the sidecar
+            // conversation — the parent's steer/submit paths are unreachable
+            // while the sidecar box is focused. Bare `/sidecar` (empty
+            // question) still lands here; the app arm enters a FRESH panel
+            // (destroy-on-entry — the old conversation is reset, the empty
+            // panel shows its enter hint). The full `/sidecar <question>`
+            // form typed inside the box is normalized too: the prefix must
+            // never be echoed to the model.
+            if sidecar_focused {
+                input.clear();
+                *cursor_idx = 0;
+                *hist_idx = None;
+                crate::undo::reset(undo_state, input, *cursor_idx);
+                let question = opencoder_session::parse_sidecar_question(&text).unwrap_or(text);
+                return KeyAction::SidecarAsk(question);
+            }
+            // `/sidecar <question>` intercepts in BOTH states — idle and
+            // running. That is the whole point: the question goes to the
+            // sidecar actor directly, so the main task keeps running without
+            // being steered, queued or interrupted.
+            if let Some(question) = opencoder_session::parse_sidecar_question(&text) {
+                input.clear();
+                *cursor_idx = 0;
+                *hist_idx = None;
+                crate::undo::reset(undo_state, input, *cursor_idx);
+                return KeyAction::SidecarAsk(question);
             }
             input.clear();
             *cursor_idx = 0;
@@ -354,28 +386,105 @@ pub(crate) fn handle_key(
                 KeyAction::Submit(text)
             }
         }
+        // Shift+Tab spelled as (Tab, SHIFT): several terminals report the
+        // chord this way instead of BackTab. Same chord, same mode-aware action — the
+        // plain queue/submit Tab arm below must not swallow it (on those
+        // terminals it would submit the draft instead of arming/switching).
+        // CONTROL/ALT/SUPER variants fall through to the plain Tab arm, same
+        // as pre-regression behavior.
+        KeyCode::Tab
+            if k.modifiers.contains(KeyModifiers::SHIFT)
+                && !k.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+        {
+            shift_tab_action(
+                agent,
+                input,
+                cursor_idx,
+                hist_idx,
+                subagent_focused,
+                sidecar_focused,
+                undo_state,
+            )
+        }
         KeyCode::Tab => {
-            // Tab = follow-up (queue) when running; normal submit when idle.
+            // Tab = follow-up (queue) when busy (running turn OR live
+            // subagents); normal submit only when fully idle.
             if input.trim().is_empty() {
                 return KeyAction::None;
             }
             let text = input.trim().to_string();
+            if (agent.starts_with("agent:") || agent.starts_with("operator:")) && text == "/stop" {
+                input.clear();
+                *cursor_idx = 0;
+                *hist_idx = None;
+                crate::undo::reset(undo_state, input, *cursor_idx);
+                return KeyAction::Cancel;
+            }
+            if matches!(
+                crate::command::parse(&text),
+                Some(crate::command::SlashAction::Task)
+            ) {
+                input.clear();
+                *cursor_idx = 0;
+                *hist_idx = None;
+                crate::undo::reset(undo_state, input, *cursor_idx);
+                return KeyAction::OpenTask;
+            }
+            if is_agent_command(&text) {
+                input.clear();
+                *cursor_idx = 0;
+                *hist_idx = None;
+                crate::undo::reset(undo_state, input, *cursor_idx);
+                return KeyAction::SelectAgent(
+                    text.strip_prefix("/agent").unwrap_or("").trim().to_owned(),
+                );
+            }
             // Focused running subagent: a queue would be admitted to the parent
             // session and affect the parent agent — reject it (mode commands
             // included) instead, leaving the typed text so Enter can submit it
             // as a subagent steer.
-            if subagent_focused {
+            // Sidecar focus likewise: the queue targets the parent, which a
+            // sidecar follow-up must never leak into — Enter asks the sidecar.
+            if subagent_focused || sidecar_focused {
                 return KeyAction::QueueUnsupported;
+            }
+            // A bare act/plan switch never queues mid-flight: it would land
+            // at the next idle boundary unannounced. Refuse and keep the
+            // typed text (Enter on the same input shows the same flash).
+            if running && is_bare_mode_switch(&text) {
+                return KeyAction::ModeSwitchBlocked;
             }
             input.clear();
             *cursor_idx = 0;
             *hist_idx = None;
             crate::undo::reset(undo_state, input, *cursor_idx);
-            if running {
+            if running || subagents_running {
                 KeyAction::Queue(text)
             } else {
                 KeyAction::Submit(text)
             }
+        }
+        // CONTROL/ALT/SUPER chord variants are filtered off: the retired
+        // ctrl+shift+tab is reported by many terminals as BackTab+CONTROL|SHIFT
+        // and must stay inert — never arm the guard, never switch modes. This
+        // mirrors the confirm side (`clear_confirm::intercept`): a chord that
+        // cannot confirm the guard must not be able to arm it either.
+        KeyCode::BackTab
+            if !k
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            shift_tab_action(
+                agent,
+                input,
+                cursor_idx,
+                hist_idx,
+                subagent_focused,
+                sidecar_focused,
+                undo_state,
+            )
         }
         KeyCode::Esc => {
             // Double-Esc within the window while running => hard-abort.
@@ -445,22 +554,14 @@ pub(crate) fn handle_key(
             {
                 return KeyAction::None;
             }
-            // Shift+I (uppercase I) enters plan-mode edit — ONLY when in
-            // plan mode, idle, and the input box is empty. Once the user starts
-            // typing, regular `I` insertion resumes.
+            // Shift+I (uppercase I) enters plan-text edit — ONLY in the
+            // plan (read-only) agent, idle, and the input box is empty.
+            // Once the user starts typing, regular `I` insertion resumes.
             if c == 'I' && agent == "plan" && !running && !input_disabled && input.is_empty() {
                 return KeyAction::EnterPlanEdit;
             }
-            if c == '$' {
+            if c == '$' && !agent.starts_with("agent:") && !agent.starts_with("operator:") {
                 *skill_menu = Some(SkillMenu::new(discover_skills()));
-                return KeyAction::None;
-            }
-            // `@` at a token start opens the file-mention picker; the
-            // character itself is consumed — the pick later re-emits it as
-            // part of the `@relative/path ` token. A mid-token `@` (emails
-            // like a@b.com) never triggers.
-            if char_opens_file_menu(input, *cursor_idx, c) {
-                *file_menu = Some(FileMenu::new(workdir));
                 return KeyAction::None;
             }
             // `/` on empty input opens the slash-command picker. Bare `/` +
@@ -478,22 +579,76 @@ pub(crate) fn handle_key(
     }
 }
 
-/// Whether typing `c` at char-index `cursor_idx` in `input` should open
-/// the file-mention picker: `@` at a token start (start of input or right
-/// after whitespace). Mid-token `@` (emails like `a@b.com`) never
-/// triggers. Public so the file-mention e2e (`tests/file_mention_flow.rs`)
-/// drives the production trigger predicate instead of re-implementing it.
-pub fn char_opens_file_menu(input: &str, cursor_idx: usize, c: char) -> bool {
-    c == '@'
-        && (cursor_idx == 0
-            || input
-                .chars()
-                .nth(cursor_idx - 1)
-                .is_some_and(char::is_whitespace))
+fn is_agent_command(text: &str) -> bool {
+    ["/agent"].iter().any(|head| {
+        text == *head
+            || text
+                .strip_prefix(head)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    })
 }
 
-/// Handle body-scroll keys (PageUp / PageDown) uniformly.
-/// Returns `true` when the key was consumed and scroll/follow updated.
+/// Shared Shift+Tab action — both spellings (`BackTab`, and `(Tab, SHIFT)`
+/// as reported by some terminals) route here. Mode-aware: in act mode it
+/// switches back to the read-only plan agent — a non-destructive switch
+/// (context preserved), so no countdown guard is needed; the busy gate in
+/// the dispatcher still defers it to an idle boundary. In plan mode it arms
+/// the clear-context countdown (see `ArmClearConfirm`): keep the plan, fold
+/// into act and execute. The arm is a PARENT-session operation: while a
+/// running subagent or the sidecar box is focused it must not arm — the
+/// armed guard would swallow the next Enter (merging the steer / sidecar-ask
+/// text meant for the focused pane into the compound clear command), so the
+/// chord is inert there, mirroring the plain Tab arm's QueueUnsupported gate.
+fn shift_tab_action(
+    agent: &str,
+    input: &mut String,
+    cursor_idx: &mut usize,
+    hist_idx: &mut Option<usize>,
+    subagent_focused: bool,
+    sidecar_focused: bool,
+    undo_state: &mut crate::undo::UndoState,
+) -> KeyAction {
+    if agent == "act" {
+        return KeyAction::SwitchAgent("plan".into());
+    }
+    if subagent_focused || sidecar_focused {
+        return KeyAction::None;
+    }
+    // Arm the clear-context countdown. The draft is forwarded as the
+    // compound rest; it is cleared from the composer now. The raw text
+    // rides along as `draft` so the guard's Esc (回撤) puts it back
+    // verbatim — arming must lose nothing.
+    let draft = (!input.is_empty()).then(|| input.clone());
+    let rest = input.trim().to_string();
+    let rest = (!rest.is_empty()).then_some(rest);
+    input.clear();
+    *cursor_idx = 0;
+    *hist_idx = None;
+    crate::undo::reset(undo_state, input, *cursor_idx);
+    KeyAction::ArmClearConfirm { rest, draft }
+}
+
+fn next_primary_agent(agent: &str) -> &'static str {
+    if agent == "plan" {
+        "act"
+    } else {
+        "plan"
+    }
+}
+
+/// A BARE act/plan switch input (`/act`, `/plan`): a control command whose
+/// target is the primary agent and that carries no trailing task text.
+/// Compound forms (`/plan review this`) are task submissions — the mode
+/// switch rides along at the idle boundary and is never gated here.
+pub(crate) fn is_bare_mode_switch(text: &str) -> bool {
+    matches!(
+        opencoder_session::control_cmd::split_control_prefix(text),
+        Some((opencoder_session::control_cmd::ControlCmd::SwitchAgent(_), rest))
+            if rest.as_deref().is_none_or(|r| r.trim().is_empty())
+    )
+}
+
+/// Handle body-scroll keys uniformly.
 pub(crate) fn apply_scroll(k: &KeyEvent, scroll: &mut u32, follow: &mut bool) -> bool {
     match k.code {
         KeyCode::PageUp => {
@@ -540,10 +695,6 @@ fn move_hist(
 mod tests;
 
 #[cfg(test)]
-#[path = "key_handler_disabled_mode_tests.rs"]
-mod disabled_mode_tests;
-
-#[cfg(test)]
 #[path = "key_handler_plan_edit_tests.rs"]
 mod plan_edit_tests;
 
@@ -554,6 +705,10 @@ mod queue_scroll_tests;
 #[cfg(test)]
 #[path = "key_handler_file_mention_tests.rs"]
 mod file_mention_tests;
+
+#[cfg(test)]
+#[path = "key_handler_sidecar_tests.rs"]
+mod sidecar_tests;
 
 #[cfg(test)]
 #[path = "key_handler_running_mode_tests.rs"]

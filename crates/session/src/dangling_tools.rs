@@ -111,7 +111,7 @@ pub fn task_tool_use_visible(task: &SubagentTaskRecord, visible: &[Message]) -> 
 }
 
 /// The parent transcript slice `resume::resume` will actually load: below a
-/// plan→act handoff boundary (`handoff_seq` + `handoff_plan`) or a compaction
+/// transcript handoff boundary (`handoff_seq` + `handoff_plan`) or a compaction
 /// boundary (`summary_seq`), else the full transcript. Mirrors the
 /// loading/trimming branches of `resume::resume`; the synthetic head message
 /// it re-attaches never carries a `tool_use`, so it is irrelevant for
@@ -206,6 +206,8 @@ pub async fn reconcile_dangling_tool_uses(session: &mut SessionState) {
     }
     let n_dangling = dangling.len();
     let synthetic = Message {
+        provider_state: None,
+        display: None,
         id: crate::runner::new_id(),
         role: Role::Tool,
         blocks: dangling,

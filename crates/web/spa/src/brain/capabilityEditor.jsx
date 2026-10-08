@@ -1,0 +1,127 @@
+import { Alert, Button, Drawer, Form, Input, Select, Space, Spin } from 'antd';
+import { useEffect, useRef, useState } from 'react';
+import { apiGet, apiPost, apiPut } from '../api.js';
+import { KINDS } from '../fleet/model.js';
+import { capabilityBody, capabilityForm, capabilityTarget, needsTargetSave } from './model.js';
+import { fetchTargetOptions } from './targetOptions.js';
+
+const required = [{ required: true, whitespace: true, message: '请填写此项' }];
+const TARGET_KIND_OPTIONS = KINDS.filter((kind) => ['agent', 'team', 'dag', 'todos', 'operator'].includes(kind.value));
+
+function CapabilityEditorSession({ entry, onClose, onSaved }) {
+  const [form] = Form.useForm();
+  const [id, setId] = useState(entry?.capability?.id || null);
+  const [loading, setLoading] = useState(!!id);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [loaded, setLoaded] = useState(!id);
+  const [revision, setRevision] = useState(0);
+  const [options, setOptions] = useState([]);
+  const [optionsLoading, setOptionsLoading] = useState(false);
+  const originalTarget = useRef(null);
+  const initialId = entry?.capability?.id;
+  const kind = Form.useWatch('target_kind', form);
+  const watchedTarget = Form.useWatch('target', form);
+
+  useEffect(() => {
+    if (!initialId) return undefined;
+    let cancelled = false;
+    setLoading(true); setLoaded(false); setError('');
+    Promise.all([
+      apiGet(`/api/brain/capabilities/${encodeURIComponent(initialId)}`),
+      apiGet(`/api/brain/capabilities/${encodeURIComponent(initialId)}/target`),
+    ]).then(([detail, binding]) => {
+      if (cancelled) return;
+      originalTarget.current = binding.target || null;
+      form.setFieldsValue(capabilityForm(detail, originalTarget.current));
+      setLoaded(true);
+    }).catch((e) => { if (!cancelled) setError('读取能力失败: ' + e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [initialId, revision, form]);
+
+  // TYPE → NAME cascade: whenever the 执行类型 changes, refetch the actual
+  // resource names of that kind. Failures are swallowed (empty options) so a
+  // broken listing endpoint never blocks editing the capability itself.
+  useEffect(() => {
+    let cancelled = false;
+    setOptionsLoading(true);
+    fetchTargetOptions(apiGet, kind)
+      .then((result) => { if (!cancelled) setOptions(result); })
+      .catch(() => { if (!cancelled) setOptions([]); })
+      .finally(() => { if (!cancelled) setOptionsLoading(false); });
+    return () => { cancelled = true; };
+  }, [kind]);
+
+  // Edit mode fallback: a binding whose resource no longer exists still
+  // displays (and can be re-saved) by appending the watched value as an option.
+  const staleTarget = watchedTarget && !options.some((option) => option.value === watchedTarget)
+    ? [{ value: watchedTarget, label: watchedTarget }] : [];
+  const mergedOptions = [...options, ...staleTarget];
+
+  const save = async (values) => {
+    if (saving || !loaded) return;
+    setSaving(true); setError('');
+    let savedId = id;
+    let contentSaved = false;
+    try {
+      const body = capabilityBody(values);
+      if (savedId) await apiPut(`/api/brain/capabilities/${encodeURIComponent(savedId)}`, body);
+      else {
+        const result = await apiPost('/api/brain/capabilities', body);
+        savedId = result.capability?.id;
+        if (!savedId) throw new Error('服务未返回新能力的 ID');
+        setId(savedId);
+      }
+      contentSaved = true;
+      const target = capabilityTarget(values);
+      if (needsTargetSave(originalTarget.current, target)) {
+        await apiPut(`/api/brain/capabilities/${encodeURIComponent(savedId)}/target`, target);
+        originalTarget.current = target;
+      }
+      onSaved();
+    } catch (e) {
+      setError((contentSaved ? '能力内容已保存，执行目标未保存，请重试: ' : '保存失败: ') + e.message);
+    } finally { setSaving(false); }
+  };
+
+  return <Drawer open placement="right" size="75%" title={id ? '编辑能力' : '新建能力'}
+    styles={{ wrapper: { maxWidth: '100vw' } }} onClose={() => { if (!saving) onClose(); }}
+    footer={<Space><Button disabled={saving} onClick={onClose}>取消</Button>
+      <Button type="primary" loading={saving} disabled={!loaded} onClick={() => form.submit()}>{id ? '保存修改' : '创建能力'}</Button></Space>}>
+    {error && <Alert type="error" showIcon title={error} style={{ marginBottom: 16 }}
+      action={!loaded ? <Button onClick={() => setRevision((value) => value + 1)}>重试</Button> : null} />}
+    <Spin spinning={loading}>
+      <Form form={form} layout="vertical" initialValues={capabilityForm(entry)} onFinish={save} disabled={saving || !loaded}>
+        <Form.Item name="target_kind" label="执行类型" rules={[{ required: true }]}>
+          <Select options={TARGET_KIND_OPTIONS} onChange={() => form.setFieldValue('target', undefined)} />
+        </Form.Item>
+        <Form.Item name="target" label="名称" rules={required}>
+          <Select showSearch optionFilterProp="label" placeholder="先选择执行类型" loading={optionsLoading} options={mergedOptions} />
+        </Form.Item>
+        <Form.Item name="summary" label="一句话描述" rules={required}><Input placeholder="这个能力做什么" /></Form.Item>
+        <Form.Item name="input_desc" label="输入描述" rules={required}><Input.TextArea rows={3} placeholder="期望的输入是什么" /></Form.Item>
+        <Form.Item name="output_desc" label="输出描述" rules={required}><Input.TextArea rows={3} placeholder="产出的结果是什么" /></Form.Item>
+        <Form.Item name="required_inputs" label="必填输入字段" extra="执行前检查这些字段已提供，且不是空值或空白文本。">
+          <Select mode="tags" tokenSeparators={[',', '，']} placeholder="输入字段名后按回车，例如 task、revision" />
+        </Form.Item>
+        <Form.Item name="required_outputs" label="必填输出字段" extra="检查结果最外层的字段；DAG 结果最外层是步骤名称。测试是否通过仍由大脑结合完整结果判断。">
+          <Select mode="tags" tokenSeparators={[',', '，']} placeholder="例如 passed、failures、revision" />
+        </Form.Item>
+        <Form.Item label="工程输入（示例输入）">
+          <Form.List name="eng_inputs">{(fields, { add, remove }) => <>
+            {fields.map((field) => <div key={field.key} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <Form.Item name={field.name} rules={required} style={{ flex: 1, marginBottom: 0 }}><Input.TextArea autoSize={{ minRows: 1, maxRows: 5 }} placeholder="一条示例输入" /></Form.Item>
+              <Button type="text" danger onClick={() => remove(field.name)}>移除</Button>
+            </div>)}
+            <Button type="dashed" onClick={() => add('')}>添加工程输入</Button>
+          </>}</Form.List>
+        </Form.Item>
+      </Form>
+    </Spin>
+  </Drawer>;
+}
+
+export function CapabilityEditor(props) {
+  return <CapabilityEditorSession key={props.entry?.capability?.id || "new"} {...props} />;
+}

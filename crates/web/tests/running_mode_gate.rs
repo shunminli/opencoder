@@ -4,7 +4,7 @@
 //! Contract split:
 //! - Admission-time mode changes (the `agent` field, POST /agent, POST
 //!   /handoff) stay 409 while draining — they rewrite session config.
-//! - Textual mode commands (/plan, /act, /act_clear_context) are ADMITTED
+//! - Textual control commands (/plan, /act, /act_clear_context) are ADMITTED
 //!   while running (queue or steer) and applied by the runner at the next
 //!   idle/turn boundary, which structurally has no turn in flight.
 
@@ -131,10 +131,15 @@ fn seeded_state(
     llm: Arc<HangingStream>,
 ) -> Arc<opencoder_web::AppState> {
     Arc::new(opencoder_web::AppState {
+        config_home: None,
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store: store.clone(),
         workdir: tmp.path().to_path_buf(),
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
         client_override: Some(llm),
     })
 }
@@ -148,6 +153,25 @@ async fn seed_session(store: &Arc<dyn Store>, sid: &str) {
             // `draining` true for up to 30 s.
             title: Some("seeded".into()),
             agent: Some("act".into()),
+            model: Some("test/model".into()),
+            created_at: 0,
+            updated_at: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// Seed the legacy sandbox spelling. Store normalization resumes it as plan,
+/// whose clear-context convergence target is act.
+async fn seed_sandbox_session(store: &Arc<dyn Store>, sid: &str) {
+    store
+        .create_session(&SessionMeta {
+            id: sid.into(),
+            // Seeded title: prevents maybe_generate_title from hanging on the
+            // HangingStream (same rationale as seed_session).
+            title: Some("seeded".into()),
+            agent: Some("sandbox".into()),
             model: Some("test/model".into()),
             created_at: 0,
             updated_at: 0,
@@ -338,6 +362,388 @@ async fn steered_mode_command_admitted_while_running_applies_at_turn_boundary() 
         .all(|message| !message.text().contains("/plan")));
     assert!(store
         .pending_inputs(sid, Delivery::Steer)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// A steered `/clear_context` while running is admitted (200), absorbed at the
+/// turn boundary and applied: `transcript_reset` persists, NO `agent_switched`
+/// (this session is already act — the already-act clear is a pure agent
+/// no-op; only a sandbox session converges to act) and no legacy
+/// `plan_handoff` frame. With no assistant reply yet the boundary degrades to
+/// the blank sentinel, so the run stops without a second LLM call.
+#[tokio::test]
+async fn steered_clear_context_on_act_session_keeps_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
+    let sid = "steered-clear";
+    seed_session(&store, sid).await;
+    let llm = Arc::new(HangingStream {
+        calls: AtomicUsize::new(0),
+    });
+    let state = seeded_state(&tmp, &store, llm.clone());
+    let app = opencoder_web::build_app(state.clone(), None, false);
+
+    start_running_drain(&app, &store, sid, &llm).await;
+    // Everything persisted up to here is pre-command.
+    let cursor = store.last_event_seq(sid).await.unwrap();
+
+    let admitted = request(
+        &app,
+        "POST",
+        &format!("/api/sessions/{sid}/prompt"),
+        r#"{"prompt":"/clear_context","delivery":"steer"}"#,
+    )
+    .await;
+    assert_eq!(
+        admitted.status(),
+        StatusCode::OK,
+        "steered control command must be admitted while running"
+    );
+
+    wait_idle(&state, sid).await;
+    wait_for_event_kind(&store, sid, "transcript_reset").await;
+    wait_for_event_kind(&store, sid, "steer_consumed").await;
+
+    let events = store.events_after(sid, cursor).await.unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|r| r.sse_kind.as_deref() == Some("agent_switched")),
+        "clear-context must keep the active agent (no agent_switched): {:?}",
+        events
+            .iter()
+            .filter_map(|r| r.sse_kind.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|r| r.sse_kind.as_deref() == Some("plan_handoff")),
+        "the legacy plan_handoff frame is gone; got {:?}",
+        events
+            .iter()
+            .filter_map(|r| r.sse_kind.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // No assistant reply existed, so the boundary persisted the blank
+    // fresh-start sentinel (`handoff_plan` = clear-context marker).
+    let meta = store.get_session(sid).await.unwrap().unwrap();
+    assert_eq!(meta.agent.as_deref(), Some("act"), "agent unchanged");
+    assert!(
+        opencoder_session::control_cmd::is_clear_context_handoff(
+            meta.handoff_plan.as_deref().unwrap_or("")
+        ),
+        "blank clear must persist the sentinel, got {:?}",
+        meta.handoff_plan
+    );
+
+    // Sentinel path stops without another LLM call; the command never
+    // reaches the transcript.
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 1, "no second LLM call");
+    let messages = store.load_messages(sid).await.unwrap();
+    assert!(messages
+        .iter()
+        .all(|message| !message.text().contains("/clear_context")));
+    assert!(store
+        .pending_inputs(sid, Delivery::Steer)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// GET `uri` and return (status, parsed JSON body).
+async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+/// Regression (sandbox -> plan rename): `POST /agent` accepts the `plan`
+/// agent — the persisted meta and the subsequent GET both reflect it — while
+/// the interlude `sandbox` name (`resolve_agent("sandbox")` is None) and the
+/// `workflow` TODO-internal scheduler (a Primary builtin that every consumer
+/// excludes from its switchable set) both get the standard unknown-agent 400
+/// and leave zero footprint.
+#[tokio::test]
+async fn agent_switch_accepts_plan_and_rejects_legacy_sandbox() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
+    let sid = "switch-plan";
+    seed_session(&store, sid).await;
+    let llm = Arc::new(HangingStream {
+        calls: AtomicUsize::new(0),
+    });
+    let state = seeded_state(&tmp, &store, llm.clone());
+    let app = opencoder_web::build_app(state.clone(), None, false);
+
+    // plan: accepted, persisted, and visible on the next GET.
+    let switched = request(
+        &app,
+        "POST",
+        &format!("/api/sessions/{sid}/agent"),
+        r#"{"value":"plan"}"#,
+    )
+    .await;
+    assert_eq!(
+        switched.status(),
+        StatusCode::OK,
+        "plan must be a switchable agent"
+    );
+    assert_eq!(
+        store
+            .get_session(sid)
+            .await
+            .unwrap()
+            .unwrap()
+            .agent
+            .as_deref(),
+        Some("plan")
+    );
+    let (status, body) = get_json(&app, &format!("/api/sessions/{sid}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["meta"]["agent"], "plan",
+        "GET must report the plan agent: {body}"
+    );
+
+    // The interlude name is not an agent anymore: standard unknown-agent 400.
+    let legacy = request(
+        &app,
+        "POST",
+        &format!("/api/sessions/{sid}/agent"),
+        r#"{"value":"sandbox"}"#,
+    )
+    .await;
+    assert_eq!(
+        legacy.status(),
+        StatusCode::BAD_REQUEST,
+        "sandbox must not be switchable"
+    );
+    let bytes = axum::body::to_bytes(legacy.into_body(), 4096)
+        .await
+        .unwrap();
+    let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(err["ok"], false);
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown agent"),
+        "400 must name the unknown agent, got: {err}"
+    );
+
+    // `workflow` resolves as a Primary builtin but is the TODO-internal
+    // scheduler: rejected here exactly like every other consumer computes
+    // its switchable set (GET /api/agents `primary`, the TUI picker).
+    let scheduler = request(
+        &app,
+        "POST",
+        &format!("/api/sessions/{sid}/agent"),
+        r#"{"value":"workflow"}"#,
+    )
+    .await;
+    assert_eq!(
+        scheduler.status(),
+        StatusCode::BAD_REQUEST,
+        "workflow must not be a switch target"
+    );
+    let bytes = axum::body::to_bytes(scheduler.into_body(), 4096)
+        .await
+        .unwrap();
+    let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(err["ok"], false);
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown agent"),
+        "400 must name the unknown agent, got: {err}"
+    );
+
+    // Zero footprint: rejected switches left meta + live override untouched.
+    let meta = store.get_session(sid).await.unwrap().unwrap();
+    assert_eq!(meta.agent.as_deref(), Some("plan"));
+    let handle = state.handles.lock().await.get(sid).cloned().unwrap();
+    assert_eq!(handle.overrides.lock().await.agent.as_deref(), Some("plan"));
+}
+
+/// Regression (wire contract): the events a plan session emits include an
+/// `agent_switched` frame whose value is "plan" — never the interlude
+/// "sandbox" value — so reconnect replays render the real agent name.
+#[tokio::test]
+async fn plan_session_emits_agent_switched_with_plan_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
+    let sid = "plan-frame";
+    seed_session(&store, sid).await;
+    let llm = Arc::new(HangingStream {
+        calls: AtomicUsize::new(0),
+    });
+    let state = seeded_state(&tmp, &store, llm.clone());
+    let app = opencoder_web::build_app(state.clone(), None, false);
+
+    start_running_drain(&app, &store, sid, &llm).await;
+    let admitted = request(
+        &app,
+        "POST",
+        &format!("/api/sessions/{sid}/prompt"),
+        r#"{"prompt":"/plan","delivery":"steer"}"#,
+    )
+    .await;
+    assert_eq!(
+        admitted.status(),
+        StatusCode::OK,
+        "steered /plan must be admitted while running"
+    );
+
+    wait_idle(&state, sid).await;
+    wait_agent(&store, sid, "plan").await;
+    wait_for_event_kind(&store, sid, "agent_switched").await;
+
+    let events = store.events_after(sid, 0).await.unwrap();
+    let switched: Vec<_> = events
+        .iter()
+        .filter(|r| r.sse_kind.as_deref() == Some("agent_switched"))
+        .collect();
+    assert!(
+        !switched.is_empty(),
+        "an agent_switched frame must be persisted: {:?}",
+        events
+            .iter()
+            .map(|r| r.sse_kind.clone())
+            .collect::<Vec<_>>()
+    );
+    for record in &switched {
+        assert_eq!(
+            record.payload.get("agent").and_then(|v| v.as_str()),
+            Some("plan"),
+            "agent_switched payload must name plan: {}",
+            record.payload
+        );
+    }
+    assert!(
+        events
+            .iter()
+            .all(|r| r.payload.get("agent").and_then(|v| v.as_str()) != Some("sandbox")),
+        "no frame may carry the legacy sandbox value"
+    );
+
+    // Cleanup: the original drain is parked on the hanging LLM turn.
+    let handle = state.handles.lock().await.get(sid).cloned().unwrap();
+    handle.cancel.lock().await.cancel();
+    wait_idle(&state, sid).await;
+}
+
+/// A queued `/act_clear_context` in a legacy sandbox (normalized plan) session
+/// converges to act: after
+/// the drain picks it up the boundary persists, `agent_switched` follows
+/// `transcript_reset`, the meta agent is `act`, and the sentinel boundary
+/// stops without a second LLM call (no assistant reply existed).
+#[tokio::test]
+async fn queued_clear_context_in_sandbox_session_converges_to_act() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
+    let sid = "queued-sandbox-clear";
+    seed_sandbox_session(&store, sid).await;
+    let llm = Arc::new(HangingStream {
+        calls: AtomicUsize::new(0),
+    });
+    let state = seeded_state(&tmp, &store, llm.clone());
+    let app = opencoder_web::build_app(state.clone(), None, false);
+
+    start_running_drain(&app, &store, sid, &llm).await;
+    // Everything persisted up to here is pre-command.
+    let cursor = store.last_event_seq(sid).await.unwrap();
+
+    let admitted = request(
+        &app,
+        "POST",
+        &format!("/api/sessions/{sid}/prompt"),
+        r#"{"prompt":"/act_clear_context","delivery":"queue"}"#,
+    )
+    .await;
+    assert_eq!(
+        admitted.status(),
+        StatusCode::OK,
+        "queued control command must be admitted while running"
+    );
+
+    // A queued item waits for the idle boundary; hard-cancel the hung run
+    // (a hard interrupt keeps pending rows for the next drain), then wake the
+    // runner with a bare `/act` (a no-op on this agent-to-be) so the fresh
+    // drain pops the queue FIFO and applies the clear without any LLM call.
+    let handle = state.handles.lock().await.get(sid).cloned().unwrap();
+    handle.cancel.lock().await.cancel();
+    wait_idle(&state, sid).await;
+    let kick = request(
+        &app,
+        "POST",
+        &format!("/api/sessions/{sid}/prompt"),
+        r#"{"prompt":"/act","delivery":"queue"}"#,
+    )
+    .await;
+    assert_eq!(kick.status(), StatusCode::OK);
+
+    wait_agent(&store, sid, "act").await;
+    wait_for_event_kind(&store, sid, "transcript_reset").await;
+    wait_for_event_kind(&store, sid, "agent_switched").await;
+    wait_idle(&state, sid).await;
+
+    // transcript_reset lands before agent_switched (the reset is emitted
+    // first; the convergence frame follows it).
+    let events = store.events_after(sid, cursor).await.unwrap();
+    let reset_idx = events
+        .iter()
+        .position(|r| r.sse_kind.as_deref() == Some("transcript_reset"))
+        .expect("transcript_reset must persist");
+    let switch_idx = events
+        .iter()
+        .position(|r| r.sse_kind.as_deref() == Some("agent_switched"))
+        .expect("agent_switched must persist for the plan convergence");
+    assert!(
+        switch_idx > reset_idx,
+        "agent_switched must follow transcript_reset, got {:?}",
+        events
+            .iter()
+            .map(|r| r.sse_kind.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // The converged agent persists with the boundary.
+    let meta = store.get_session(sid).await.unwrap().unwrap();
+    assert_eq!(
+        meta.agent.as_deref(),
+        Some("act"),
+        "plan clear converges to act"
+    );
+    assert!(
+        opencoder_session::control_cmd::is_clear_context_handoff(
+            meta.handoff_plan.as_deref().unwrap_or("")
+        ),
+        "the clear (no assistant reply) must persist the sentinel, got {:?}",
+        meta.handoff_plan
+    );
+
+    // Sentinel path stops without another LLM call; the command never
+    // reaches the transcript.
+    assert_eq!(llm.calls.load(Ordering::SeqCst), 1, "no second LLM call");
+    let messages = store.load_messages(sid).await.unwrap();
+    assert!(messages
+        .iter()
+        .all(|message| !message.text().contains("/act_clear_context")));
+    assert!(store
+        .pending_inputs(sid, Delivery::Queue)
         .await
         .unwrap()
         .is_empty());

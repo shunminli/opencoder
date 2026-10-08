@@ -32,6 +32,8 @@ fn replay_one_renders_prefetched_http_image() {
     prefetched.insert(url.to_string(), red_png_bytes());
 
     let msg = Message {
+        provider_state: None,
+        display: None,
         id: "u1".into(),
         role: Role::User,
         blocks: vec![
@@ -74,6 +76,8 @@ fn replay_one_http_image_without_prefetch_is_placeholder() {
     let empty: HashMap<String, Vec<u8>> = HashMap::new();
 
     let msg = Message {
+        provider_state: None,
+        display: None,
         id: "u2".into(),
         role: Role::User,
         blocks: vec![
@@ -117,6 +121,8 @@ fn replay_one_prefetched_tool_image_renders() {
     prefetched.insert(url.to_string(), red_png_bytes());
 
     let msg = Message {
+        provider_state: None,
+        display: None,
         id: "m-tool".into(),
         role: Role::Tool,
         blocks: vec![ContentBlock::ToolResult {
@@ -133,14 +139,26 @@ fn replay_one_prefetched_tool_image_renders() {
     };
 
     let mut chat = ChatView::default();
-    // Need a matching Tool block for the ToolResult to attach output.
-    chat.blocks.push(ChatBlock::Tool {
-        id: "t1".into(),
-        header: Line::from("test"),
-        output: Vec::new(),
-        collapsed: false,
-        started_at_ms: 0,
-        elapsed_ms: None,
+    // Need a matching StepGroup call for the ToolResult to attach output.
+    chat.blocks.push(ChatBlock::StepGroup {
+        steps: vec![crate::chat::Step {
+            thinking_raw: String::new(),
+            thinking: Vec::new(),
+            thinking_dirty: false,
+            calls: vec![crate::chat::ToolCall {
+                id: "t1".into(),
+                header: Line::from("test"),
+                output: Vec::new(),
+                started_at_ms: Some(0),
+                elapsed_ms: Some(0),
+                expanded: false,
+            }],
+            open: false,
+            calls_open: false,
+            sealed: false,
+        }],
+        open: false,
+        progress_active: false,
     });
     replay_one(&mut chat, &msg, &prefetched);
 
@@ -163,6 +181,8 @@ async fn prefetch_skips_data_uris_and_collects_http() {
     // data URIs are skipped (not attempted as network fetches).
     let data_uri = "data:image/png;base64,iVBORw0KGgo=";
     let msgs = vec![Message {
+        provider_state: None,
+        display: None,
         id: "u1".into(),
         role: Role::User,
         blocks: vec![
@@ -193,6 +213,8 @@ use super::replay::prefetch_image_bytes_with;
 fn http_msg(urls: &[&str]) -> Vec<Message> {
     urls.iter()
         .map(|u| Message {
+            provider_state: None,
+            display: None,
             id: format!("m-{u}"),
             role: Role::User,
             blocks: vec![

@@ -12,14 +12,28 @@ use crate::runner::new_id;
 /// Copy a session's meta and messages into a new session id, leaving the
 /// original untouched. Returns the new id.
 pub async fn fork_session(store: &dyn Store, parent_id: &str) -> Result<String> {
+    fork_session_with_id(store, parent_id, &new_id()).await
+}
+
+/// Embedders may assign a durable fleet ID before copying the session.
+pub async fn fork_session_with_id(store: &dyn Store, parent_id: &str, id: &str) -> Result<String> {
+    if !opencoder_core::fleet::valid_id(id) || store.get_session(id).await?.is_some() {
+        return Err(anyhow!("invalid or existing fork id"));
+    }
     let meta = store
         .get_session(parent_id)
         .await?
         .ok_or_else(|| anyhow!("session not found: {parent_id}"))?;
     let messages = store.load_messages(parent_id).await?;
-    let new_id = new_id();
+    let runtime = store.harness_runtime(parent_id).await?;
+    anyhow::ensure!(
+        runtime.as_ref().is_none_or(|r| !r.in_flight),
+        "cannot fork an unfinished harness turn"
+    );
+    let new_id = id.to_string();
     let now = now_ms();
     let forked = SessionMeta {
+        kind: meta.kind.clone(),
         id: new_id.clone(),
         title: meta.title.as_deref().map(|t| format!("{t} (fork)")),
         agent: meta.agent.clone(),
@@ -36,10 +50,12 @@ pub async fn fork_session(store: &dyn Store, parent_id: &str) -> Result<String> 
         skill: meta.skill.clone(),
         task_type: None,
         requirement: None,
-        plan_snapshot: None,
-        plan_input_count: 0,
     };
     store.create_session(&forked).await?;
+    if let Some(mut runtime) = runtime {
+        runtime.fork_from = runtime.thread_id.take();
+        store.set_harness_runtime(&new_id, &runtime).await?;
+    }
     if !messages.is_empty() {
         store.append_messages(&new_id, &messages).await?;
     }
@@ -78,8 +94,7 @@ mod tests {
                 skill: None,
                 task_type: task_type.map(String::from),
                 requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
+                kind: None,
             })
             .await
             .unwrap();

@@ -10,6 +10,7 @@ pub struct ConfigPatch {
     pub fps: u32,
     pub ap_max_iter: u32,
     pub enable_tmux_session: Option<bool>,
+    pub local_memory: bool,
 }
 
 impl ConfigPatch {
@@ -21,6 +22,7 @@ impl ConfigPatch {
             "context_limit": self.context_limit,
             "compaction": { "context_threshold": self.context_threshold },
             "fps": self.fps,
+            "local_memory": self.local_memory,
             "autopilot": {
                 "max_iterations": self.ap_max_iter,
             },
@@ -40,6 +42,7 @@ impl ConfigPatch {
 
 #[derive(Debug, Clone)]
 pub struct ProviderPatch {
+    pub protocol: String,
     pub name: String,
     pub model_id: String,
     pub base_url: String,
@@ -49,7 +52,8 @@ pub struct ProviderPatch {
 
 impl ProviderPatch {
     pub fn to_json(&self) -> serde_json::Value {
-        let mut provider = serde_json::json!({ "base_url": self.base_url });
+        let mut provider =
+            serde_json::json!({ "base_url": self.base_url, "protocol": self.protocol });
         provider["model"] = serde_json::Value::String(self.model_id.clone());
         if let Some(v) = &self.api_key {
             let v = v.trim();

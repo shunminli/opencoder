@@ -1,30 +1,38 @@
 use std::path::Path;
-use std::time::Duration;
 
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use libsql::{Builder, Connection};
+use anyhow::Result;
+use libsql::Connection;
 use tokio::sync::Mutex;
-use tracing::debug;
 
-use crate::store::Store;
-use crate::types::{
-    Delivery, ImportReport, NodeRecord, NodeTaskRecord, NodeTaskStatus, SessionEventRecord,
-    SessionFilter, SessionInput, SessionListItem, SessionMeta, SessionPatch, SubagentTaskRecord,
-};
-use crate::{TodoEventRecord, TodoItemRecord, TodoWorkflowRecord, TodoWorkflowSummary};
-
+mod brain;
+mod brain_layered;
+mod chat_tables;
+mod connection;
+mod dag;
+mod dag_events;
 mod events;
+mod impl_store;
 mod inputs;
 mod messages;
 mod node_state;
 mod node_tasks;
 mod nodes;
+mod project;
+mod project_links;
+mod project_runs;
+mod schedule;
 pub(crate) mod schema;
 mod sessions;
 mod subagent_tasks;
+mod team_runs;
 mod todos;
 mod tx;
+mod users;
+
+/// Database schema watermark; v4 brain tables are additive and must not move it.
+pub fn schema_watermark() -> i64 {
+    schema::SCHEMA_VERSION
+}
 
 /// Primary `Store` implementation backed by libsql (embedded local SQLite, WAL).
 ///
@@ -48,35 +56,16 @@ pub struct LibsqlStore {
 impl LibsqlStore {
     /// Open (or create) a libsql database file and bootstrap the schema.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = Builder::new_local(path.as_ref())
-            .build()
-            .await
-            .with_context(|| format!("open libsql db at {}", path.as_ref().display()))?;
-        let conn = db.connect().context("connect libsql")?;
-        schema::apply_connection_pragmas(&conn).await?;
-        let _ = conn.busy_timeout(Duration::from_secs(30));
-        schema::bootstrap(&conn).await?;
-        let _ = schema::checkpoint_wal(&conn).await;
-        let store = LibsqlStore {
-            conn,
+        Ok(Self {
+            conn: connection::open_file(path.as_ref()).await?,
             db_lock: Mutex::new(()),
-        };
-        debug!(backend = "libsql", "store opened");
-        Ok(store)
+        })
     }
 
     /// Open an in-memory database (used by tests and ephemeral runs).
     pub async fn open_memory() -> Result<Self> {
-        let db = Builder::new_local(":memory:")
-            .build()
-            .await
-            .context("open in-memory db")?;
-        let conn = db.connect().context("connect in-memory")?;
-        schema::apply_connection_pragmas(&conn).await?;
-        let _ = conn.busy_timeout(Duration::from_secs(30));
-        schema::bootstrap(&conn).await?;
-        Ok(LibsqlStore {
-            conn,
+        Ok(Self {
+            conn: connection::open_memory().await?,
             db_lock: Mutex::new(()),
         })
     }
@@ -84,322 +73,5 @@ impl LibsqlStore {
     /// Acquire a connection that shares the underlying database. Cheap clone.
     pub async fn conn(&self) -> Result<Connection> {
         Ok(self.conn.clone())
-    }
-}
-
-#[async_trait]
-impl Store for LibsqlStore {
-    fn backend_name(&self) -> &'static str {
-        "libsql"
-    }
-
-    async fn create_session(&self, meta: &SessionMeta) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        sessions::create(&conn, meta).await
-    }
-    async fn get_session(&self, id: &str) -> Result<Option<SessionMeta>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        sessions::get(&conn, id).await
-    }
-    async fn list_sessions(&self, filter: &SessionFilter) -> Result<Vec<SessionListItem>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        sessions::list(&conn, filter).await
-    }
-    async fn update_session(&self, id: &str, patch: &SessionPatch) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        sessions::update(&conn, id, patch).await
-    }
-    async fn delete_session(&self, id: &str) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        sessions::delete(&conn, id).await
-    }
-    async fn clear_other_sessions(&self, keep_session_id: &str) -> Result<u64> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        sessions::clear_others(&conn, keep_session_id).await
-    }
-
-    async fn append_message(&self, session_id: &str, msg: &opencoder_core::Message) -> Result<i64> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        messages::append(&conn, session_id, msg).await
-    }
-    async fn append_messages(
-        &self,
-        session_id: &str,
-        msgs: &[opencoder_core::Message],
-    ) -> Result<Vec<i64>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        messages::append_many(&conn, session_id, msgs).await
-    }
-    async fn load_messages(&self, session_id: &str) -> Result<Vec<opencoder_core::Message>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        messages::load(&conn, session_id).await
-    }
-    async fn load_messages_after(
-        &self,
-        session_id: &str,
-        skip_count: i64,
-    ) -> Result<Vec<opencoder_core::Message>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        messages::load_after(&conn, session_id, skip_count).await
-    }
-    async fn last_message_seq(&self, session_id: &str) -> Result<i64> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        messages::last_seq(&conn, session_id).await
-    }
-
-    async fn admit_input(&self, input: &SessionInput) -> Result<i64> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::admit(&conn, input).await
-    }
-    async fn pending_inputs(
-        &self,
-        session_id: &str,
-        delivery: Delivery,
-    ) -> Result<Vec<SessionInput>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::pending(&conn, session_id, delivery).await
-    }
-    async fn promote_inputs(
-        &self,
-        session_id: &str,
-        up_to_admitted_seq: i64,
-        delivery: Delivery,
-    ) -> Result<Vec<i64>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::promote(&conn, session_id, up_to_admitted_seq, delivery).await
-    }
-    async fn promote_next_queued(&self, session_id: &str) -> Result<Option<i64>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::promote_next_queued(&conn, session_id).await
-    }
-    async fn claim_next_queue(&self, session_id: &str) -> Result<Option<(i64, SessionInput)>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::claim_next_queue(&conn, session_id).await
-    }
-    async fn unpromote_inputs(&self, session_id: &str, seqs: &[i64]) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::unpromote(&conn, session_id, seqs).await
-    }
-    async fn mark_inputs_recorded(&self, session_id: &str, seqs: &[i64]) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::mark_recorded(&conn, session_id, seqs).await
-    }
-    async fn recover_orphan_inputs(&self, session_id: &str) -> Result<u64> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::recover_orphans(&conn, session_id).await
-    }
-    async fn delete_input(&self, input_id: i64) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::delete_input(&conn, input_id).await
-    }
-    async fn swap_input_order(&self, session_id: &str, seq_a: i64, seq_b: i64) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        inputs::swap_input_order(&conn, session_id, seq_a, seq_b).await
-    }
-
-    async fn append_events(&self, events: &[SessionEventRecord]) -> Result<Vec<i64>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        events::append_many(&conn, events).await
-    }
-    async fn events_after(
-        &self,
-        session_id: &str,
-        after_seq: i64,
-    ) -> Result<Vec<SessionEventRecord>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        events::after(&conn, session_id, after_seq).await
-    }
-    async fn last_event_seq(&self, session_id: &str) -> Result<i64> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        events::last_seq(&conn, session_id).await
-    }
-
-    async fn create_subagent_task(&self, record: &SubagentTaskRecord) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        subagent_tasks::create(&conn, record).await
-    }
-    async fn complete_subagent_task(&self, task_id: &str, result: &str, ok: bool) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        subagent_tasks::complete(&conn, task_id, result, ok).await
-    }
-    async fn list_subagent_tasks(
-        &self,
-        parent_session_id: &str,
-    ) -> Result<Vec<SubagentTaskRecord>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        subagent_tasks::list(&conn, parent_session_id).await
-    }
-    async fn get_subagent_task(&self, task_id: &str) -> Result<Option<SubagentTaskRecord>> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        subagent_tasks::get_by_task_id(&conn, task_id).await
-    }
-    async fn cancel_subagent_task(&self, task_id: &str) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        subagent_tasks::cancel(&conn, task_id).await
-    }
-
-    async fn create_todo_workflow(
-        &self,
-        workflow: &TodoWorkflowRecord,
-        items: &[TodoItemRecord],
-        event: &TodoEventRecord,
-    ) -> Result<i64> {
-        let _guard = self.db_lock.lock().await;
-        todos::create(&self.conn, workflow, items, event).await
-    }
-
-    async fn get_todo_workflow(&self, id: &str) -> Result<Option<TodoWorkflowRecord>> {
-        let _guard = self.db_lock.lock().await;
-        todos::get(&self.conn, id).await
-    }
-
-    async fn list_todo_workflows(&self, limit: u32) -> Result<Vec<TodoWorkflowSummary>> {
-        let _guard = self.db_lock.lock().await;
-        todos::list(&self.conn, limit).await
-    }
-
-    async fn list_todo_items(&self, workflow_id: &str) -> Result<Vec<TodoItemRecord>> {
-        let _guard = self.db_lock.lock().await;
-        todos::items(&self.conn, workflow_id).await
-    }
-
-    async fn commit_todo_transition(
-        &self,
-        workflow: &TodoWorkflowRecord,
-        items: &[TodoItemRecord],
-        event: &TodoEventRecord,
-    ) -> Result<i64> {
-        let _guard = self.db_lock.lock().await;
-        todos::commit(&self.conn, workflow, items, event).await
-    }
-
-    async fn todo_events_after(
-        &self,
-        workflow_id: &str,
-        after_seq: i64,
-    ) -> Result<Vec<TodoEventRecord>> {
-        let _guard = self.db_lock.lock().await;
-        todos::events_after(&self.conn, workflow_id, after_seq).await
-    }
-
-    async fn register_node(
-        &self,
-        name: &str,
-        version: Option<&str>,
-        workdir: Option<&str>,
-        now_ms: i64,
-    ) -> Result<NodeRecord> {
-        let _guard = self.db_lock.lock().await;
-        nodes::register(&self.conn, name, version, workdir, now_ms).await
-    }
-    async fn list_nodes(&self) -> Result<Vec<NodeRecord>> {
-        let _guard = self.db_lock.lock().await;
-        nodes::list(&self.conn).await
-    }
-    async fn get_node(&self, id: &str) -> Result<Option<NodeRecord>> {
-        let _guard = self.db_lock.lock().await;
-        nodes::get(&self.conn, id).await
-    }
-    async fn delete_node(&self, id: &str) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        nodes::delete(&self.conn, id).await
-    }
-    async fn heartbeat_node(&self, id: &str, now_ms: i64) -> Result<Vec<String>> {
-        let _guard = self.db_lock.lock().await;
-        nodes::heartbeat(&self.conn, id, now_ms).await
-    }
-    async fn dispatch_node_task(
-        &self,
-        task_id: &str,
-        session_id: &str,
-        node_id: &str,
-        title: Option<&str>,
-        prompt: &str,
-        agent: Option<&str>,
-        model: Option<&str>,
-        now_ms: i64,
-    ) -> Result<NodeTaskRecord> {
-        let _guard = self.db_lock.lock().await;
-        node_tasks::dispatch(
-            &self.conn, task_id, session_id, node_id, title, prompt, agent, model, now_ms,
-        )
-        .await
-    }
-    async fn claim_next_node_task(
-        &self,
-        node_id: &str,
-        now_ms: i64,
-    ) -> Result<Option<NodeTaskRecord>> {
-        let _guard = self.db_lock.lock().await;
-        node_tasks::claim_next(&self.conn, node_id, now_ms).await
-    }
-    async fn update_node_task_status(
-        &self,
-        task_id: &str,
-        status: NodeTaskStatus,
-        error: Option<&str>,
-        now_ms: i64,
-    ) -> Result<()> {
-        let _guard = self.db_lock.lock().await;
-        node_tasks::update_status(&self.conn, task_id, status, error, now_ms).await
-    }
-    async fn request_node_task_cancel(&self, task_id: &str) -> Result<Option<NodeTaskStatus>> {
-        let _guard = self.db_lock.lock().await;
-        node_tasks::request_cancel(&self.conn, task_id).await
-    }
-    async fn list_node_tasks(&self, node_id: &str, limit: u32) -> Result<Vec<NodeTaskRecord>> {
-        let _guard = self.db_lock.lock().await;
-        node_tasks::list_tasks(&self.conn, node_id, limit).await
-    }
-    async fn get_node_task(&self, task_id: &str) -> Result<Option<NodeTaskRecord>> {
-        let _guard = self.db_lock.lock().await;
-        node_tasks::get_task(&self.conn, task_id).await
-    }
-    async fn converge_lost_node_tasks(
-        &self,
-        now_ms: i64,
-        stale_ms: i64,
-    ) -> Result<Vec<NodeTaskRecord>> {
-        let _guard = self.db_lock.lock().await;
-        node_tasks::converge_lost(&self.conn, now_ms, stale_ms).await
-    }
-
-    async fn import_messages(
-        &self,
-        session_id: &str,
-        msgs: &[opencoder_core::Message],
-    ) -> Result<ImportReport> {
-        let _guard = self.db_lock.lock().await;
-        let conn = self.conn().await?;
-        messages::import(&conn, session_id, msgs).await
     }
 }

@@ -15,6 +15,18 @@ pub(crate) fn flash_visible(start: u32, now: u32, ticks: u32) -> bool {
     now.wrapping_sub(start) < ticks
 }
 
+/// Whether the mode-flash chip renders in the warning hue: the read-only
+/// plan family, the "→ edit plan" flash for the plan-text editor, and the
+/// clear-context countdown guard (a destructive operation about to fold the
+/// transcript — matched by its countdown banner text, not by a prefix).
+pub(crate) fn is_warn_flash(text: &str) -> bool {
+    text.starts_with("\u{2192} plan mode")
+        || text.starts_with("\u{2192} edit plan")
+        || text.contains(
+            "\u{4e4b}\u{540e}\u{4ec5}\u{4fdd}\u{7559}\u{8ba1}\u{5212}\u{5e76}\u{6267}\u{884c}",
+        )
+}
+
 /// Transient mode-flash status text if still within its visibility window.
 fn flash_status_text(mode_flash: &Option<(String, u32)>, anim_tick: u32) -> Option<&str> {
     mode_flash
@@ -53,10 +65,9 @@ pub(crate) fn render_frame(
     skill_menu: Option<&crate::menu::SkillMenu>,
     task_picker: Option<&crate::task::TaskPicker>,
     command_menu: Option<&crate::command::CommandMenu>,
-    file_menu: Option<&crate::file_menu::FileMenu>,
+    agent_menu: Option<&crate::agent_menu::AgentMenu>,
     model_menu: Option<&crate::model_menu::ModelMenu>,
     mcp_menu: Option<&crate::mcp_menu::McpMenu>,
-    envs_menu: Option<&crate::envs_menu::EnvsMenu>,
     cli_menu: Option<&crate::cli_menu::CliMenu>,
     skill_toggle_menu: Option<&crate::skill_menu::SkillMenu>,
     ap_menu: Option<&crate::ap_menu::ApMenu>,
@@ -74,14 +85,15 @@ pub(crate) fn render_frame(
     is_top_level: bool,
     ap_mode: opencoder_core::ApMode,
     display_mode: &str,
+    plan_skill_active: bool,
     notepad: Option<&crate::notepad::NotepadView>,
 ) -> anyhow::Result<()> {
-    let plan_label = plan_edit.as_ref().map(|pe| pe.mode_label());
+    let plan_edit_label = plan_edit.as_ref().map(|pe| pe.mode_label());
     let (render_input, render_cursor) = match plan_edit {
         Some(pe) => (pe.text(), pe.cursor()),
         None => (input, cursor_idx),
     };
-    let plan_mode: Option<&str> = plan_label.as_deref();
+    let plan_edit_mode: Option<&str> = plan_edit_label.as_deref();
     let edit_title: Option<&str> = plan_edit.as_ref().map(|pe| pe.title());
     crate::render::render(
         terminal,
@@ -106,10 +118,9 @@ pub(crate) fn render_frame(
         skill_menu,
         task_picker,
         command_menu,
-        file_menu,
+        agent_menu,
         model_menu,
         mcp_menu,
-        envs_menu,
         cli_menu,
         skill_toggle_menu,
         ap_menu,
@@ -122,13 +133,14 @@ pub(crate) fn render_frame(
         copy_mode,
         pending_images,
         input_disabled,
-        plan_mode,
+        plan_edit_mode,
         edit_title,
         tail_ms,
         task_ms,
         is_top_level,
         ap_mode,
         display_mode,
+        plan_skill_active,
         notepad,
     )
 }

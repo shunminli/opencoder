@@ -17,6 +17,28 @@ use serde_json::json;
 use crate::handle_questions::get_or_create_handle;
 use crate::AppState;
 
+/// 404 precheck aligned with `api_events::get_events`: without it every
+/// question poll on a bogus session id get-or-creates a handle — a token
+/// holder could grow the HandleMap without bound, and the hub attach would
+/// pin entries that never drain. Keep the error as response *parts* here;
+/// boxing a full axum `Response` into every successful Result was large
+/// enough to trip the workspace's `result_large_err` release gate.
+type SessionLookupError = (axum::http::StatusCode, Json<serde_json::Value>);
+
+async fn require_session(state: &Arc<AppState>, id: &str) -> Result<(), SessionLookupError> {
+    match state.store.get_session(id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "session not found" })),
+        )),
+        Err(e) => Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": format!("get_session: {e:#}") })),
+        )),
+    }
+}
+
 /// GET /api/sessions/:id/questions — open questions (200, always).
 ///
 /// The get-or-create + attach means even a pure polling frontend enables
@@ -26,6 +48,9 @@ pub async fn list_questions(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    if let Err(resp) = require_session(&state, &id).await {
+        return resp.into_response();
+    }
     let handle = get_or_create_handle(&state.handles, &id).await;
     handle.question_hub.attach();
     let questions: Vec<_> = handle
@@ -72,6 +97,9 @@ pub async fn answer_question(
         )
             .into_response();
     }
+    if let Err(resp) = require_session(&state, &id).await {
+        return resp.into_response();
+    }
     let handle = get_or_create_handle(&state.handles, &id).await;
     let not_waiting = !handle
         .question_hub
@@ -94,6 +122,9 @@ pub async fn skip_question(
     State(state): State<Arc<AppState>>,
     Path((id, call_id)): Path<(String, String)>,
 ) -> Response {
+    if let Err(resp) = require_session(&state, &id).await {
+        return resp.into_response();
+    }
     let handle = get_or_create_handle(&state.handles, &id).await;
     let waiting = handle.question_hub.waiting_questions();
     if !waiting.iter().any(|(cid, _)| cid == &call_id) {

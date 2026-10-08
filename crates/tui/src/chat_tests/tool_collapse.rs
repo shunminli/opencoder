@@ -1,10 +1,55 @@
+//! Step-group folding for runs of tool calls (`ChatBlock::StepGroup`).
+//!
+//! A group is the canonical ladder for one admitted user Turn; assistant
+//! text, image, marker, and subagent presentation do not split it. Within a
+//! group a step is one Thinking run plus every function call that follows;
+//! sequential and parallel calls both accumulate until new Thinking opens
+//! the next step. Default render is ONE
+//! clickable group row `▸ N Steps`; clicking it lists the step rows,
+//! clicking a step row reveals its thinking + `N Function calls`, opening
+//! that aggregate lists calls, and clicking a call row expands only that
+//! call's result; Ctrl+L collapses every level again.
+
 use super::super::*;
 
+/// Collect `(group_idx, steps)` for every StepGroup in the view.
+fn groups(v: &ChatView) -> Vec<(usize, &Vec<Step>)> {
+    v.blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| match b {
+            ChatBlock::StepGroup { steps, .. } => Some((i, steps)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Flatten one group's steps into its calls in order.
+fn group_calls(v: &ChatView) -> Vec<Vec<&ToolCall>> {
+    groups(v)
+        .iter()
+        .map(|(_, steps)| steps.iter().flat_map(|s| s.calls.iter()).collect())
+        .collect()
+}
+
+fn flatten_text(v: &ChatView) -> Vec<String> {
+    v.flatten()
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect::<String>()
+        })
+        .collect()
+}
+
 #[test]
-fn parallel_tool_outputs_route_to_own_block() {
+fn parallel_tool_calls_form_one_group_and_route_by_id() {
     // Regression: when two tools start before either ends (parallel bash
-    // calls), each ToolEnd must append output to its own block by id, not to
-    // the last-pushed block. Previously all output piled into the final block.
+    // calls), they join ONE group (and one step, neither being finished at
+    // the second start) and each ToolEnd must append output to its own call
+    // by id — not to the last-pushed call.
     let mut v = ChatView::default();
     v.apply(&SessionEvent::ToolStart {
         id: "a".into(),
@@ -32,533 +77,323 @@ fn parallel_tool_outputs_route_to_own_block() {
         images: Vec::new(),
     });
 
-    // Two distinct tool blocks, in start order.
-    let tools: Vec<_> = v
-        .blocks
-        .iter()
-        .filter_map(|b| match b {
-            ChatBlock::Tool {
-                id, header, output, ..
-            } => Some((id, header, output)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(tools.len(), 2, "expected two tool blocks");
-    assert_eq!(tools[0].0, "a");
-    assert_eq!(tools[1].0, "b");
-
-    let text = |i: usize| -> String {
-        tools[i]
-            .1
+    let grps = group_calls(&v);
+    assert_eq!(grps.len(), 1, "concurrent calls must form one group");
+    assert_eq!(grps[0].len(), 2, "the step must hold both calls");
+    // Calls keep start order regardless of end order.
+    assert_eq!(grps[0][0].id, "a");
+    assert_eq!(grps[0][1].id, "b");
+    let text = |c: &ToolCall| -> String {
+        c.header
             .spans
             .iter()
-            .chain(tools[i].2.iter().flat_map(|l| l.spans.iter()))
+            .chain(c.output.iter().flat_map(|l| l.spans.iter()))
             .map(|s| s.content.clone())
             .collect()
     };
-    let text_a = text(0);
-    let text_b = text(1);
-
-    assert!(text_a.contains("echo A"), "block A header: {text_a}");
-    assert!(text_a.contains("A-out"), "block A output: {text_a}");
-    assert!(!text_a.contains("B-out"), "block A contaminated: {text_a}");
-
-    assert!(text_b.contains("echo B"), "block B header: {text_b}");
-    assert!(text_b.contains("B-out"), "block B output: {text_b}");
-    assert!(!text_b.contains("A-out"), "block B contaminated: {text_b}");
+    let text_a = text(grps[0][0]);
+    let text_b = text(grps[0][1]);
+    assert!(text_a.contains("echo A"), "call A header: {text_a}");
+    assert!(text_a.contains("A-out"), "call A output: {text_a}");
+    assert!(!text_a.contains("B-out"), "call A contaminated: {text_a}");
+    assert!(text_b.contains("echo B"), "call B header: {text_b}");
+    assert!(text_b.contains("B-out"), "call B output: {text_b}");
+    assert!(!text_b.contains("A-out"), "call B contaminated: {text_b}");
+    // Finished calls record elapsed time.
+    assert!(grps[0].iter().all(|c| c.elapsed_ms.is_some()));
 }
 
 #[test]
-fn orphan_tool_end_creates_synthetic_block() {
-    // A ToolEnd with no preceding ToolStart (e.g. a lost event) must not
-    // panic; it creates a synthetic "(output)" tool block carrying the id.
+fn sequential_calls_without_new_thinking_stay_in_one_step() {
+    // Call completion is not a Step boundary. Until a new Thinking run
+    // appears, sequential calls accumulate in the same function-call list.
     let mut v = ChatView::default();
-    v.apply(&SessionEvent::ToolEnd {
-        id: "orphan".into(),
+    v.apply(&SessionEvent::ToolStart {
+        id: "a".into(),
         name: "bash".into(),
-        output: "loose output".into(),
+        input: serde_json::json!({"command": "echo A"}),
+    });
+    v.apply(&SessionEvent::ToolEnd {
+        id: "a".into(),
+        name: "bash".into(),
+        output: "A-out".into(),
         is_error: false,
         images: Vec::new(),
     });
-    let tools: Vec<_> = v
-        .blocks
-        .iter()
-        .filter_map(|b| match b {
-            ChatBlock::Tool {
-                id, header, output, ..
-            } => Some((id, header, output)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(tools.len(), 1, "orphan ToolEnd should create one block");
-    assert_eq!(tools[0].0, "orphan");
-    let header: String = tools[0].1.spans.iter().map(|s| s.content.clone()).collect();
-    assert!(header.contains("(output)"), "synthetic header: {header}");
-    let out: String = tools[0]
-        .2
-        .iter()
-        .flat_map(|l| l.spans.iter())
-        .map(|s| s.content.clone())
-        .collect();
-    assert!(out.contains("loose output"), "output appended: {out}");
+    v.apply(&SessionEvent::ToolStart {
+        id: "b".into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": "echo B"}),
+    });
+    let grps = groups(&v);
+    assert_eq!(grps.len(), 1, "sequential calls stay in one group");
+    assert_eq!(grps[0].1.len(), 1, "calls alone do not create steps");
+    assert_eq!(grps[0].1[0].calls[0].id, "a");
+    assert_eq!(grps[0].1[0].calls[1].id, "b");
 }
 
 #[test]
-fn tool_end_error_colors_output_red() {
+fn new_thinking_opens_step_even_when_previous_call_is_still_running() {
     let mut v = ChatView::default();
     v.apply(&SessionEvent::ToolStart {
-        id: "e1".into(),
+        id: "a".into(),
         name: "bash".into(),
-        input: serde_json::json!({"command": "false"}),
+        input: serde_json::json!({"command": "sleep 1"}),
     });
-    v.apply(&SessionEvent::ToolEnd {
-        id: "e1".into(),
+    v.apply(&SessionEvent::ReasoningDelta("next thought".into()));
+    v.apply(&SessionEvent::ToolStart {
+        id: "b".into(),
         name: "bash".into(),
-        output: "boom".into(),
-        is_error: true,
-        images: Vec::new(),
+        input: serde_json::json!({"command": "echo B"}),
     });
-    let tool = v
-        .blocks
-        .iter()
-        .find_map(|b| match b {
-            ChatBlock::Tool { output, .. } => Some(output),
-            _ => None,
-        })
-        .expect("tool block");
-    assert!(!tool.is_empty(), "error output should be appended");
-    assert_eq!(
-        tool[0].spans[0].style.fg,
-        Some(ratatui::style::Color::Red),
-        "error output must be styled red"
+
+    let steps = groups(&v)[0].1;
+    assert_eq!(steps.len(), 2, "new Thinking is the Step boundary");
+    assert_eq!(steps[0].calls[0].id, "a");
+    assert_eq!(steps[1].calls[0].id, "b");
+    assert!(steps[1].thinking_raw.contains("next thought"));
+}
+
+#[test]
+fn collapsed_by_default_renders_single_group_row() {
+    let mut v = ChatView::default();
+    for id in ["a", "b"] {
+        v.apply(&SessionEvent::ReasoningDelta(format!("think {id}")));
+        v.apply(&SessionEvent::ToolStart {
+            id: id.into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": format!("echo {id}")}),
+        });
+        v.apply(&SessionEvent::ToolEnd {
+            id: id.into(),
+            name: "bash".into(),
+            output: format!("{id}-out\nsecond line"),
+            is_error: false,
+            images: Vec::new(),
+        });
+    }
+    let lines = flatten_text(&v);
+    // Group row + trailing blank: the whole ladder is one clickable row.
+    assert_eq!(lines.len(), 2, "default render: group row + blank");
+    assert!(
+        lines[0].contains("\u{25b8} 2 Steps"),
+        "collapsed group row carries the step count: {:?}",
+        lines[0]
     );
-}
+    assert!(
+        !lines[0].contains("\u{276f}"),
+        "closed group must use the closed glyph: {:?}",
+        lines[0]
+    );
+    // Step rows, call headers and outputs are all folded away.
+    assert!(!lines.iter().any(|l| l.contains("Step(")));
+    assert!(!lines.iter().any(|l| l.contains("echo a")));
+    assert!(!lines.iter().any(|l| l.contains("a-out")));
 
-#[test]
-fn tool_output_retained_in_full_and_collapsed_by_default() {
-    let mut v = ChatView::default();
-    v.apply(&SessionEvent::ToolStart {
-        id: "t1".into(),
+    // Singular grammar for a single-step group (two parallel calls = one
+    // step).
+    let mut v1 = ChatView::default();
+    v1.apply(&SessionEvent::ToolStart {
+        id: "solo".into(),
         name: "bash".into(),
-        input: serde_json::json!({"command": "seq 20"}),
+        input: serde_json::json!({"command": "true"}),
     });
-    v.apply(&SessionEvent::ToolEnd {
-        id: "t1".into(),
+    v1.apply(&SessionEvent::ToolEnd {
+        id: "solo".into(),
         name: "bash".into(),
-        output: (1..=20)
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join("\n"),
+        output: "ok".into(),
         is_error: false,
         images: Vec::new(),
     });
-    let (output, collapsed) = v
-        .blocks
-        .iter()
-        .find_map(|b| match b {
-            ChatBlock::Tool {
-                output, collapsed, ..
-            } => Some((output, *collapsed)),
-            _ => None,
-        })
-        .expect("tool block");
-    // No truncation: all 20 lines are retained.
-    assert_eq!(
-        output.len(),
-        20,
-        "full output must be retained (was truncated to 6); got {}",
-        output.len()
+    let solo = flatten_text(&v1);
+    assert_eq!(solo.len(), 2, "group row + blank");
+    assert!(
+        solo[0].contains("1 Step") && !solo[0].contains("Steps"),
+        "single step uses singular: {:?}",
+        solo[0]
     );
-    // Tool blocks start collapsed by default.
-    assert!(collapsed, "tool block must default to collapsed");
 }
 
 #[test]
-fn toggle_tool_at_expands_then_collapses() {
+fn running_hint_persists_until_say_begins() {
     let mut v = ChatView::default();
     v.apply(&SessionEvent::ToolStart {
-        id: "t1".into(),
+        id: "slow".into(),
         name: "bash".into(),
-        input: serde_json::json!({"command": "echo hi"}),
+        input: serde_json::json!({"command": "sleep 5"}),
     });
+    let line = &flatten_text(&v)[0];
+    assert!(
+        line.contains("running"),
+        "unfinished call must show the running hint: {line:?}"
+    );
+    assert!(
+        line.contains("Step  \u{280b} running"),
+        "the animation must keep a two-column gap: {line:?}"
+    );
     v.apply(&SessionEvent::ToolEnd {
-        id: "t1".into(),
+        id: "slow".into(),
         name: "bash".into(),
-        output: "RESULT-42".into(),
+        output: "done".into(),
         is_error: false,
         images: Vec::new(),
     });
+    let line = &flatten_text(&v)[0];
     assert!(
-        matches!(
-            v.blocks.last(),
-            Some(ChatBlock::Tool {
-                collapsed: true,
-                ..
-            })
-        ),
-        "tool block should start collapsed"
+        line.contains("running"),
+        "ToolEnd must keep progress alive while waiting for Say: {line:?}"
     );
-    // While collapsed, the output body must be hidden from flatten().
-    let flat_collapsed = v.flatten();
-    let body: String = flat_collapsed
-        .iter()
-        .flat_map(|l| l.spans.iter())
-        .map(|s| s.content.clone())
-        .collect();
+    v.apply(&SessionEvent::TextDelta("final answer".into()));
+    let line = &flatten_text(&v)[0];
+    // The running hint MOVES onto the merged Say header while the Say
+    // streams last — it retires from the pre-Say group row, it does not
+    // vanish: the pair header now carries the live indicator.
     assert!(
-        !body.contains("RESULT-42"),
-        "collapsed tool must hide its output; got: {body:?}"
+        line.contains("Say(1 step): final answer") && line.contains("running"),
+        "the first non-empty Say chunk hands the hint to the merged header: {line:?}"
     );
 
-    let idx = v.blocks.len() - 1;
-    v.toggle_tool_at(idx);
-    let flat_expanded = v.flatten();
-    let body2: String = flat_expanded
-        .iter()
-        .flat_map(|l| l.spans.iter())
-        .map(|s| s.content.clone())
-        .collect();
-    assert!(
-        body2.contains("RESULT-42"),
-        "expanded tool must show its output; got: {body2:?}"
-    );
-    assert!(
-        flat_expanded.len() > flat_collapsed.len(),
-        "expanded must render more lines than collapsed"
-    );
-
-    // Toggle back to collapsed.
-    v.toggle_tool_at(idx);
-    assert!(
-        matches!(
-            v.blocks.last(),
-            Some(ChatBlock::Tool {
-                collapsed: true,
-                ..
-            })
-        ),
-        "second toggle must re-collapse"
-    );
+    // Say is terminal for the ladder: later frames cannot re-arm it —
+    // post-Say activity (new ladder below the Say) retires the hint for
+    // good, exactly like the old pre-Say row.
+    v.apply(&SessionEvent::ReasoningDelta("one more check".into()));
+    assert!(!flatten_text(&v)[0].contains("running"));
+    v.apply(&SessionEvent::ToolStart {
+        id: "after-say".into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": "true"}),
+    });
+    assert!(!flatten_text(&v)[0].contains("running"));
 }
 
 #[test]
-fn toggle_tool_at_is_noop_for_non_tool_blocks() {
+fn terminal_event_clears_progress_when_no_say_arrives() {
     let mut v = ChatView::default();
-    v.apply(&SessionEvent::TextDelta("hello".into()));
+    v.apply(&SessionEvent::ToolStart {
+        id: "no-say".into(),
+        name: "bash".into(),
+        input: serde_json::json!({"command": "true"}),
+    });
+    v.apply(&SessionEvent::ToolEnd {
+        id: "no-say".into(),
+        name: "bash".into(),
+        output: "done".into(),
+        is_error: false,
+        images: Vec::new(),
+    });
+    assert!(flatten_text(&v)[0].contains("running"));
     v.apply(&SessionEvent::Done);
-    // Index 0 is an Assistant block, not a Tool — toggling must be a no-op.
-    v.toggle_tool_at(0);
-    assert!(
-        block_text(&v).contains("hello"),
-        "non-tool toggle must not corrupt state"
-    );
-}
+    assert!(!flatten_text(&v)[0].contains("running"));
 
-#[test]
-fn collapse_all_collapsible_collapses_tools_and_thinking() {
-    let mut v = ChatView::default();
-    v.apply(&SessionEvent::ReasoningDelta("reason".into()));
-    v.apply(&SessionEvent::ToolStart {
-        id: "t".into(),
+    let mut failed = ChatView::default();
+    failed.apply(&SessionEvent::ReasoningDelta("will fail".into()));
+    assert!(flatten_text(&failed)[0].contains("running"));
+    failed.apply(&SessionEvent::Error("boom".into()));
+    assert!(!flatten_text(&failed)[0].contains("running"));
+
+    let mut recovered = ChatView::default();
+    recovered.apply(&SessionEvent::ToolStart {
+        id: "recovered".into(),
         name: "bash".into(),
-        input: serde_json::json!({"command": "ls"}),
+        input: serde_json::json!({"command": "true"}),
     });
-    v.apply(&SessionEvent::ToolEnd {
-        id: "t".into(),
+    recovered.apply(&SessionEvent::ToolEnd {
+        id: "recovered".into(),
         name: "bash".into(),
-        output: "out".into(),
+        output: "done".into(),
         is_error: false,
         images: Vec::new(),
     });
-    // Expand both so they are observably NOT collapsed beforehand.
-    for h in v.thinking_headers() {
-        v.toggle_thinking_at(h.block_idx);
-    }
-    for h in v.tool_headers() {
-        v.toggle_tool_at(h.block_idx);
-    }
-    v.collapse_all_collapsible();
-    for b in &v.blocks {
-        match b {
-            ChatBlock::Thinking { collapsed, .. } | ChatBlock::Tool { collapsed, .. } => {
-                assert!(*collapsed, "every collapsible block must be collapsed");
-            }
-            _ => {}
-        }
-    }
+    recovered.reconcile_completed_assistant("reliable answer");
+    assert!(!flatten_text(&recovered)[0].contains("running"));
 }
 
 #[test]
-fn tool_headers_line_index_lands_on_tool_header() {
+fn toggling_the_ladder_reveals_each_level() {
+    // Two Thinking + call pairs. Default = group row + blank = 2;
+    // group open = + 2 step rows = 4; step 1 open = Thinking header/body +
+    // calls row = 7; calls open = + call row = 8; call expanded = + output = 9
+    // plus the trailing blank = 10 total.
     let mut v = ChatView::default();
-    v.apply(&SessionEvent::TextDelta("preamble\nsecond".into()));
-    v.apply(&SessionEvent::Done);
-    v.apply(&SessionEvent::ToolStart {
-        id: "t".into(),
-        name: "bash".into(),
-        input: serde_json::json!({"command": "echo x"}),
-    });
-    let headers = v.tool_headers();
-    assert_eq!(headers.len(), 1, "expected exactly one tool header");
-    let flat = v.flatten();
-    let header_line: String = flat[headers[0].header_line_idx]
-        .spans
-        .iter()
-        .map(|s| s.content.clone())
-        .collect();
+    for id in ["a", "b"] {
+        v.apply(&SessionEvent::ReasoningDelta(format!("think {id}")));
+        v.apply(&SessionEvent::ToolStart {
+            id: id.into(),
+            name: "bash".into(),
+            input: serde_json::json!({"command": format!("echo {id}")}),
+        });
+        v.apply(&SessionEvent::ToolEnd {
+            id: id.into(),
+            name: "bash".into(),
+            output: format!("{id}-out"),
+            is_error: false,
+            images: Vec::new(),
+        });
+    }
+    let list = flatten_text(&v);
+    assert_eq!(list.len(), 2, "default = group row + blank");
     assert!(
-        header_line.contains("bash"),
-        "header_line_idx must land on the tool header line; got: {header_line:?}"
+        list[0].contains("\u{25b8} 2 Steps"),
+        "collapsed group row: {:?}",
+        list[0]
     );
-}
 
-#[test]
-fn summarize_keeps_full_bash_command_no_truncation() {
-    // Regression: bash commands longer than 80 columns were truncated to
-    // 80 display columns (with …), hiding the real command behind an
-    // ellipsis. summarize() must now return the full command text so the
-    // body layer can wrap it to the terminal width.
-    let long_cmd = format!("echo {}", "a".repeat(100));
+    // Open the group: both closed step rows appear.
+    v.toggle_tool_call_at(0, 0);
+    let open_group = flatten_text(&v);
+    assert_eq!(open_group.len(), 4);
     assert!(
-        long_cmd.chars().count() > 80,
-        "test setup: command must exceed 80 cols"
-    );
-    let mut v = ChatView::default();
-    v.apply(&SessionEvent::ToolStart {
-        id: "t1".into(),
-        name: "bash".into(),
-        input: serde_json::json!({"command": long_cmd.clone()}),
-    });
-    let header = v
-        .blocks
-        .iter()
-        .find_map(|b| match b {
-            ChatBlock::Tool { header, .. } => Some(header),
-            _ => None,
-        })
-        .expect("tool block");
-    // spans[0] is the "▸ bash " label; spans[1] is the summarize() output.
-    let summary = header.spans[1].content.to_string();
-    assert!(
-        summary.contains(&long_cmd),
-        "header must contain the full command; got {summary:?}"
+        open_group[0].contains("\u{276f} 2 Steps"),
+        "open group glyph: {:?}",
+        open_group[0]
     );
     assert!(
-        !summary.contains('\u{2026}'),
-        "header must not be truncated with ellipsis; got {summary:?}"
+        open_group[1].contains("\u{25b8} Step(1)") && open_group[2].contains("\u{25b8} Step(2)"),
+        "both steps render collapsed rows: {open_group:?}"
     );
-}
 
-#[test]
-fn tool_output_truncated_at_limit() {
-    // Gap 2: even when expanded, a single ToolEnd event must not capture
-    // an unbounded number of lines. The cap (TOOL_OUTPUT_LINES = 200)
-    // bounds memory and per-refresh flatten_with cost.
-    use crate::chat::TOOL_OUTPUT_LINES;
-    let big: String = (0..5000)
-        .map(|i| format!("line-{i}\n"))
-        .collect::<String>()
-        .trim_end()
-        .to_string();
+    // Open step 1: thinking/calls summary appears, but call rows stay hidden.
+    v.toggle_tool_call_at(0, 1);
+    let open_step = flatten_text(&v);
+    assert_eq!(open_step.len(), 7);
     assert!(
-        big.lines().count() > TOOL_OUTPUT_LINES,
-        "test setup: output must exceed the cap"
+        open_step[1].contains("\u{276f} Step(1)"),
+        "opened step row: {:?}",
+        open_step[1]
     );
-    let mut v = ChatView::default();
-    v.apply(&SessionEvent::ToolStart {
-        id: "big".into(),
-        name: "bash".into(),
-        input: serde_json::json!({"command": "cat huge_file.txt"}),
-    });
-    v.apply(&SessionEvent::ToolEnd {
-        id: "big".into(),
-        name: "bash".into(),
-        output: big,
-        is_error: false,
-        images: Vec::new(),
-    });
-    let tool = v
-        .blocks
-        .iter()
-        .find_map(|b| match b {
-            ChatBlock::Tool { id, output, .. } if id == "big" => Some(output),
-            _ => None,
-        })
-        .expect("tool block");
-    assert_eq!(
-        tool.len(),
-        TOOL_OUTPUT_LINES,
-        "tool output must be capped at TOOL_OUTPUT_LINES ({}), got {}",
-        TOOL_OUTPUT_LINES,
-        tool.len()
-    );
-    // Sanity: first line is the beginning of the output, not truncated from the front.
-    let first: String = tool[0]
-        .spans
-        .iter()
-        .map(|s| s.content.to_string())
-        .collect();
     assert!(
-        first.contains("line-0"),
-        "first captured line must be the start of the output: {first}"
+        open_step[4].contains("1 Function call"),
+        "function-call aggregate row: {:?}",
+        open_step[4]
+    );
+    assert!(!open_step.join("\n").contains("echo a"));
+
+    // Open the aggregate: the call row appears without its result.
+    v.toggle_tool_call_at(0, 2);
+    let calls_open = flatten_text(&v);
+    assert_eq!(calls_open.len(), 8);
+    assert!(calls_open[5].contains("echo a"));
+    assert!(!calls_open.join("\n").contains("a-out"));
+
+    // Click the function call: its result appears.
+    v.toggle_tool_call_at(0, 3);
+    let expanded = flatten_text(&v);
+    assert_eq!(expanded.len(), 10, "call result + blank join the ladder");
+    assert!(
+        expanded[6].contains("a-out"),
+        "output visible: {:?}",
+        expanded[6]
+    );
+
+    // Re-toggling the group collapses the whole ladder; the group row stays.
+    v.toggle_tool_call_at(0, 0);
+    let closed = flatten_text(&v);
+    assert_eq!(closed.len(), 2, "group closed folds every level");
+    assert!(
+        closed[0].contains("\u{25b8} 2 Steps"),
+        "group row persists: {closed:?}"
     );
 }
 
-#[test]
-fn expanded_tool_header_prefix_arrow_flips_down() {
-    // Regression: `flatten_with` rewrites the tool header's prefix arrow from
-    // ▸ (U+25B8, points right) to ▾ (U+25BE, points down) when the block is
-    // expanded, and reverts to ▸ when collapsed. The arrow is the visual cue
-    // for whether the tool body is visible.
-    let mut v = ChatView::default();
-    v.apply(&SessionEvent::ToolStart {
-        id: "t1".into(),
-        name: "bash".into(),
-        input: serde_json::json!({"command": "echo hi"}),
-    });
-    v.apply(&SessionEvent::ToolEnd {
-        id: "t1".into(),
-        name: "bash".into(),
-        output: "RESULT-42".into(),
-        is_error: false,
-        images: Vec::new(),
-    });
-
-    let first_span_char =
-        |lines: &[Line]| -> Option<char> { lines.first()?.spans.first()?.content.chars().next() };
-
-    // Collapsed (default): header keeps ▸.
-    assert_eq!(
-        first_span_char(&v.flatten()),
-        Some('\u{25b8}'),
-        "collapsed tool header must start with ▸ (U+25B8)"
-    );
-
-    // Expand — arrow flips to ▾.
-    v.toggle_tool_at(v.blocks.len() - 1);
-    assert_eq!(
-        first_span_char(&v.flatten()),
-        Some('\u{25be}'),
-        "expanded tool header must start with ▾ (U+25BE)"
-    );
-
-    // Collapse again — arrow reverts to ▸.
-    v.toggle_tool_at(v.blocks.len() - 1);
-    assert_eq!(
-        first_span_char(&v.flatten()),
-        Some('\u{25b8}'),
-        "re-collapsed tool header must start with ▸ (U+25B8) again"
-    );
-}
-
-#[test]
-fn push_bash_tool_creates_expanded_tool_block() {
-    // `push_bash_tool` opens a fresh tool block for a running bash command:
-    // expanded (so the user sees output stream in), no output yet, and no
-    // elapsed time recorded. Mirrors how `app_notepad` seeds a shell block.
-    use crate::chat::{ChatBlock, ChatView};
-    let mut v = ChatView::default();
-    v.push_bash_tool("ls -la");
-
-    match v.blocks.last() {
-        Some(ChatBlock::Tool {
-            id,
-            header,
-            output,
-            collapsed,
-            elapsed_ms,
-            ..
-        }) => {
-            assert!(
-                id.starts_with("bash-"),
-                "id must start with 'bash-', got {id:?}"
-            );
-            let header_text: String = header.spans.iter().map(|s| s.content.clone()).collect();
-            assert!(
-                header_text.contains("ls -la"),
-                "header must contain the command; got {header_text:?}"
-            );
-            assert!(
-                output.is_empty(),
-                "output must be empty before the command finishes"
-            );
-            assert!(
-                !*collapsed,
-                "a freshly-pushed tool block must be expanded (collapsed == false)"
-            );
-            assert_eq!(
-                *elapsed_ms, None,
-                "elapsed_ms must be None until finish_bash_tool is called"
-            );
-        }
-        other => panic!("expected ChatBlock::Tool as last block, got {other:?}"),
-    }
-}
-
-#[test]
-fn finish_bash_tool_fills_output_and_collapses() {
-    // After the command resolves, `finish_bash_tool` writes the captured
-    // output lines, collapses the block, and stamps the elapsed time.
-    use crate::chat::{ChatBlock, ChatView};
-    let mut v = ChatView::default();
-    v.push_bash_tool("echo hi");
-    v.finish_bash_tool("hello\nworld");
-
-    match v.blocks.last() {
-        Some(ChatBlock::Tool {
-            output,
-            collapsed,
-            elapsed_ms,
-            ..
-        }) => {
-            assert!(
-                !output.is_empty(),
-                "output must contain lines after finish_bash_tool"
-            );
-            let joined: String = output
-                .iter()
-                .flat_map(|l| l.spans.iter())
-                .map(|s| s.content.clone())
-                .collect();
-            assert!(
-                joined.contains("hello") && joined.contains("world"),
-                "output must preserve both lines; got {joined:?}"
-            );
-            assert!(
-                *collapsed,
-                "tool block must collapse once the command finishes"
-            );
-            assert!(
-                elapsed_ms.is_some(),
-                "elapsed_ms must be recorded after finish_bash_tool"
-            );
-        }
-        other => panic!("expected ChatBlock::Tool as last block, got {other:?}"),
-    }
-}
-
-#[test]
-fn finish_bash_tool_aborted_message() {
-    // When a command is aborted (e.g. user interrupt), the notepad layer
-    // passes "(command aborted)" as the output. The block must surface that
-    // text so the transcript explains why there is no real result.
-    use crate::chat::{ChatBlock, ChatView};
-    let mut v = ChatView::default();
-    v.push_bash_tool("sleep 999");
-    v.finish_bash_tool("(command aborted)");
-
-    match v.blocks.last() {
-        Some(ChatBlock::Tool { output, .. }) => {
-            let joined: String = output
-                .iter()
-                .flat_map(|l| l.spans.iter())
-                .map(|s| s.content.clone())
-                .collect();
-            assert!(
-                joined.contains("aborted"),
-                "aborted output must be visible in the block; got {joined:?}"
-            );
-        }
-        other => panic!("expected ChatBlock::Tool as last block, got {other:?}"),
-    }
-}
+#[path = "tool_collapse/turn_routing.rs"]
+mod turn_routing;

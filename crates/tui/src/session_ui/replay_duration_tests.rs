@@ -1,21 +1,22 @@
-//! Regression tests for duration rendering on replayed Tool blocks.
+//! Regression tests for duration/running rendering on replayed step groups.
 //!
-//! Replayed Tool blocks carry no wall-clock timing from the persisted
-//! `Message`s. They must NOT enter the "running" branch of
-//! `push_duration_span` (which would compute `now - 0 = epoch-ms` and
-//! render a garbage timer on `--continue`/resume). Setting
-//! `elapsed_ms: Some(0)` hits the sub-1s guard so no span is pushed.
+//! Replayed tool calls carry no wall-clock timing from the persisted
+//! `Message`s. They must be marked finished (`elapsed_ms: Some(0)`) so the
+//! group marker shows neither a live timer nor the "running" spinner hint on
+//! `--continue`/resume.
 
 use super::replay::replay_one;
 use crate::chat::{ChatBlock, ChatView};
 use opencoder_core::{ContentBlock, Message, MessageUsage, Role};
 use std::collections::HashMap;
 
-/// Replaying an assistant ToolUse must mark the Tool block done
-/// (`elapsed_ms: Some(0)`) so it does NOT render an epoch-scale live timer.
+/// Replaying an assistant ToolUse must mark the call done
+/// (`elapsed_ms: Some(0)`) so the group marker shows no running hint.
 #[test]
 fn replayed_tool_block_omits_duration_span() {
     let msg = Message {
+        provider_state: None,
+        display: None,
         id: "a1".into(),
         role: Role::Assistant,
         blocks: vec![
@@ -38,41 +39,52 @@ fn replayed_tool_block_omits_duration_span() {
     let mut chat = ChatView::default();
     replay_one(&mut chat, &msg, &HashMap::new());
 
-    let tool = chat
+    let group = chat
         .blocks
         .iter()
-        .find(|b| matches!(b, ChatBlock::Tool { .. }))
-        .expect("should have a Tool block");
+        .find(|b| matches!(b, ChatBlock::StepGroup { .. }))
+        .expect("should have a StepGroup block");
 
-    match tool {
-        ChatBlock::Tool { elapsed_ms, .. } => {
-            assert_eq!(*elapsed_ms, Some(0));
+    match group {
+        ChatBlock::StepGroup { steps, .. } => {
+            assert_eq!(steps[0].calls[0].elapsed_ms, Some(0));
         }
         _ => unreachable!(),
     }
 
-    // Flatten with an epoch-scale now_ms. Before the fix `elapsed_ms: None`
-    // would compute live = now - 0 and push format_run_duration(epoch_ms).
+    // Flatten with an epoch-scale now_ms. A not-finished call would show the
+    // running hint (and, before the group rework, an epoch-scale live timer).
     let now_ms = 1_700_000_000_000_i64;
     let garbage = crate::fmt::format_run_duration(now_ms as u64);
     let lines = chat.flatten_with(0, now_ms);
-    let rendered: String = lines
+    // Scope the assertions to the GROUP LINE itself — the assistant body in
+    // this fixture legitimately contains the word "running".
+    let group_line: String = lines
         .iter()
-        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .find(|l| l.spans.iter().any(|s| s.content.contains("1 Step")))
+        .expect("group marker should be present")
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
         .collect::<String>();
 
-    assert!(rendered.contains("bash"), "tool header should be present");
     assert!(
-        !rendered.contains(&garbage),
-        "replayed Tool must not render garbage duration '{garbage}'"
+        !group_line.contains("running"),
+        "replayed group marker must not show the running hint: {group_line}"
+    );
+    assert!(
+        !group_line.contains(&garbage),
+        "replayed group must not render garbage duration '{garbage}'"
     );
 }
 
 /// The fallback orphan-tool-result path (Role::Tool with no matching ToolUse
-/// block) must also omit a duration span.
+/// block) must also produce a finished call (no running hint).
 #[test]
 fn replayed_orphan_tool_result_omits_duration_span() {
     let msg = Message {
+        provider_state: None,
+        display: None,
         id: "tr1".into(),
         role: Role::Tool,
         blocks: vec![ContentBlock::ToolResult {
@@ -91,26 +103,29 @@ fn replayed_orphan_tool_result_omits_duration_span() {
     let mut chat = ChatView::default();
     replay_one(&mut chat, &msg, &HashMap::new());
 
-    let tool = chat
+    let group = chat
         .blocks
         .iter()
-        .find(|b| matches!(b, ChatBlock::Tool { .. }))
-        .expect("should have a fallback Tool block");
+        .find(|b| matches!(b, ChatBlock::StepGroup { .. }))
+        .expect("should have a fallback StepGroup block");
 
-    match tool {
-        ChatBlock::Tool { elapsed_ms, .. } => {
-            assert_eq!(*elapsed_ms, Some(0));
+    match group {
+        ChatBlock::StepGroup { steps, .. } => {
+            assert_eq!(steps[0].calls[0].elapsed_ms, Some(0));
         }
         _ => unreachable!(),
     }
 }
 
-/// Replaying an assistant message carrying Reasoning blocks must restore them
-/// as collapsed `ChatBlock::Thinking` blocks — so the `💭 Thinking` label
-/// survives resume / compaction (mirrors the live ReasoningDelta path).
+/// Replaying an assistant message carrying Reasoning blocks must fold them
+/// into the ladder as a rendered, call-less step ABOVE the Say — mirroring
+/// the live path (`1 Turn = n Steps + Say`); no top-level `Thinking` block
+/// survives resume / compaction.
 #[test]
-fn replayed_reasoning_restored_as_thinking_block() {
+fn replayed_reasoning_folds_into_the_ladder_step() {
     let msg = Message {
+        provider_state: None,
+        display: None,
         id: "r1".into(),
         role: Role::Assistant,
         blocks: vec![
@@ -131,37 +146,44 @@ fn replayed_reasoning_restored_as_thinking_block() {
     let mut chat = ChatView::default();
     replay_one(&mut chat, &msg, &HashMap::new());
 
-    let thinking = chat
+    assert!(
+        !chat
+            .blocks
+            .iter()
+            .any(|b| matches!(b, ChatBlock::Thinking { .. })),
+        "replayed reasoning lives inside the ladder, not a top-level block"
+    );
+    let group_idx = chat
         .blocks
         .iter()
-        .find(|b| matches!(b, ChatBlock::Thinking { .. }))
-        .expect("Reasoning block must be restored as a Thinking block");
-
-    match thinking {
-        ChatBlock::Thinking {
-            text,
-            collapsed,
-            sealed,
-        } => {
-            assert_eq!(text, "think hard");
-            assert!(*collapsed, "replayed thinking starts collapsed");
-            assert!(*sealed, "replayed thinking is sealed (not streaming)");
+        .position(|b| matches!(b, ChatBlock::StepGroup { .. }))
+        .expect("Reasoning block must fold into the ladder's step");
+    match &chat.blocks[group_idx] {
+        ChatBlock::StepGroup { steps, .. } => {
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].thinking_raw, "think hard");
+            let rendered: String = steps[0]
+                .thinking
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.content.clone())
+                .collect();
+            assert!(
+                rendered.contains("think hard"),
+                "replayed step thinking is rendered eagerly: {rendered:?}"
+            );
+            assert!(steps[0].calls.is_empty());
         }
         _ => unreachable!(),
     }
 
-    let thinking_idx = chat
-        .blocks
-        .iter()
-        .position(|b| matches!(b, ChatBlock::Thinking { .. }))
-        .expect("thinking index");
     let assistant_idx = chat
         .blocks
         .iter()
         .position(|b| matches!(b, ChatBlock::Assistant { .. }))
         .expect("assistant text block must still be replayed");
     assert!(
-        thinking_idx < assistant_idx,
+        group_idx < assistant_idx,
         "replay must preserve the live Thinking-before-Say order"
     );
 }

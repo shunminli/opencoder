@@ -21,10 +21,15 @@ struct Ctx {
 async fn app() -> Ctx {
     let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
     let state = Arc::new(opencoder_web::AppState {
+        config_home: None,
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store: store.clone(),
         workdir: std::env::temp_dir(),
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
         client_override: Some(Arc::new(MockChatClient::new())),
     });
     Ctx {
@@ -107,8 +112,8 @@ async fn claim_task(ctx: &Ctx, node_id: &str) -> Option<(String, String)> {
     }
     assert_eq!(s, StatusCode::OK);
     Some((
-        c["task_id"].as_str().unwrap().into(),
-        c["session_id"].as_str().unwrap().into(),
+        c["task"]["task_id"].as_str().unwrap().into(),
+        c["task"]["session_id"].as_str().unwrap().into(),
     ))
 }
 

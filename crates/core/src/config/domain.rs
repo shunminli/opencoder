@@ -1,15 +1,17 @@
-//! Domain config files (`mcp.json` / `cli.json` / `skills.json` / `ap.json`).
+//! Domain config files (`mcp.json` / `cli.json` / `skills.json` / `ap.json` /
+//! `schedules.json`).
 //!
 //! The three map-shaped domains (`mcp_servers`, `cli`, `skills`) plus the
-//! scalar `autopilot` domain are hard-cut from `config.json`: they load
+//! object-shaped `autopilot` and `schedules` domains are hard-cut from
+//! `config.json`: they load
 //! from — and save to — a dedicated domain file.
 //! Lookup walks project first and a single effective file wins (it shadows
 //! the others entirely — no per-key merge across files, unlike
 //! `config.json` candidates):
 //!
 //! - project: `<working_dir>/.opencoder/<domain>.json`
-//! - env: `<global_opencode_home>/envs/<name>/<domain>.json` (active env only)
-//! - global: `<global_opencode_home>/<domain>.json` (the home behind
+//! - env: `<global_opencoder_home>/envs/<name>/<domain>.json` (active env only)
+//! - global: `<global_opencoder_home>/<domain>.json` (the home behind
 //!   [`super::env::primary_global_config_path`], so the `scoped_config_home`
 //!   override applies; XDG dirs are NOT consulted for domain files).
 
@@ -18,11 +20,12 @@ use std::path::{Path, PathBuf};
 use super::Config;
 
 /// Domain key -> domain file name. Order defines the split/save routing order.
-pub(crate) const DOMAIN_FILES: [(&str, &str); 4] = [
+pub(crate) const DOMAIN_FILES: [(&str, &str); 5] = [
     ("mcp_servers", "mcp.json"),
     ("cli", "cli.json"),
     ("skills", "skills.json"),
     ("autopilot", "ap.json"),
+    ("schedules", "schedules.json"),
 ];
 
 /// Placeholder path piece for a non-domain key: never matches a real file, so
@@ -52,29 +55,36 @@ pub(crate) fn project_domain_path(working_dir: &Path, key: &str) -> PathBuf {
     working_dir.join(".opencoder").join(file)
 }
 
-/// Global-scope domain file: `<global_opencode_home>/<domain>.json`. `None`
+/// Global-scope domain file: `<global_opencoder_home>/<domain>.json`. `None`
 /// when the key is not a domain key or the home directory is unresolvable.
 pub(crate) fn global_domain_path(key: &str) -> Option<PathBuf> {
-    let file = domain_file_name(key).unwrap_or(NOT_A_DOMAIN_FILE);
-    super::env::global_opencode_home().map(|home| home.join(file))
+    global_domain_path_with_home(key, None)
 }
 
-/// Env-scope domain file: `~/.opencoder/envs/<name>/<domain>.json` while an
-/// env is active; `None` when no env layer applies.
-fn env_domain_path(active: Option<&str>, key: &str) -> Option<PathBuf> {
-    let file = domain_file_name(key)?;
-    super::envs::env_dir(active?).map(|dir| dir.join(file))
+/// [`global_domain_path`] with the global home explicitly redirected (see
+/// [`super::env::candidates_with_home`]); operator execution isolation pins
+/// domain-file discovery to the execution's frozen home.
+pub(crate) fn global_domain_path_with_home(key: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let file = domain_file_name(key).unwrap_or(NOT_A_DOMAIN_FILE);
+    match home {
+        Some(home) => Some(home.join(".opencoder").join(file)),
+        None => super::env::global_opencoder_home().map(|home| home.join(file)),
+    }
 }
 
 /// The single effective domain file: the project one if it exists, else the
-/// active env's, else the global one if it exists, else `None` (nothing to
-/// load). Non-domain keys (guarded by [`is_domain_key`]) resolve to no file.
-/// With an explicit env layer (`None` = base chain, used by env capture to
-/// avoid self-reference).
-pub(crate) fn effective_path_with(
+/// global one if it exists, else `None` (nothing to load). Non-domain keys
+/// (guarded by [`is_domain_key`]) resolve to no file.
+pub(crate) fn effective_path(working_dir: &Path, key: &str) -> Option<PathBuf> {
+    effective_path_with_home(working_dir, key, None)
+}
+
+/// [`effective_path`] with the global home redirected (see
+/// [`global_domain_path_with_home`]).
+pub(crate) fn effective_path_with_home(
     working_dir: &Path,
     key: &str,
-    active: Option<&str>,
+    home: Option<&Path>,
 ) -> Option<PathBuf> {
     if !is_domain_key(key) {
         return None;
@@ -83,12 +93,7 @@ pub(crate) fn effective_path_with(
     if project.exists() {
         return Some(project);
     }
-    if let Some(env) = env_domain_path(active, key) {
-        if env.exists() {
-            return Some(env);
-        }
-    }
-    let global = global_domain_path(key)?;
+    let global = global_domain_path_with_home(key, home)?;
     if global.exists() {
         Some(global)
     } else {
@@ -97,30 +102,15 @@ pub(crate) fn effective_path_with(
 }
 
 /// Write target for a domain patch: the project file if it already exists,
-/// else (while an env is active) the env file — created on save so the base
-/// global file stays pristine for deactivation, else the global one — created
-/// on save. Falls back to the project path when no home resolves.
+/// else the global one — created on save. Falls back to the project path when
+/// no home resolves.
 pub(crate) fn write_target(working_dir: &Path, key: &str) -> Option<PathBuf> {
-    write_target_with(working_dir, key, super::envs::active_env().as_deref())
-}
-
-/// [`write_target`] with an explicit env layer.
-pub(crate) fn write_target_with(
-    working_dir: &Path,
-    key: &str,
-    active: Option<&str>,
-) -> Option<PathBuf> {
     if !is_domain_key(key) {
         return None;
     }
     let project = project_domain_path(working_dir, key);
     if project.exists() {
         return Some(project);
-    }
-    if let Some(env) = env_domain_path(active, key) {
-        // Whether or not the env file exists, it is the target from here on
-        // (created on save); the base global file stays untouched.
-        return Some(env);
     }
     // Whether or not a global file exists, it is the target from here on
     // (created on save); only an unresolvable home falls back to the project.
@@ -132,17 +122,15 @@ pub(crate) fn write_target_with(
 /// candidates) and is treated as absent — a bad domain file must not break
 /// startup.
 pub(crate) fn read_effective(working_dir: &Path, key: &str) -> Option<serde_json::Value> {
-    read_effective_with(working_dir, key, super::envs::active_env().as_deref())
+    read_effective_with_home(working_dir, key, None)
 }
 
-/// [`read_effective`] with an explicit env layer (`None` = base chain).
-pub(crate) fn read_effective_with(
-    working_dir: &Path,
-    key: &str,
-    active: Option<&str>,
-) -> Option<serde_json::Value> {
-    let path = effective_path_with(working_dir, key, active)?;
-    let raw = std::fs::read_to_string(&path).ok()?;
+/// Read one explicit domain file (operator-plane source: the operator dir's
+/// own `<domain>.json`). Same tolerate-corrupt semantics as
+/// [`read_effective_with_home`]: missing/empty -> `None`, bad JSON warns and
+/// reads as absent.
+pub(crate) fn read_effective_from(path: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(path).ok()?;
     if raw.trim().is_empty() {
         return None;
     }
@@ -157,10 +145,21 @@ pub(crate) fn read_effective_with(
             None
         }
         Err(e) => {
-            tracing::warn!("domain file {} is corrupt: {e}; ignoring", path.display());
+            tracing::warn!("domain file {} is corrupt: {e}; ignoring", path.display(),);
             None
         }
     }
+}
+
+/// [`read_effective`] with the global home redirected (see
+/// [`effective_path_with_home`]).
+pub(crate) fn read_effective_with_home(
+    working_dir: &Path,
+    key: &str,
+    home: Option<&Path>,
+) -> Option<serde_json::Value> {
+    let path = effective_path_with_home(working_dir, key, home)?;
+    read_effective_from(&path)
 }
 
 fn json_kind(v: &serde_json::Value) -> &'static str {
@@ -240,7 +239,7 @@ pub(crate) fn save_domain(
         }
     }
     let pretty = serde_json::to_string_pretty(&root)?;
-    std::fs::write(&target, pretty)?;
+    super::write_config_save(&target, &pretty)?;
     Ok(target)
 }
 
@@ -322,8 +321,10 @@ pub(crate) fn apply_domain(cfg: &mut Config, key: &str, value: &serde_json::Valu
                 }
             }
         }
-        // Not entry-shaped: ap.json's top level is the AutoPilotConfig body.
+        // Not entry-shaped: ap.json's / schedules.json's top level IS the
+        // config body (AutoPilotConfig / SchedulesConfig).
         "autopilot" => super::autopilot::merge(&mut cfg.autopilot, entries),
+        "schedules" => super::schedule::merge(&mut cfg.schedules, entries),
         _ => {}
     }
 }
@@ -334,7 +335,7 @@ mod tests {
 
     #[test]
     fn domain_key_table_maps_keys_to_files() {
-        for key in ["mcp_servers", "cli", "skills", "autopilot"] {
+        for key in ["mcp_servers", "cli", "skills", "autopilot", "schedules"] {
             assert!(is_domain_key(key), "{key} must be a domain key");
         }
         for key in ["model", "fps", "providers", "keymap", ""] {
@@ -344,6 +345,7 @@ mod tests {
         assert_eq!(domain_file_name("cli"), Some("cli.json"));
         assert_eq!(domain_file_name("skills"), Some("skills.json"));
         assert_eq!(domain_file_name("autopilot"), Some("ap.json"));
+        assert_eq!(domain_file_name("schedules"), Some("schedules.json"));
         assert_eq!(domain_file_name("model"), None);
     }
 

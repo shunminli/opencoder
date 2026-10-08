@@ -1,57 +1,31 @@
-Commit: a3b194219b48609bbb078ffd214da477d626bdf4
+Commit: 4bb3a745544f3b3f9898447088a919da502de6e5
 
 # store 模块
 
-## 职责
+`Store` trait + libsql（WAL）持久化层。细节以代码为准。
+接缝：`Arc<dyn Store>`，session/web/todos/control 等全部经此持久化。
+项目接口 `ProjectStore` 由同一 `LibsqlStore` 实现；独立 Web 在 [serve](../../crates/web/src/lib.rs) 中复用同一实例，项目后端没有独立配置或工厂。
 
-会话与 TODO 工作流的唯一持久化层。`Store` trait 隔离上层运行时与 libsql 实现，保存 Session、Message、Input、Event、Subagent 关系、TODO Workflow projection 和 append-only TODO Event。
+## 索引
+- `src/lib.rs` — `Store` trait
+- `src/libsql_store/` — libsql 实现（WAL）
+- [Cargo.toml](../../Cargo.toml) 固定 libsql 上游提交 `0070ff3331cd6d09425b812e1cd3ebe32e1d4206`，避免连接释放时重复关闭 SQLite 句柄；[connection_lifecycle.rs](../../crates/store/tests/connection_lifecycle.rs) 验证连接与派生持有者生命周期，以及最后持有者释放后的 Windows 独占文件访问。
+- `src/libsql_store/sessions.rs` — 会话批删（FK 级联）；`node_tasks.rs` — 节点任务与终态清扫
+- [libsql_store/messages.rs](../../crates/store/src/libsql_store/messages.rs) — `load_transcript_page` 在 SQL 中投影并按字节切块，保留消息角色、展示原文、合成标记和用量，排除私有 provider 状态；与已有消息块读取共用游标和预算。
+- `src/types.rs` — `SessionMeta.kind` 泳道标签（schema v28 起 `sessions.kind TEXT`；创建时定值：`operator`/`agent`/`team`/`dag`/`todos`/`project`/`brain`，存量行为 NULL）
+- `src/libsql_store/sessions.rs` 泳道栅栏 — `SessionFilter.kind=None` 的默认清单排除 `kind='operator'`（`s.kind IS NULL OR s.kind <> 'operator'`），精确泳道用 `s.kind = ?`；存量 NULL 行仍走 id 前缀/标题回退
+- `src/schedule_types.rs`、`src/libsql_store/schedule.rs` — 调度台账与定义表（schema v26/v27）
+- `src/fleet/` — 节点容量/归属/派发回执（`handoff/`），容量领取在 `handoff/capacity.rs`
+- `src/fleet/records.rs` — 终态执行索引批删
+- `src/libsql_store/brain_layered.rs` + `brain_layered/schema.rs` — v4 分层画布 run/operation/event 投影（additive 建表，不推动 `SCHEMA_VERSION`；`schema_watermark()` 仅供断言，当前值为 33）
+- [project.rs](../../crates/store/src/project.rs)、[project_links.rs](../../crates/store/src/libsql_store/project_links.rs) — TODO 看板及执行引用；关联只保存能力 ID、执行 ID、类型、名称和创建时间，删除关联不删除节点执行；排序按专项或未归属范围校验，拒绝缺失或外部 TODO，在 libsql 事务内提交。
+- [project/tags.rs](../../crates/store/src/project/tags.rs)、[libsql_store/project/tags.rs](../../crates/store/src/libsql_store/project/tags.rs) — Tag 范围解析与关联整理；定义范围固定且所属项目或专项必须存在，Tag 与 TODO 变更原子提交。
+- [schema/catalog.rs](../../crates/store/src/libsql_store/schema/catalog.rs) — schema v32 的专项、Tag 与 TODO 关联结构；迁移校验专项复制结果，解除旧里程碑的 TODO 归属并移除旧容器，保留执行记录。
+- [libsql_store/schema/project_links.rs](../../crates/store/src/libsql_store/schema/project_links.rs) — schema v33 在事务内复制、校验并替换 TODO 执行引用表，移除结论与同步状态缓存，保留执行关联和手工看板字段。
+- [libsql_store/schema.rs](../../crates/store/src/libsql_store/schema.rs) — 初始化先读取版本，超出当前支持版本时在业务 DDL 前拒绝打开；已有旧版本记录或版本跟踪前的会话表时创建历史项目结构，再运行升级链，支持只有部分业务表的旧数据库
+- `src/store/contract/` 与 `src/libsql_store/impl_methods/` 分组组装 Store 接口和实现；`schema/migrations.rs` 保存共享表升级链。旧大脑专属表不再创建，历史数据由经过核准的维护清单单独清理。
 
-## 边界
-
-- 不执行 LLM、agent、TUI 或工作流决策。
-- 上层只依赖 `Arc<dyn Store>`，不直接依赖 libsql 查询。
-- 当前后端是本地 embedded libsql + WAL；远程复制不是该模块能力。
-- 删除 Session 或数据库数据必须由显式上层操作触发。
-
-## 关键抽象
-
-- `Store`（`src/store.rs`）：dyn-compatible async 持久化接口。默认方法只用于后端兼容；libsql 实现完整支持 todos。
-- `LibsqlStore`（`src/libsql_store/mod.rs`）：缓存单个 Connection，并以 async Mutex 串行触碰同步 SQLite FFI，避免并发 worker 阻塞。
-- `run_tx`（`src/libsql_store/tx.rs`）：显式 BEGIN/COMMIT/ROLLBACK，避免 async 取消时 `libsql::Transaction::Drop` panic。
-- Session 类型（`src/types.rs`）：`SessionMeta`、`SessionPatch`、Input/Event/Subagent records；`task_type` 区分 parent、subagent、todo_workflow 和 todo。
-- TODO 类型（`src/todo_types.rs`）：`TodoWorkflowRecord`、`TodoItemRecord`、`TodoEventRecord` 和列表摘要。
-
-## Schema 与一致性
-
-schema 当前为 v10：
-
-- Session 面：`sessions`、`messages`、`session_inputs`、`session_events`、`subagent_tasks` 及 ts registry 相关结构。
-- TODO 面：`todo_workflows` 保存 spec/state/generation；`todo_items` 保存每项 projection；`todo_events` 保存有序不可变 transition。
-- v9 migration 从既有 v8 数据库新增 TODO 表和索引，不修改既有 Session 数据。
-- v10 migration 给 `session_inputs` 加 `recorded` 消费标记（NOT NULL DEFAULT 0）：promote（含再提升）时重置 0，消费后 `mark_inputs_recorded` 置 1；promoted-but-unrecorded 孤儿行（崩溃/硬中止残留）由 `recover_orphan_inputs` 翻回 pending；迁移落地时既有 promoted 行一次性回填 recorded=1。
-- v10 migration 给 sessions 加 plan 阶段落库两列（`plan_snapshot TEXT`、`plan_input_count INTEGER NOT NULL DEFAULT 0`）。
-- `commit_todo_transition` 在单事务内更新 workflow、替换 TODO projection 并追加 event；workflow update 带 expected generation，陈旧父进程不能覆盖 interrupt 或其他 writer。
-- Foreign key 将 parent/active TODO Session 关联到 `sessions`，因此 dispatch 先创建 Session，再提交 active reference。
-- 消息批量写按 200 条分块；WAL 使用 30 秒 busy timeout 和被动 checkpoint。
-
-## 主流程
-
-- Session：create/get/list/update/delete；append messages；admit/promote/claim inputs + 落账与孤儿回收（`mark_inputs_recorded` 幂等标记已消费、`recover_orphan_inputs` 把 promoted 未落账行翻回 pending）；append/replay events；记录 subagent 生命周期。
-- Resume：上层读取 SessionMeta、压缩摘要和保留消息，Store 不推断 agent 行为。
-- Bundle：`src/bundle.rs` 递归导出/导入 Session 与 subagent 树，不包含 Config 或 API key。
-- TODO：create workflow → 按 generation 原子 commit projection/event → list/load/events-after；interrupt、resume 和 debug projection 都以这些数据为源。
-- Migration：bootstrap 幂等创建当前表，再按 `schema_version` 增量迁移；旧数据库保持可打开。
-
-## 依赖与接口
-
-- 依赖 libsql 0.9.x、opencoder-core message 类型和 async-trait。
-- 被 session、web、cli、tui 和 [todos](../todos/index.md) 依赖。
-- 用户能力见 [TODO 工作流](../../features/todos/index.md) 与 [会话 CLI](../cli/index.md)。
-
-## 代表性验证
-
-- `tests/store_integration.rs`：WAL 并发、事务回滚、取消安全和崩溃恢复。
-- `tests/todos_workflow.rs`：TODO 投影+事件原子提交、generation 冲突、v8→v9 migration。
-- `tests/plan_phase.rs`：`plan_snapshot`/`plan_input_count` 经 SessionPatch 往返、set 与 clear 互斥、create_session 携带 plan 阶段字段。
-- `tests/store_perf.rs`：持久化性能门槛。
-- `src/bundle.rs` 相关测试：Session 树导入导出与幂等性。
+- [fleet/report/rows.rs](../../crates/store/src/fleet/report/rows.rs)：批量核验索引不可变字段，仅写入新增或变化行，冲突整批回滚。
+- [fleet/handoff/pending.rs](../../crates/store/src/fleet/handoff/pending.rs)：先筛选 prepared 回执，再读取冻结请求，校验 ID 与类型一致性。
+- [fleet/handoff/capacity.rs](../../crates/store/src/fleet/handoff/capacity.rs)：复用活跃票据部分索引，保持全机 FIFO 与事务内容量复核。
+- [project_store/reopen.rs](../../crates/store/tests/project_store/reopen.rs)：关闭重开后核验项目、Tag、看板、执行引用与旧运行结果；无效 Tag 修改不能部分提交。完整存储回归入口为 [project-store-tests.yml](../../.github/workflows/project-store-tests.yml)。

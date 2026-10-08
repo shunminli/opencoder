@@ -1,5 +1,5 @@
 //! Integration tests for compound control commands: `/plan review` and
-//! `/plan $review` (mode switch + trailing argument / skill token),
+//! `/plan $review` (agent switch + trailing argument / skill token),
 //! submitted as the idle prompt or queued.
 //!
 //! Contracts:
@@ -17,12 +17,12 @@ use opencoder_session::{run, SessionEvent, SessionState};
 use opencoder_store::{Delivery, LibsqlStore, SessionInput, Store};
 
 /// True when any user message of the captured request carries a skill
-/// artifact — the persistent `[skill loaded]` full-body injection or the
-/// transient `[active skill]` tail reminder. Under one-shot `$skill`
+/// artifact — the transient `[skill loaded]` full-body payload message or
+/// the transient `[active skill]` tail reminder. Under one-shot `$skill`
 /// semantics (see `skill_one_shot.rs`) this is THE activation proof: the
 /// skill lives exactly for the run that consumed the token.
 fn request_carries_skill(req: &opencoder_llm::ChatRequest) -> bool {
-    req.messages
+    opencoder_llm::lower_messages(&req.messages)
         .iter()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
         .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
@@ -77,7 +77,7 @@ fn mk_input(session_id: &str, delivery: Delivery, prompt: &str) -> SessionInput 
 }
 
 // ---------------------------------------------------------------------------
-// Compound control commands: `/plan review` and `/act review` (mode switch +
+// Compound control commands: `/plan review` and `/act review` (agent switch +
 // trailing argument run as a prompt in the new mode).
 // ---------------------------------------------------------------------------
 
@@ -118,7 +118,8 @@ impl Drop for HomeGuard {
     }
 }
 
-/// `/plan review` submitted as the idle prompt switches to plan mode AND runs
+/// `/plan review` submitted as the idle prompt switches to the plan
+/// agent AND runs
 /// "review" as a real prompt in that mode (one LLM turn), rather than leaking
 /// the whole string to the model as literal text.
 #[tokio::test]
@@ -158,7 +159,7 @@ async fn idle_compound_plan_arg_switches_then_runs() {
     assert_eq!(assistant_turns, 1, "one assistant turn for the prompt");
 }
 
-/// `/plan review` queued as a single item: at the idle boundary the mode
+/// `/plan review` queued as a single item: at the idle boundary the agent
 /// switches (no LLM turn) and then "review" runs as a prompt (one LLM turn).
 #[tokio::test]
 async fn queue_compound_plan_arg_switches_then_runs() {

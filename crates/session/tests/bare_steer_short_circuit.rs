@@ -54,7 +54,7 @@ fn mk_input(session_id: &str, delivery: Delivery, prompt: &str) -> SessionInput 
 }
 
 /// Bare "/plan" admitted as a steer, then drained with an empty initial
-/// prompt, switches to plan mode with ZERO LLM calls. Against an empty
+/// prompt, switches to the plan agent with ZERO LLM calls. Against an empty
 /// `MockChatClient` (no pushed scripts) this is deterministic: without the
 /// short-circuit the run reaches `run_one_llm_call` → empty mock → failure.
 #[tokio::test]
@@ -165,6 +165,18 @@ async fn steered_compound_plan_switches_then_runs_rest() {
         assert!(
             evs.iter().any(|e| matches!(e, SessionEvent::Done)),
             "Done emitted"
+        );
+        // The steer echo is model-facing: the tail only, never the token.
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, SessionEvent::SteerConsumed { text, .. } if text == "review")),
+            "SteerConsumed must carry the compound tail \"review\""
+        );
+        assert!(
+            !evs.iter().any(
+                |e| matches!(e, SessionEvent::SteerConsumed { text, .. } if text.contains("/plan"))
+            ),
+            "the /plan token must never be echoed"
         );
     }
 

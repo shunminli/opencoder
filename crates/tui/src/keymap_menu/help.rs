@@ -14,16 +14,23 @@ use crate::theme;
 pub const HELP: &str = "\
 快捷键列表：
 
-  Ctrl+T          切换模式 act <--> plan（保留上下文，主键）
-  Alt+Tab         切换模式（清空上下文；Shift+Tab 同效）
-                   /plan + 内容 提交后算需求输入，切换后开始执行任务
-  Ctrl+Shift+Tab  切换模式（保留上下文；当 Ctrl+T 被终端拦截时使用）
+  Ctrl+T          保留上下文，在 act / plan 间切换（仅空闲边界生效）
+  Shift+Tab        act 模式：切换到 plan（保留上下文，空闲边界生效）；
+                   plan 模式：保留计划、切换到 act 并开始执行
+                   (/act_clear_context)；先倒计时确认：Esc 回撤，
+                   提交（Enter）或再按一次 Shift+Tab 立即执行（运行中先打断
+                   当前轮再执行）；倒计时内可继续输入，提交的输入并入附加需求；
+                   无人确认到点自动排队，当前轮结束后执行
   Enter            提交（空闲） / 转向（运行中，下一轮生效）
   Tab              提交（空闲） / 排队跟进（运行中，完成后提交）
   Ctrl+V          粘贴剪贴板图片（截图）
   Alt+回车            插入换行（多行输入）
   $                选择并插入技能 -> $name；提交时加载
   /                命令选择: /task（会话）, /config（设置）, /model（模型）, /compact（压缩）
+                   /plan（只读探索） /act（执行） /act_clear_context（清空上下
+                   文，倒计时确认） /sidecar（旁路快照问答: 不打断主任务，
+                   进入临时问询界面，ESC 返回即销毁不留痕（token 计入主任务），
+                   结果仅本端显示、不落库；同一面板内追问延续同一旁路会话）
   Shift+I          编辑计划（plan 模式、空闲时）: i/a 编辑, :wq 保存, :q! 放弃
   Ctrl+G          复制模式: 交还终端原生拖拽选择（正文去装饰全宽显示）, 终端快捷键复制, Esc/Ctrl+G 退出
   Esc              关闭帮助/弹窗/清空输入
@@ -40,7 +47,8 @@ pub const HELP: &str = "\
   PageUp/Down      滚动对话记录  （PageDown = 跳到底部）
   Shift+PageUp/Down 滚动转向面板（查看更早的排队条目 / 回到最新）
   Ctrl+F           强制重新渲染屏幕
-  Ctrl+L           退出子代理视图 / 折叠所有输出 / 回到底部跟随 / 清空输入
+  Ctrl+L           退出子代理/旁路（sidecar）视图 / 折叠所有输出 / 回到底部跟随 / 清空输入
+  ESC              退出旁路（sidecar）问询：销毁对话，主回显区不留痕迹
   Ctrl+L / Ctrl+U  /config、/model 弹窗内: 清空当前聚焦字段
 
 鼠标:            滚轮滚动对话记录；点击箭头跟随最新
@@ -190,6 +198,22 @@ mod tests {
         assert!(HELP.contains("PageDown/End 回最新"));
         assert!(!HELP.contains("OSC52"));
         assert!(!HELP.contains("应用内选择模式"));
+    }
+
+    #[test]
+    fn help_matches_plan_world() {
+        // Ctrl+T is the sole context-preserving toggle. The retired Alt+Tab /
+        // Ctrl+Shift+Tab variants stay hidden; Shift+Tab is the guarded
+        // plan-to-act execution handoff.
+        assert!(HELP.contains("Ctrl+T"));
+        assert!(HELP.contains("act / plan"));
+        assert!(!HELP.contains("仅切换模式"));
+        assert!(HELP.contains("/act_clear_context"));
+        assert!(HELP.contains("/plan"));
+        assert!(HELP.contains("/sidecar"));
+        assert!(HELP.contains("Shift+I"));
+        assert!(!HELP.contains("Alt+Tab"));
+        assert!(!HELP.contains("Ctrl+Shift+Tab"));
     }
 
     #[test]

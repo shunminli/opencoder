@@ -60,6 +60,7 @@ impl ChatView {
     /// visible while the summarizing LLM call runs, not only after it finishes.
     pub(crate) fn open_compaction_streaming(&mut self, t: &str) {
         self.finalize_assistant();
+        self.flush_pending_thinking();
         if let Some(ChatBlock::Compaction {
             text,
             streaming: true,
@@ -77,20 +78,17 @@ impl ChatView {
     }
 
     /// Finalize the compaction block with the complete summary. If the last
-    /// block is a streaming Compaction, overwrite its text with the final
-    /// summary and collapse it; otherwise create a fresh collapsed block (the
-    /// streamed block was destroyed, e.g. by a `TranscriptReset` replay).
+    /// block is a streaming Compaction, overwrite its text while preserving
+    /// its current disclosure state; otherwise create a fresh collapsed block
+    /// (the streamed block was destroyed, e.g. by a `TranscriptReset` replay).
     pub(crate) fn finalize_compaction(&mut self, summary: &str) {
         self.finalize_assistant();
         if let Some(ChatBlock::Compaction {
-            text,
-            collapsed,
-            streaming,
+            text, streaming, ..
         }) = self.blocks.last_mut()
         {
             if *streaming {
                 *text = summary.to_string();
-                *collapsed = true;
                 *streaming = false;
                 return;
             }
@@ -117,6 +115,6 @@ impl ChatView {
     /// Return each Compaction block's `(block_idx, header_line_idx)`, where
     /// `header_line_idx` is the index in `flatten()` of its header line.
     pub fn compaction_headers(&self) -> Vec<CompactionHeader> {
-        self.collect_headers().3
+        self.collect_headers().2
     }
 }

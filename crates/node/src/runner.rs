@@ -8,6 +8,9 @@
 //!   serially inside the arm, so no second task can start until it returns;
 //!   during that window a dedicated per-task heartbeater keeps liveness fresh
 //!   AND feeds the executor's cancel flag from `cancel_task_ids`.
+//! - control tasks piggyback on claim/heartbeat replies and are ALWAYS served
+//!   in detached tasks, so their local fetch + upload can never stretch the
+//!   beat cadence past the server's liveness window (`STALE_AFTER_MS`).
 //! - shutdown — armed by Ctrl-C/SIGTERM; while a task is active it converges
 //!   through the SAME cancel flag as a server-side stop, so exactly one
 //!   reporting protocol exists (`status=cancelled`).
@@ -22,13 +25,23 @@ use opencoder_store::{LibsqlStore, Store};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use opencoder_core::node_protocol::ClaimedTask;
+use opencoder_core::node_protocol::{ClaimedTask, ControlTask};
 
+use crate::control::{handle_control, Inflight};
 use crate::executor::{execute, ExecDeps};
 use crate::uplink::Uplink;
 
 /// Liveness tick sent to the server. Short enough that a lost node crosses
 /// into `lost` within a few intervals; long enough to stay cheap.
+///
+/// Budget contract with the server (`STALE_AFTER_MS = 20s` in
+/// `crates/web/src/nodes_state.rs`): one beat can at most block for
+/// [`crate::uplink::HEARTBEAT_TIMEOUT`] (5s) and the next tick fires right
+/// after (`MissedTickBehavior::Skip`), so the worst-case silent gap is
+/// ≈ 5s + 5s = 10s < 20s — about 2× headroom. A beat failing fast (weak
+/// network) costs no liveness: the loop just waits for the next tick, which
+/// is the retry. Control tasks ride the heartbeat/claim replies and are
+/// served in detached tasks ([`spawn_control`]) so they never delay a beat.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Non-blocking claim poll cadence while idle.
@@ -53,6 +66,11 @@ pub struct NodeOpts {
     /// ([`opencoder_core::data_dir_for`] on workdir) so a server and a node
     /// sharing one machine share one store.
     pub local_store_dir: Option<PathBuf>,
+    /// Agent-binary extension for DAG workflow runs: when set, an idle claim
+    /// tick with no prompt task due also polls a DAG run and executes it
+    /// serially (same single-active policy). `None` = this node is a plain
+    /// prompt-task worker (e.g. `opencoder-agent --no-dag`).
+    pub dag: Option<Arc<dyn crate::DagHook>>,
 }
 
 impl NodeOpts {
@@ -111,6 +129,10 @@ pub async fn run_node(opts: NodeOpts, override_client: Option<Arc<dyn ChatStream
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     spawn_shutdown_signal(shutdown_tx);
 
+    // Shared control-task dedup: the same control can be delivered twice
+    // within milliseconds (claim reply racing a heartbeat batch).
+    let inflight = Inflight::new();
+
     let mut hb_tick = tokio::time::interval(opts.heartbeat_interval);
     let mut claim_tick = tokio::time::interval(opts.claim_interval);
     hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -126,17 +148,74 @@ pub async fn run_node(opts: NodeOpts, override_client: Option<Arc<dyn ChatStream
                 return Ok(());
             }
             _ = hb_tick.tick() => {
-                if let Err(e) = uplink.heartbeat(&node_id).await {
-                    warn!(error = %e, "heartbeat failed (retrying next tick)");
+                match uplink.heartbeat(&node_id).await {
+                    Ok(resp) => {
+                        // Idle nodes normally see nothing here; controls can
+                        // stack up while the claim arm was busy executing.
+                        // Detached: a slow control fetch must never delay
+                        // the next liveness beat.
+                        for task in resp.controls {
+                            spawn_control(
+                                uplink.clone(),
+                                Arc::clone(&store),
+                                inflight.clone(),
+                                node_id.clone(),
+                                task,
+                            );
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "heartbeat failed (retrying next tick)"),
                 }
             }
             _ = claim_tick.tick() => {
                 match uplink.claim_next(&node_id).await {
-                    Ok(Some(task)) => {
-                        run_task(&uplink, &store, &client, &opts, &task, &node_id, &shutdown_rx)
+                    Ok(resp) => {
+                        // Durable work is preferred by the server; a control
+                        // task rides along only when no task was due.
+                        if let Some(task) = resp.control {
+                            spawn_control(
+                                uplink.clone(),
+                                Arc::clone(&store),
+                                inflight.clone(),
+                                node_id.clone(),
+                                task,
+                            );
+                        }
+                        if let Some(task) = resp.task {
+                            run_task(
+                                &uplink,
+                                &store,
+                                &client,
+                                &opts,
+                                &task,
+                                &node_id,
+                                &shutdown_rx,
+                                &inflight,
+                            )
                             .await;
+                        } else if let Some(hook) = opts.dag.as_ref() {
+                            // No prompt task due: an agent binary also polls
+                            // the DAG queue. Single-active policy is the same
+                            // (serial execution inside this arm).
+                            match hook.claim(&node_id).await {
+                                Ok(Some(run)) => {
+                                    run_dag_run(
+                                        &uplink,
+                                        &store,
+                                        &inflight,
+                                        &opts,
+                                        hook,
+                                        run,
+                                        &node_id,
+                                        &shutdown_rx,
+                                    )
+                                    .await;
+                                }
+                                Ok(None) => {}
+                                Err(e) => warn!(error = %e, "dag claim poll failed"),
+                            }
+                        }
                     }
-                    Ok(None) => {}
                     Err(e) => warn!(error = %e, "claim poll failed"),
                 }
             }
@@ -150,6 +229,7 @@ pub async fn run_node(opts: NodeOpts, override_client: Option<Arc<dyn ChatStream
 /// heartbeat whose `cancel_task_ids` contains this task, or process shutdown.
 /// The executor races that flag against the drain so an aborted run still
 /// closes through the session's own interrupt path and reports `cancelled`.
+#[allow(clippy::too_many_arguments)]
 async fn run_task(
     uplink: &Uplink,
     store: &Arc<dyn Store>,
@@ -158,6 +238,7 @@ async fn run_task(
     task: &ClaimedTask,
     node_id: &str,
     shutdown_rx: &watch::Receiver<bool>,
+    inflight: &Inflight,
 ) {
     info!(
         task_id = %task.task_id,
@@ -169,6 +250,8 @@ async fn run_task(
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let hb = spawn_heartbeater(
         uplink.clone(),
+        Arc::clone(store),
+        inflight.clone(),
         node_id.to_string(),
         opts.heartbeat_interval,
         task.task_id.clone(),
@@ -215,11 +298,105 @@ async fn run_task(
     hb.abort();
 }
 
+/// Execute ONE claimed DAG run serially under its own heartbeater — the
+/// exact same shape as [`run_task`], but the executor is the injected
+/// [`crate::DagHook`] (the agent binary's DAG runtime) and cancellation is
+/// signalled through the heartbeat's `cancel_run_ids`. The hook reports its
+/// own terminal status upstream; this wrapper only keeps liveness fresh and
+/// folds errors into warnings, like the task path.
+#[allow(clippy::too_many_arguments)]
+async fn run_dag_run(
+    uplink: &Uplink,
+    store: &Arc<dyn Store>,
+    inflight: &Inflight,
+    opts: &NodeOpts,
+    hook: &Arc<dyn crate::DagHook>,
+    run: opencoder_dag::protocol::DagClaimedRun,
+    node_id: &str,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    info!(
+        run_id = %run.run_id,
+        dag_id = %run.dag_id,
+        steps = run.spec.steps.len(),
+        "claimed dag run"
+    );
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let hb = spawn_dag_heartbeater(
+        uplink.clone(),
+        Arc::clone(store),
+        inflight.clone(),
+        node_id.to_string(),
+        opts.heartbeat_interval,
+        run.run_id.clone(),
+        cancel_tx.clone(),
+    );
+
+    // Shutdown converges through the SAME cancel flag as a server-side stop,
+    // so exactly one reporting protocol exists (the hook reports cancelled).
+    let fwd_tx = cancel_tx.clone();
+    let mut fwd_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        crate::await_flag(&mut fwd_shutdown).await;
+        info!("shutdown observed during dag run; requesting local cancellation");
+        let _ = fwd_tx.send(true);
+    });
+
+    match hook.execute(run, cancel_rx).await {
+        Ok(()) => info!("dag run finished"),
+        Err(e) => warn!(error = %e, "dag run ended with error"),
+    }
+    hb.abort();
+}
+
+/// Per-run heartbeat duty loop for DAG runs: mirrors [`spawn_heartbeater`]
+/// but the cancel piggyback is `cancel_run_ids`. Exits as soon as this run's
+/// cancellation is observed; control tasks are still served detached so a
+/// long workflow never starves the message-relay channel.
+fn spawn_dag_heartbeater(
+    uplink: Uplink,
+    store: Arc<dyn Store>,
+    inflight: Inflight,
+    node_id: String,
+    interval: Duration,
+    run_id: String,
+    cancel_tx: watch::Sender<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            match uplink.heartbeat(&node_id).await {
+                Ok(resp) => {
+                    if resp.cancel_run_ids.iter().any(|id| id == &run_id) {
+                        info!(%run_id, "dag run cancellation observed on heartbeat");
+                        let _ = cancel_tx.send(true);
+                        return;
+                    }
+                    for task in resp.controls {
+                        spawn_control(
+                            uplink.clone(),
+                            Arc::clone(&store),
+                            inflight.clone(),
+                            node_id.clone(),
+                            task,
+                        );
+                    }
+                }
+                Err(e) => warn!(%run_id, error = %e, "busy heartbeat failed"),
+            }
+        }
+    })
+}
+
 /// Per-task heartbeat duty loop. Exits as soon as cancellation for THIS task
 /// is observed (liveness afterwards is irrelevant: execution is collapsing),
 /// leaving the outer idle loop to resume its own ticks after `execute`.
 fn spawn_heartbeater(
     uplink: Uplink,
+    store: Arc<dyn Store>,
+    inflight: Inflight,
     node_id: String,
     interval: Duration,
     task_id: String,
@@ -237,11 +414,48 @@ fn spawn_heartbeater(
                         let _ = cancel_tx.send(true);
                         return;
                     }
+                    // A BUSY worker never polls claim: the heartbeat is its
+                    // only guaranteed control-task delivery channel. Serve
+                    // each control detached so control work never stretches
+                    // the beat cadence past the server's liveness window.
+                    for task in resp.controls {
+                        spawn_control(
+                            uplink.clone(),
+                            Arc::clone(&store),
+                            inflight.clone(),
+                            node_id.clone(),
+                            task,
+                        );
+                    }
                 }
                 Err(e) => warn!(%task_id, error = %e, "busy heartbeat failed"),
             }
         }
     })
+}
+
+/// Serve ONE control task OFF the heartbeat/claim tick critical path: the
+/// liveness touch must never wait behind a local transcript read + result
+/// upload (that in-tick delay is exactly what used to stretch the silent
+/// gap past the server's `STALE_AFTER_MS`).
+///
+/// Ownership: `Uplink` and `Inflight` are cheap clones (internal Arcs) and
+/// the store is already an `Arc`, so the spawned task owns everything it
+/// needs. The task's outcome is already fully logged inside
+/// [`handle_control`], so the join handle is detached. Dedup stays correct
+/// under this concurrency: [`Inflight::insert_if_absent`] is an atomic
+/// check-and-insert under a mutex, so of N racing deliveries of the same
+/// `control_id` exactly one wins and the rest log a duplicate and drop.
+fn spawn_control(
+    uplink: Uplink,
+    store: Arc<dyn Store>,
+    inflight: Inflight,
+    node_id: String,
+    task: ControlTask,
+) {
+    tokio::spawn(async move {
+        handle_control(&uplink, &store, &inflight, &node_id, &task).await;
+    });
 }
 
 /// Fire-and-forget terminal report used before execution even starts (config
@@ -278,13 +492,7 @@ async fn register_with_retry(uplink: &Uplink, opts: &NodeOpts) -> Result<String>
 fn build_default_client(opts: &NodeOpts) -> Result<Arc<dyn ChatStream>> {
     let config = opencoder_core::Config::load(&opts.workdir)?;
     let ep = config.resolve_endpoint()?;
-    let client = ChatClient::new_with_read_timeout(
-        &ep.base_url,
-        &ep.api_key,
-        &ep.headers,
-        config.stream_idle_timeout(),
-        config.network.proxy.as_deref(),
-    )?;
+    let client = ChatClient::from_config(&config, &ep)?;
     Ok(Arc::new(client))
 }
 

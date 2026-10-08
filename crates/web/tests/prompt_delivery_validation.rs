@@ -29,11 +29,16 @@ async fn state() -> Arc<opencoder_web::AppState> {
             }]),
         );
     Arc::new(opencoder_web::AppState {
+        config_home: None,
         client_override: Some(mock),
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store,
         workdir: tempfile::tempdir().unwrap().keep(),
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
     })
 }
 
@@ -46,7 +51,10 @@ async fn post(
     let resp = opencoder_web::api::post_prompt(
         axum::extract::State(state.clone()),
         axum::extract::Path(sid.to_string()),
+        None,
         axum::Json(opencoder_web::api::PromptBody {
+            display: None,
+            input_id: None,
             prompt: "hi".into(),
             images: Vec::new(),
             delivery: delivery.map(String::from),
@@ -152,7 +160,10 @@ async fn post_model(
     let resp = opencoder_web::api::post_prompt(
         axum::extract::State(state.clone()),
         axum::extract::Path(sid.to_string()),
+        None,
         axum::Json(opencoder_web::api::PromptBody {
+            display: None,
+            input_id: None,
             prompt: "hi".into(),
             images: Vec::new(),
             delivery: None,
@@ -200,11 +211,16 @@ async fn model_error_precedes_and_differs_from_api_key_error() {
     let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
     let workdir = tempfile::tempdir().unwrap().keep();
     let state = Arc::new(opencoder_web::AppState {
+        config_home: None,
         client_override: None,
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store,
         workdir: workdir.clone(),
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
     });
     let _iso = opencoder_core::scoped_config_home(workdir);
 

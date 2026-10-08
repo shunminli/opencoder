@@ -88,6 +88,7 @@ async fn import_jsonl_file<S: Store + ?Sized>(
     let now = opencoder_core::message::now_ms();
     let earliest = msgs.first().map(|m| m.created_at).unwrap_or(now);
     let meta = crate::types::SessionMeta {
+        kind: None,
         id: session_id.to_string(),
         title: first_user_text.map(|t| t.chars().take(80).collect()),
         agent: msgs
@@ -114,8 +115,6 @@ async fn import_jsonl_file<S: Store + ?Sized>(
         skill: None,
         task_type: None,
         requirement: None,
-        plan_snapshot: None,
-        plan_input_count: 0,
     };
     store.create_session(&meta).await?;
     // If message import fails mid-way, the just-created session row would be

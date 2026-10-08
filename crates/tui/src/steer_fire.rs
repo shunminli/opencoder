@@ -1,86 +1,24 @@
-//! Steer dispatch from `app.rs`'s submit paths. Two divergent routes:
+//! Steer dispatch: the interrupt route for the `>` mouse button.
 //!
-//! - **Keyboard Enter** (`KeyAction::Steer`) -> [`admit_keyboard_steer`]:
-//!   persist + push onto the pending panel WITHOUT interrupting the running
-//!   turn. The steer is absorbed at the next idle/turn boundary by the runner.
-//!   Deliberately takes no turn_cancel, so it is structurally incapable of
-//!   firing an interrupt. The admit does NOT arm the plan→act handoff:
-//!   arming happens at consumption time (TurnDone(plan) reads the persisted
-//!   plan-phase counter), so a stranded, never-consumed steer row can never
-//!   arm a context-clearing handoff.
+//! The keyboard Enter path (`KeyAction::Steer`) no longer lives here — it
+//! moved to `steer_admit::submit_steer`, an off-loop optimistic actor that
+//! persists + pushes onto the pending steer panel WITHOUT interrupting the
+//! running turn (structurally interrupt-free: no turn_cancel anywhere in
+//! that path; a stranded row is restarted by idle_rekick like any admit).
 //!
 //! - **Mouse `>` button** (`MouseOutcome::SteerSubmit`) ->
 //!   [`fire_steer_interrupt`]: `steer_dispatch::resolve` + `fire_turn_cancel`,
 //!   immediately interrupting the running turn.
-//!
-//! Extracted from `app.rs` so both submit paths share one home and the line
-//! budget is respected.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use opencoder_session::SharedCancel;
-use opencoder_store::{Delivery, Store};
 use tokio_util::sync::CancellationToken;
 
 use super::steer_dispatch;
 use super::subagent_input;
-use crate::app_helpers::{mk_input_with_images, snapshot_image_uris};
 use crate::chat::ChatView;
-
-/// Admit a steer submitted via the keyboard Enter path: persist it to the
-/// store and push it onto the pending steer panel, WITHOUT interrupting the
-/// running turn.
-///
-/// This takes **no** `turn_cancel` — by construction the keyboard path cannot
-/// fire a turn interrupt. The running turn is left to finish naturally and the
-/// admitted steer is absorbed at the next idle/turn boundary (runner
-/// `claim_steers` / late-steer peek). To interrupt immediately the user clicks
-/// the `>` button, which routes through [`fire_steer_interrupt`].
-///
-/// Snapshots and consumes `pending_images` only on a successful store write,
-/// so an attached image is never silently dropped on a store error. Returns
-/// the store seq if admitted.
-pub(crate) async fn admit_keyboard_steer(
-    store: &Arc<dyn Store>,
-    session_id: &str,
-    clean: &str,
-    display: &str,
-    pending_images: &mut Vec<(String, String)>,
-    chat: &mut ChatView,
-) -> Option<i64> {
-    let image_uris = snapshot_image_uris(pending_images);
-    let input = mk_input_with_images(
-        session_id,
-        Delivery::Steer,
-        clean,
-        Some(display.to_string()),
-        &image_uris,
-    );
-    let seq = store.admit_input(&input).await.ok()?;
-    pending_images.clear();
-    chat.steer_items.push((seq, display.to_string()));
-    // Deliberately NO `note_requirement_submitted` here: the steer is only
-    // ADMITTED, not delivered. It arms the plan→act handoff at consumption
-    // (TurnDone(plan) reads the persisted plan-phase counter), so a stranded
-    // row that a cancelled/idle drain never absorbs cannot arm a
-    // context-clearing handoff.
-    Some(seq)
-}
-
-/// Flash shown when a keyboard steer submit fails at the store layer.
-/// Mirrors `queue_admitter::apply_done`'s failure flash; the raw text stays
-/// recoverable via ↑ history because `push_history` runs on every submit.
-pub(crate) const STEER_SUBMIT_FAILED_FLASH: &str =
-    "⚠ steer submit failed — recover text with ↑ history";
-
-/// Map an admit outcome to the failure flash (None on success).
-pub(crate) fn flash_on_admit_failure(seq: Option<i64>) -> Option<&'static str> {
-    match seq {
-        Some(_) => None,
-        None => Some(STEER_SUBMIT_FAILED_FLASH),
-    }
-}
 
 /// Resolve the steer action and fire the appropriate interrupt.
 ///
@@ -95,7 +33,13 @@ pub(crate) fn fire_steer_interrupt(
     turn_cancel: &SharedCancel,
     chat: &ChatView,
 ) -> steer_dispatch::Action {
-    let sub_focused = subagent_focus.is_some();
+    // Liveness-aware focus: only a LIVE (`done == false`) subagent block
+    // routes `>` to the child. A done subagent or a stale block index must
+    // fall through to the PARENT path — the queue panel already shows the
+    // parent's steer rows in that state (`app_display::steer_queue_sources`),
+    // so the click must interrupt the parent and submit the steer instead of
+    // silently no-oping inside `fire_subagent_turn_cancel`.
+    let sub_focused = subagent_input::is_live_subagent_focus(chat, subagent_focus);
     // fire_child_cancels both checks AND cancels children. While a running
     // subagent is focused the `>` targets the CHILD's own turn token, so the
     // siblings are left untouched (no cascade).
@@ -197,6 +141,114 @@ mod tests {
         assert!(
             turn_cancel.lock().unwrap().is_cancelled(),
             "running parent with a pending steer must fire the turn_cancel"
+        );
+    }
+
+    // Stale-focus guard (G3): a focused subagent that is DONE must NOT swallow
+    // the click. The panel shows the parent's steer rows in that state
+    // (`app_display::steer_queue_sources`), so `>` must take the parent path
+    // and fire turn_cancel — before this fix the click silently no-oped
+    // inside `fire_subagent_turn_cancel` (no interrupt, no submit).
+    #[test]
+    fn done_subagent_focus_falls_back_to_parent_steer() {
+        let turn_cancel = fresh_cancel();
+        let mut chat = ChatView::default();
+        chat.blocks.push(crate::chat::ChatBlock::Subagent {
+            id: "task-1".into(),
+            child_session_id: "sub-1".into(),
+            kind: "explore".into(),
+            prompt: "p".into(),
+            view: ChatView::default(),
+            done: true,
+            ok: true,
+            cancelled: false,
+            summary: String::new(),
+            started_at_ms: 0,
+            elapsed_ms: None,
+        });
+        chat.steer_items.push((1, "stop now".into()));
+
+        let action = fire_steer_interrupt(
+            Some(0),
+            true,
+            &empty_cancels(),
+            &empty_turn_cancels(),
+            &turn_cancel,
+            &chat,
+        );
+
+        assert_eq!(action, steer_dispatch::Action::SteerParent);
+        assert!(
+            turn_cancel.lock().unwrap().is_cancelled(),
+            "done-subagent focus must fall back to the parent interrupt"
+        );
+    }
+
+    // G3 companion: a stale focus index (block replaced/shifted since the
+    // click target was registered) must likewise fall back to the parent path.
+    #[test]
+    fn stale_focus_index_falls_back_to_parent_steer() {
+        let turn_cancel = fresh_cancel();
+        let mut chat = ChatView::default();
+        chat.steer_items.push((1, "stop now".into()));
+
+        let action = fire_steer_interrupt(
+            Some(9),
+            true,
+            &empty_cancels(),
+            &empty_turn_cancels(),
+            &turn_cancel,
+            &chat,
+        );
+
+        assert_eq!(action, steer_dispatch::Action::SteerParent);
+        assert!(turn_cancel.lock().unwrap().is_cancelled());
+    }
+
+    // Live-subagent focus still targets ONLY the child's turn token: the
+    // parent's turn_cancel stays intact (the child absorbs its own steer).
+    #[test]
+    fn live_subagent_focus_targets_child_token_only() {
+        let turn_cancel = fresh_cancel();
+        let child_token: SharedCancel = fresh_cancel();
+        let child_turn_cancels = empty_turn_cancels();
+        child_turn_cancels
+            .lock()
+            .unwrap()
+            .insert("task-1".into(), child_token.clone());
+        let mut chat = ChatView::default();
+        chat.blocks.push(crate::chat::ChatBlock::Subagent {
+            id: "task-1".into(),
+            child_session_id: "sub-1".into(),
+            kind: "explore".into(),
+            prompt: "p".into(),
+            view: ChatView::default(),
+            done: false,
+            ok: false,
+            cancelled: false,
+            summary: String::new(),
+            started_at_ms: 0,
+            elapsed_ms: None,
+        });
+        chat.steer_items.push((1, "parent steer".into()));
+
+        let action = fire_steer_interrupt(
+            Some(0),
+            true,
+            &empty_cancels(),
+            &child_turn_cancels,
+            &turn_cancel,
+            &chat,
+        );
+
+        assert_eq!(action, steer_dispatch::Action::Subagent);
+        assert!(
+            child_token.lock().unwrap().is_cancelled(),
+            "live child focus must fire the child's turn token"
+        );
+        assert!(
+            !turn_cancel.lock().unwrap().is_cancelled(),
+            "live child focus must NOT interrupt the parent's turn"
         );
     }
 
@@ -361,305 +413,5 @@ mod tests {
             steer_dispatch::Action::StartTurn,
             "idle `>` with a pending steer must start a turn, not interrupt"
         );
-    }
-
-    // Core invariant (behavioral): the keyboard Enter path admits a steer
-    // WITHOUT firing turn_cancel — the running turn finishes naturally and the
-    // steer is absorbed at the next idle/turn boundary. This drives the actual
-    // keyboard admit seam (`admit_keyboard_steer`) that app.rs's
-    // `KeyAction::Steer` arm calls, so the cancel-token contract is observable
-    // (not only asserted at the `KeyAction` enum level). It then proves the
-    // contrast: the `>` button interrupts the very same running turn.
-    #[tokio::test]
-    async fn keyboard_enter_admits_steer_without_firing_turn_cancel() {
-        use opencoder_store::{LibsqlStore, SessionMeta};
-
-        let turn_cancel = fresh_cancel();
-        let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
-        store
-            .create_session(&SessionMeta {
-                id: "s".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let mut chat = ChatView::default();
-        let mut pending_images: Vec<(String, String)> = Vec::new();
-
-        // Keyboard Enter while a turn is running: persist + push, do NOT
-        // interrupt. (running is implicit: handle_key returns `KeyAction::Steer`
-        // only while a turn is in progress.)
-        let seq = admit_keyboard_steer(
-            &store,
-            "s",
-            "stop and rethink",
-            "stop and rethink",
-            &mut pending_images,
-            &mut chat,
-        )
-        .await;
-        assert!(
-            seq.is_some(),
-            "keyboard steer must be admitted to the store"
-        );
-        assert_eq!(
-            chat.steer_items.len(),
-            1,
-            "keyboard steer must appear on the pending panel"
-        );
-        assert!(
-            !turn_cancel.lock().unwrap().is_cancelled(),
-            "keyboard Enter must NOT fire turn_cancel (no interrupt)"
-        );
-
-        // Contrast: the `>` button path interrupts the very same running turn.
-        let action = fire_steer_interrupt(
-            None,
-            true,
-            &empty_cancels(),
-            &empty_turn_cancels(),
-            &turn_cancel,
-            &chat,
-        );
-        assert_eq!(action, steer_dispatch::Action::SteerParent);
-        assert!(
-            turn_cancel.lock().unwrap().is_cancelled(),
-            "`>` button must fire turn_cancel (interrupt)"
-        );
-    }
-    // ---- Error-path coverage ----
-    use anyhow::Result;
-    use opencoder_core::Message;
-    use opencoder_store::{
-        Delivery, LibsqlStore, SessionEventRecord, SessionFilter, SessionInput, SessionListItem,
-        SessionMeta, SessionPatch, SubagentTaskRecord,
-    };
-
-    /// A Store wrapper that delegates everything to an inner LibsqlStore
-    /// EXCEPT `admit_input`, which always fails. Exercises the documented
-    /// store-failure branch of `admit_keyboard_steer`: it must return None and
-    /// leave `pending_images` untouched (no silent image drop).
-    struct FailingAdmitStore(Arc<LibsqlStore>);
-
-    #[async_trait::async_trait]
-    impl Store for FailingAdmitStore {
-        fn backend_name(&self) -> &'static str {
-            self.0.backend_name()
-        }
-        async fn create_session(&self, m: &SessionMeta) -> Result<()> {
-            self.0.create_session(m).await
-        }
-        async fn get_session(&self, id: &str) -> Result<Option<SessionMeta>> {
-            self.0.get_session(id).await
-        }
-        async fn list_sessions(&self, f: &SessionFilter) -> Result<Vec<SessionListItem>> {
-            self.0.list_sessions(f).await
-        }
-        async fn update_session(&self, id: &str, p: &SessionPatch) -> Result<()> {
-            self.0.update_session(id, p).await
-        }
-        async fn delete_session(&self, id: &str) -> Result<()> {
-            self.0.delete_session(id).await
-        }
-        async fn clear_other_sessions(&self, k: &str) -> Result<u64> {
-            self.0.clear_other_sessions(k).await
-        }
-        async fn append_message(&self, sid: &str, m: &Message) -> Result<i64> {
-            self.0.append_message(sid, m).await
-        }
-        async fn append_messages(&self, sid: &str, m: &[Message]) -> Result<Vec<i64>> {
-            self.0.append_messages(sid, m).await
-        }
-        async fn load_messages(&self, sid: &str) -> Result<Vec<Message>> {
-            self.0.load_messages(sid).await
-        }
-        async fn last_message_seq(&self, sid: &str) -> Result<i64> {
-            self.0.last_message_seq(sid).await
-        }
-        async fn admit_input(&self, _input: &SessionInput) -> Result<i64> {
-            Err(anyhow::anyhow!("simulated store failure"))
-        }
-        async fn pending_inputs(&self, sid: &str, d: Delivery) -> Result<Vec<SessionInput>> {
-            self.0.pending_inputs(sid, d).await
-        }
-        async fn promote_inputs(&self, sid: &str, up: i64, d: Delivery) -> Result<Vec<i64>> {
-            self.0.promote_inputs(sid, up, d).await
-        }
-        async fn promote_next_queued(&self, sid: &str) -> Result<Option<i64>> {
-            self.0.promote_next_queued(sid).await
-        }
-        async fn claim_next_queue(&self, sid: &str) -> Result<Option<(i64, SessionInput)>> {
-            self.0.claim_next_queue(sid).await
-        }
-        async fn delete_input(&self, id: i64) -> Result<()> {
-            self.0.delete_input(id).await
-        }
-        async fn swap_input_order(&self, sid: &str, a: i64, b: i64) -> Result<()> {
-            self.0.swap_input_order(sid, a, b).await
-        }
-        async fn append_events(&self, ev: &[SessionEventRecord]) -> Result<Vec<i64>> {
-            self.0.append_events(ev).await
-        }
-        async fn events_after(&self, sid: &str, s: i64) -> Result<Vec<SessionEventRecord>> {
-            self.0.events_after(sid, s).await
-        }
-        async fn last_event_seq(&self, sid: &str) -> Result<i64> {
-            self.0.last_event_seq(sid).await
-        }
-        async fn create_subagent_task(&self, r: &SubagentTaskRecord) -> Result<()> {
-            self.0.create_subagent_task(r).await
-        }
-        async fn complete_subagent_task(&self, id: &str, res: &str, ok: bool) -> Result<()> {
-            self.0.complete_subagent_task(id, res, ok).await
-        }
-        async fn list_subagent_tasks(&self, pid: &str) -> Result<Vec<SubagentTaskRecord>> {
-            self.0.list_subagent_tasks(pid).await
-        }
-        async fn get_subagent_task(&self, id: &str) -> Result<Option<SubagentTaskRecord>> {
-            self.0.get_subagent_task(id).await
-        }
-        async fn cancel_subagent_task(&self, id: &str) -> Result<()> {
-            self.0.cancel_subagent_task(id).await
-        }
-    }
-
-    // When the store write fails, admit_keyboard_steer must return None AND
-    // preserve pending_images (the snapshot is taken first, but clear() only
-    // runs after a successful write). No image is silently dropped.
-    #[tokio::test]
-    async fn store_failure_returns_none_and_preserves_images() {
-        let inner = Arc::new(LibsqlStore::open_memory().await.unwrap());
-        inner
-            .create_session(&SessionMeta {
-                id: "s".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let store: Arc<dyn Store> = Arc::new(FailingAdmitStore(inner));
-
-        let mut chat = ChatView::default();
-        let mut pending_images = vec![("img.png".to_string(), "data".to_string())];
-
-        let seq =
-            admit_keyboard_steer(&store, "s", "stop", "stop", &mut pending_images, &mut chat).await;
-
-        assert!(seq.is_none(), "store failure must return None");
-        assert_eq!(
-            pending_images.len(),
-            1,
-            "pending_images must survive a store failure (no silent image drop)"
-        );
-        assert!(
-            chat.steer_items.is_empty(),
-            "steer panel must not be mutated on store failure"
-        );
-    }
-
-    // Consumption-time arming: a keyboard steer is only ADMITTED here — it
-    // must NOT arm the plan→act handoff. The arm happens when the runner
-    // absorbs the steer and the plan turn's TurnDone(plan) re-arms from the
-    // persisted plan-phase counter. A stranded, never-consumed steer row can
-    // therefore never arm a context-clearing handoff.
-    #[tokio::test]
-    async fn keyboard_steer_in_plan_mode_does_not_arm_plan_submitted() {
-        let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
-        store
-            .create_session(&SessionMeta {
-                id: "steer-plan".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let mut chat = ChatView {
-            agent: "plan".into(),
-            ..Default::default()
-        };
-        let mut pending_images = Vec::new();
-
-        let seq = admit_keyboard_steer(
-            &store,
-            "steer-plan",
-            "also cover the CLI flag",
-            "also cover the CLI flag",
-            &mut pending_images,
-            &mut chat,
-        )
-        .await
-        .expect("admit must succeed");
-
-        assert!(
-            !chat.plan_submitted,
-            "a plan-mode steer admit must NOT arm the Shift+Tab handoff — arming is consumption-time"
-        );
-        assert_eq!(
-            chat.steer_items,
-            vec![(seq, "also cover the CLI flag".to_string())],
-            "steer must be mirrored on the pending panel"
-        );
-        let pending = store
-            .pending_inputs("steer-plan", Delivery::Steer)
-            .await
-            .unwrap();
-        assert_eq!(
-            pending.len(),
-            1,
-            "admitted steer must still be pending in the store"
-        );
-        assert_eq!(pending[0].seq, Some(seq));
-    }
-
-    // Fix ④ counterpart: in act mode the same call is a self-guarded no-op for
-    // the handoff arm — `plan_submitted` must stay false.
-    #[tokio::test]
-    async fn keyboard_steer_in_act_mode_does_not_arm_plan_submitted() {
-        let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
-        store
-            .create_session(&SessionMeta {
-                id: "steer-act".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let mut chat = ChatView {
-            agent: "act".into(),
-            ..Default::default()
-        };
-        let mut pending_images = Vec::new();
-
-        let seq = admit_keyboard_steer(
-            &store,
-            "steer-act",
-            "stop exploring",
-            "stop exploring",
-            &mut pending_images,
-            &mut chat,
-        )
-        .await
-        .expect("admit must succeed");
-
-        assert!(
-            !chat.plan_submitted,
-            "act-mode steer must not arm the plan handoff"
-        );
-        assert_eq!(chat.steer_items.len(), 1, "panel mirror is agent-agnostic");
-        assert!(seq > 0);
-    }
-
-    // F4 seam: a None admit outcome must map to a non-empty failure flash
-    // (never a silent drop); a successful seq maps to None (no flash).
-    #[test]
-    fn flash_on_admit_failure_none_on_success() {
-        assert_eq!(flash_on_admit_failure(Some(7)), None);
-    }
-
-    #[test]
-    fn flash_on_admit_failure_some_on_store_failure() {
-        let flash = flash_on_admit_failure(None).expect("failure must produce a flash");
-        assert!(!flash.is_empty());
-        assert!(flash.contains("steer"), "flash must name the steer path");
-        assert_eq!(flash, STEER_SUBMIT_FAILED_FLASH);
     }
 }

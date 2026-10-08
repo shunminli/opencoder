@@ -23,9 +23,7 @@ use crate::keymap::KeyBindings;
 use crate::theme;
 use crate::worker::UiCmd;
 
-use crate::queue_panel;
-use crate::render::{in_rect, MouseHits};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent};
 
 #[cfg(test)]
 #[cfg(test)]
@@ -41,7 +39,7 @@ pub(crate) fn resume_hint(id: &str) -> String {
 /// restores the model stored in the session row into `session.config.model`,
 /// so an explicit `--model` must win here. Returns the new model string when
 /// the session changed (caller persists it), else `None`. Mirrors the headless
-/// path in `crates/cli/src/run.rs` -- the TUI previously lacked this and
+/// path in `crates/local/src/run.rs` -- the TUI previously lacked this and
 /// silently dropped `--model` on resume (chosen model not applied after restart).
 pub(crate) fn reapply_session_model(
     session: &mut SessionState,
@@ -87,7 +85,14 @@ pub(crate) async fn initial_chat_view(
     session: &SessionState,
     store: &Arc<dyn Store>,
 ) -> crate::chat::ChatView {
-    let mut view = if !session.messages.is_empty() {
+    if let Some(remote) = &session.harness.remote {
+        return crate::chat::ChatView {
+            agent: remote.label(),
+            remote: true,
+            ..Default::default()
+        };
+    }
+    let view = if !session.messages.is_empty() {
         crate::session_ui::replay_into_chat(
             &session.agent.name,
             &session.messages,
@@ -103,17 +108,6 @@ pub(crate) async fn initial_chat_view(
             ..Default::default()
         }
     };
-    // Re-arm `plan_submitted` from the persisted plan-phase state so the
-    // plan→act handoff survives a restart (`--continue` / `--session`).
-    // Armed by the input counter OR a plan snapshot: legacy sessions (created
-    // before the plan-phase columns existed) resume with counter=0 but a
-    // recovered snapshot, and both mean a real plan was produced this phase.
-    // Mirrors the /task session-switch path in app_task::switch_session.
-    if session.agent.name == "plan"
-        && (session.plan_input_count > 0 || session.plan_snapshot.is_some())
-    {
-        view.plan_submitted = true;
-    }
     view
 }
 
@@ -124,9 +118,8 @@ pub(crate) async fn initial_chat_view(
 /// Returns `true` when the key was consumed (caller should `continue` to the
 /// next event).
 ///
-/// Note: Ctrl+T is intentionally NOT handled here — it is a pure act<->plan
-/// mode toggle (see `handle_key`). Keeping it out of this intercept lets it
-/// switch mode without collapsing thinking or clearing the input box.
+/// Mode switching is deliberately not intercepted here: Ctrl+T falls through
+/// to `handle_key`, which returns the explicit parent-agent switch action.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pre_key_intercept(
     k: KeyEvent,
@@ -138,8 +131,19 @@ pub(crate) fn pre_key_intercept(
     input: &mut String,
     cursor_idx: &mut usize,
     needs_clear: &mut bool,
+    sidecar_ask: &mpsc::Sender<crate::sidecar_ui::SidecarCmd>,
 ) -> bool {
     *needs_clear = false;
+    // Sidecar ctx-switch: Esc DESTROYS the sidecar — the actor drops its
+    // conversation (aborting an in-flight turn; partial usage still lands on
+    // the main session) and every sidecar block is purged from the
+    // transcript, so the parent view carries zero sidecar trace.
+    if chat.sidecar_focus && k.code == KeyCode::Esc {
+        crate::sidecar_ui::exit_panel(chat, sidecar_ask);
+        *follow = true; // follow mode: render clamps scroll to bottom (render.rs)
+        *last_esc = None;
+        return true;
+    }
     // Subagent ctx-switch: Esc exits to parent view.
     if subagent_focus.is_some() && k.code == KeyCode::Esc {
         *subagent_focus = None;
@@ -155,6 +159,13 @@ pub(crate) fn pre_key_intercept(
                 view.collapse_all_collapsible();
             }
             *subagent_focus = None;
+            *last_esc = None;
+        }
+        // Same exit path for a focused sidecar box: DESTROY it (the sidecar
+        // is a temporary bypass, not a transcript artifact), then fall
+        // through to the parent-wide collapse below.
+        if chat.sidecar_focus {
+            crate::sidecar_ui::exit_panel(chat, sidecar_ask);
             *last_esc = None;
         }
         chat.collapse_all_collapsible();
@@ -331,7 +342,11 @@ pub(crate) fn worker_dead(chat: &mut ChatView) {
 /// time (queue/steer drain resolved a `$name` token at the idle boundary).
 /// The runner shares only the body, so the display name is derived from the
 /// body's `> Source: .../skills/<name>/SKILL.md` prefix; `sys_tokens` is
-/// re-estimated from the new body. No-op while both sides agree.
+/// re-estimated from the new body, and the `[act]` task-plan chip highlight
+/// is re-derived. The early-return (body unchanged) path must keep the
+/// caller's `plan_skill_active` value as-is: a yellow cleared by a steer/
+/// queued input taking effect must not be revived by a later idle mirror
+/// refresh. No-op while both sides agree.
 pub(crate) fn refresh_skill_mirrors(
     skill_handle: &Arc<Mutex<Option<String>>>,
     active_skill: &mut Option<String>,
@@ -339,6 +354,7 @@ pub(crate) fn refresh_skill_mirrors(
     sys_tokens: &mut u64,
     agent_name: &str,
     workdir: &Path,
+    plan_skill_active: &mut bool,
 ) {
     let body = skill_handle.lock().ok().and_then(|g| g.clone());
     if body == *active_skill_body {
@@ -349,6 +365,7 @@ pub(crate) fn refresh_skill_mirrors(
         .and_then(crate::skill_display::skill_name_from_body);
     *active_skill_body = body;
     *sys_tokens = sys_tokens_for(agent_name, workdir, active_skill_body.as_deref());
+    *plan_skill_active = crate::skill_persist::act_plan_highlight(active_skill.as_deref());
 }
 
 pub(crate) fn sys_tokens_for(agent_name: &str, workdir: &Path, skill: Option<&str>) -> u64 {
@@ -356,7 +373,7 @@ pub(crate) fn sys_tokens_for(agent_name: &str, workdir: &Path, skill: Option<&st
         Some(a) => a,
         None => return 0,
     };
-    let text = opencoder_session::prompt::build_system(&agent, workdir, None).text();
+    let text = opencoder_session::prompt::build_system(&agent, workdir, None, skill).text();
     let registry = opencoder_session::tools::registry();
     let tool_tokens =
         opencoder_session::tools::estimate_tool_schema_tokens(&agent, skill, &registry);
@@ -489,12 +506,59 @@ pub(crate) fn queue_unsupported_flash(anim_tick: u32) -> (String, u32) {
     )
 }
 
-/// Stable busy hint shared by direct shortcuts and textual mode commands.
+/// Tab-queue submit arm body (extracted from `app.rs`, file-size cap): the
+/// off-loop admitter owns the store write. On a failed hand-off (actor gone /
+/// channel saturated) the temp row + images were already rolled back — flash
+/// so the submit is not silently swallowed; the raw text stays recoverable
+/// via ↑ history (push_history runs on every submit).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn queue_submit_flash(
+    text: &str,
+    tx: &mpsc::Sender<crate::queue_admitter::AdmitReq>,
+    st: &mut crate::queue_admitter::AdmitUiState,
+    queue_items: &mut Vec<(i64, String)>,
+    pending_images: &mut Vec<(String, String)>,
+    session_id: &str,
+    anim_tick: u32,
+    mode_flash: &mut Option<(String, u32)>,
+) {
+    if !crate::queue_admitter::handle_queue(text, tx, st, queue_items, pending_images, session_id) {
+        *mode_flash = Some((
+            crate::queue_admitter::QUEUE_SUBMIT_FAILED_FLASH.to_string(),
+            anim_tick,
+        ));
+    }
+}
+
+/// Parent keyboard-steer submit arm body (extracted from `app.rs`, file-size
+/// cap): optimistic off-loop submit into `chat.steer_items` — no interrupt
+/// (`>` remains that route via `steer_fire::fire_steer_interrupt`). On a
+/// failed hand-off the temp row + images were already rolled back — flash;
+/// the raw text stays recoverable via ↑ history.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn steer_submit_flash(
+    tx: &mpsc::Sender<crate::queue_admitter::AdmitReq>,
+    st: &mut crate::queue_admitter::AdmitUiState,
+    steer_items: &mut Vec<(i64, String)>,
+    pending_images: &mut Vec<(String, String)>,
+    session_id: &str,
+    raw: &str,
+    anim_tick: u32,
+    mode_flash: &mut Option<(String, u32)>,
+) {
+    if !crate::steer_admit::submit_steer(tx, st, steer_items, pending_images, session_id, raw) {
+        *mode_flash = Some((
+            crate::steer_admit::STEER_SUBMIT_FAILED_FLASH.to_string(),
+            anim_tick,
+        ));
+    }
+}
+
+/// Stable busy hint shared by direct shortcuts and textual mode commands:
+/// a bare act/plan switch (Ctrl+T, `/act`, `/plan`) while a turn runs is
+/// refused, never queued.
 pub(crate) fn mode_switch_busy_flash(anim_tick: u32) -> (String, u32) {
-    (
-        "\u{23f3} busy \u{2014} mode switch blocked, retry when idle".to_string(),
-        anim_tick,
-    )
+    ("\u{26a0} 任务运行中不可切换状态".to_string(), anim_tick)
 }
 
 pub(crate) fn push_history(history: &mut Vec<String>, hist_idx: &mut Option<usize>, text: &str) {
@@ -502,235 +566,39 @@ pub(crate) fn push_history(history: &mut Vec<String>, hist_idx: &mut Option<usiz
     *hist_idx = None;
 }
 
+/// Echo a submitted prompt: `echo` is the model-facing text rendered as the
+/// transcript user block (a compound control command's tail — the command
+/// token itself never echoes), `history_text` is the raw input kept for
+/// arrow-up recall. `first_prompt` (title source) stays keyed on the raw
+/// input so slash-prefixed inputs keep being excluded.
 pub(crate) fn push_user(
     chat: &mut ChatView,
     history: &mut Vec<String>,
     hist_idx: &mut Option<usize>,
-    text: &str,
+    echo: &str,
+    history_text: &str,
 ) {
     if chat.first_prompt.is_none() {
-        let t = text.trim();
+        let t = history_text.trim();
         if !t.is_empty() && !t.starts_with('/') {
             chat.first_prompt = Some(t.to_string());
         }
     }
-    push_history(history, hist_idx, text);
+    push_history(history, hist_idx, history_text);
     chat.blocks.push(crate::chat::ChatBlock::User {
-        rendered: crate::markdown::render(text),
+        rendered: crate::markdown::render(echo),
     });
     chat.push_marker(Line::from(""));
+    // Remember the echo across a TranscriptReset rebuild: a compound control
+    // command (`/act_clear_context <tail>`) resets the view after this push
+    // but before the tail is recorded, which would otherwise orphan the new
+    // turn's ladder with no user boundary.
+    if !echo.trim().is_empty() {
+        chat.pending_turn_echo = Some(echo.to_string());
+    }
 }
 
 pub(crate) use opencoder_core::data_dir_for;
-
-/// Outcome of a mouse event: `None` for normal handling (all effects are side
-/// effects on the caller's locals), or `SteerSubmit` when the user clicked the
-/// `>` submit-now button on a steer row, signalling the caller to interrupt the
-/// current turn and restart the drain loop to promote pending steers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum MouseOutcome {
-    None,
-    SteerSubmit,
-}
-
-/// Which `ChatView` a header click toggles: the focused subagent's child view
-/// when one is active, else the parent. `None` (click still consumed) for a
-/// stale or non-Subagent focus index.
-fn collapse_view(chat: &mut ChatView, focus: Option<usize>) -> Option<&mut ChatView> {
-    let i = match focus {
-        None => return Some(chat),
-        Some(i) => i,
-    };
-    match chat.blocks.get_mut(i)? {
-        crate::chat::ChatBlock::Subagent { view, .. } => Some(view),
-        _ => None,
-    }
-}
-
-/// Mouse-event handler extracted from `app.rs`'s main event loop. Owns all the
-/// state it touches via mutable references, so most effects are side effects on
-/// the caller's locals; the exception is `SteerSubmit` which the caller must
-/// handle by restarting the drain loop. `async` because the queue-panel
-/// delete/swap paths call through the `Store` trait (`delete_input` /
-/// `swap_input_order`).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_mouse(
-    m: MouseEvent,
-    hits: &MouseHits,
-    scroll: &mut u32,
-    follow: &mut bool,
-    chat: &mut ChatView,
-    subagent_focus: &mut Option<usize>,
-    subagent_sys: &mut u64,
-    workdir: &Path,
-    queue_items: &mut Vec<(i64, String)>,
-    session_id: &str,
-    store: &dyn Store,
-    queue_scroll: &mut u32,
-    pending_images: &mut Vec<(String, String)>,
-) -> MouseOutcome {
-    match m.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            // Follow button: highest-priority check so a quick succession of
-            // body-click + arrow-click does not have the arrow-click swallowed.
-            if let Some(r) = hits.jump_btn {
-                if in_rect(r, m.column, m.row) {
-                    *follow = true;
-                    return MouseOutcome::None; // deterministic jump to bottom
-                }
-            }
-
-            // Top-jump button: scroll back to the very first row. Sits next to
-            // the jump_btn check.
-            if let Some(r) = hits.top_btn {
-                if in_rect(r, m.column, m.row) {
-                    *scroll = 0;
-                    *follow = false;
-                    return MouseOutcome::None; // jump to top
-                }
-            }
-
-            // ── Button-hit detection ──
-            // Queue / Thinking / Subagent affordances must respond on the
-            // FIRST click (no early-return guard before the toggle loop).
-            let mut consumed = false;
-            for btn in &hits.queue_btns {
-                if !in_rect(btn.rect, m.column, m.row) {
-                    continue;
-                }
-                consumed = true;
-                // Submit-now on a steer row: signal the caller to interrupt
-                // and restart the drain loop. No store mutation needed — the
-                // steers are promoted by `claim_steers()` at the top of the
-                // next `run_loop` iteration.
-                if btn.action == queue_panel::QueueBtnAction::Submit {
-                    return MouseOutcome::SteerSubmit;
-                }
-                match queue_panel::plan(queue_items, btn.seq, btn.action) {
-                    queue_panel::QueueEffect::Delete(seq) => {
-                        if store.delete_input(seq).await.is_ok() {
-                            queue_items.retain(|(s, _)| *s != seq);
-                            chat.steer_items.retain(|(s, _)| *s != seq);
-                        }
-                    }
-                    queue_panel::QueueEffect::Swap(a, b) => {
-                        if store.swap_input_order(session_id, a, b).await.is_ok() {
-                            queue_panel::apply_swap(queue_items, a, b);
-                        }
-                    }
-                    queue_panel::QueueEffect::None => {}
-                }
-                break;
-            }
-            // Attachment ✕ delete: remove the clicked pending image on the
-            // FIRST click, like the queue buttons. Rects are rebuilt every
-            // frame and a single click removes one image, so the index stays
-            // valid for this event only.
-            for btn in &hits.attach_del_btns {
-                if in_rect(btn.rect, m.column, m.row) {
-                    if btn.index < pending_images.len() {
-                        pending_images.remove(btn.index);
-                    }
-                    consumed = true;
-                    break;
-                }
-            }
-            // Click a Thinking/Tool header to toggle its collapse (subagent-aware:
-            // toggles the focused child view, not the parent).
-            for btn in &hits.thinking_btns {
-                if in_rect(btn.rect, m.column, m.row) {
-                    if let Some(v) = collapse_view(chat, *subagent_focus) {
-                        ChatView::toggle_thinking_at(v, btn.block_idx);
-                    }
-                    consumed = true;
-                    break;
-                }
-            }
-            for btn in &hits.tool_btns {
-                if in_rect(btn.rect, m.column, m.row) {
-                    if let Some(v) = collapse_view(chat, *subagent_focus) {
-                        ChatView::toggle_tool_at(v, btn.block_idx);
-                    }
-                    consumed = true;
-                    break;
-                }
-            }
-            for btn in &hits.compaction_btns {
-                if in_rect(btn.rect, m.column, m.row) {
-                    if let Some(v) = collapse_view(chat, *subagent_focus) {
-                        ChatView::toggle_compaction_at(v, btn.block_idx);
-                    }
-                    consumed = true;
-                    break;
-                }
-            }
-            // Click on a Subagent-block header: enter
-            // the subagent's perspective (ctx-switch).
-            // No inline expansion — the child view and
-            // its context stats are shown full-body.
-            for btn in &hits.subagent_btns {
-                if in_rect(btn.rect, m.column, m.row) {
-                    *scroll = 0;
-                    *follow = true;
-                    *subagent_focus = Some(btn.block_idx);
-                    // Cache subagent's system-prompt
-                    // token estimate once on entry.
-                    if let Some(crate::chat::ChatBlock::Subagent { kind, .. }) =
-                        chat.blocks.get(btn.block_idx)
-                    {
-                        *subagent_sys = sys_tokens_for(kind, workdir, None);
-                    }
-                    consumed = true;
-                    break;
-                }
-            }
-            if consumed {
-                return MouseOutcome::None;
-            }
-        }
-        MouseEventKind::ScrollUp => {
-            // Wheel-up over the queue/steer panel looks at older entries (toward the top; rects never overlap the body).
-            if let Some(r) = hits.queue_panel {
-                if in_rect(r, m.column, m.row) {
-                    *queue_scroll = queue_scroll.saturating_sub(1);
-                    return MouseOutcome::None;
-                }
-            }
-            if let Some(r) = hits.body {
-                if in_rect(r, m.column, m.row) {
-                    *scroll = scroll.saturating_sub(8);
-                    *follow = false;
-                }
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            // Wheel-down over the queue/steer panel moves toward newer entries (toward the bottom).
-            if let Some(r) = hits.queue_panel {
-                if in_rect(r, m.column, m.row) {
-                    // Clamp to the cached panel total (mirrors the body clamp) so burst wheels can't overshoot.
-                    let max_scroll = hits.queue_total.saturating_sub(r.height as usize);
-                    *queue_scroll = queue_scroll.saturating_add(1).min(max_scroll as u32);
-                    return MouseOutcome::None;
-                }
-            }
-            if let Some(r) = hits.body {
-                if in_rect(r, m.column, m.row) {
-                    let visible_h = r.height.saturating_sub(2) as usize;
-                    // Use cached total_rows from the last render_body call instead
-                    // of re-flattening the entire transcript on every wheel event.
-                    let total_rows = hits.total_rows;
-                    let max_rows = total_rows.saturating_sub(visible_h);
-                    *scroll = scroll.saturating_add(3);
-                    if (*scroll as usize) >= max_rows {
-                        *follow = true;
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    MouseOutcome::None
-}
 
 /// Open (creating its data dir if needed) the on-disk sqlite store rooted at
 /// `workdir`. Best-effort dir creation: a mkdir failure is ignored via `.ok()`
@@ -761,6 +629,39 @@ pub(crate) fn apply_force_redraw<B: ratatui::backend::Backend>(
     }
 }
 
+#[path = "app_mouse.rs"]
+mod app_mouse;
+
+pub(crate) use app_mouse::{handle_mouse, MouseOutcome};
+
 #[cfg(test)]
 #[path = "app_helpers_tests/mod.rs"]
 mod tests;
+
+/// Both startup and task switches use the same task worker routing.
+pub(crate) fn start_worker(
+    session: opencoder_session::SessionState,
+    events: tokio::sync::mpsc::Sender<crate::worker::UiEvent>,
+    commands: tokio::sync::mpsc::Receiver<crate::worker::UiCmd>,
+    store: Arc<dyn Store>,
+) -> (
+    tokio::sync::mpsc::Sender<crate::sidecar_ui::SidecarCmd>,
+    tokio::task::JoinHandle<()>,
+) {
+    let sidecar = crate::sidecar_ui::spawn_actor(&session, events.clone(), Some(store));
+    (
+        sidecar,
+        crate::worker::spawn_task(session, commands, events),
+    )
+}
+
+pub(crate) fn start_input() -> (
+    tokio::sync::mpsc::Receiver<crossterm::event::Event>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let heartbeat = crate::supervisor::Heartbeat::new();
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    crate::supervisor::spawn(heartbeat.clone(), active.clone());
+    let (input, _) = crate::input::spawn_input_pump(heartbeat);
+    (input, active)
+}

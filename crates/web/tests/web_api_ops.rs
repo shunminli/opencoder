@@ -52,11 +52,16 @@ async fn state() -> Arc<opencoder_web::AppState> {
     let workdir = std::env::temp_dir().join(format!("oc-web-ops-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&workdir).ok();
     Arc::new(opencoder_web::AppState {
+        config_home: None,
         client_override: Some(Arc::new(MockChatClient::new()) as Arc<dyn ChatStream>),
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store,
         workdir,
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
     })
 }
 
@@ -75,11 +80,16 @@ async fn state_with_reply(text: &str) -> Arc<opencoder_web::AppState> {
     let workdir = std::env::temp_dir().join(format!("oc-web-ops-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&workdir).ok();
     Arc::new(opencoder_web::AppState {
+        config_home: None,
         client_override: Some(mock),
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store,
         workdir,
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
     })
 }
 
@@ -104,8 +114,7 @@ async fn seed(state: &opencoder_web::AppState, sid: &str) {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();
@@ -572,21 +581,9 @@ async fn handoff_persists_boundary_when_plan_exists() {
         )
         .await
         .unwrap();
-    // Phase-bounded handoff (`plan_handoff::handoff`): the plan comes from
-    // the snapshot `record` persists while the plan agent answers; the drain
-    // restores it from the sessions row via `resume`. Seed that mirror
-    // exactly as a real plan-mode session would have left it.
-    state
-        .store
-        .update_session(
-            sid,
-            &opencoder_store::SessionPatch {
-                plan_snapshot: Some("## Plan\n1. do X\n2. do Y".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    // The handoff brief is the newest assistant reply in the transcript
+    // (`handoff::reset_to_directive`); the drain restores the transcript via
+    // `resume`, so seeding the persisted assistant message is enough.
     let resp = app
         .oneshot(
             Request::builder()
@@ -608,6 +605,11 @@ async fn handoff_persists_boundary_when_plan_exists() {
                 assert!(
                     meta.handoff_plan.is_some(),
                     "handoff_plan must be persisted alongside handoff_seq"
+                );
+                let plan = meta.handoff_plan.unwrap();
+                assert!(
+                    plan.contains("## Plan") && plan.contains("begin"),
+                    "handoff_plan carries the brief plus the extra text, got: {plan}"
                 );
                 assert_eq!(
                     meta.agent.as_deref(),

@@ -228,6 +228,8 @@ mod tests {
 
     fn sample_bundle() -> SessionBundle {
         let msg = Message {
+            provider_state: None,
+            display: None,
             id: "msg1".into(),
             role: Role::User,
             blocks: vec![ContentBlock::Text {
@@ -241,6 +243,7 @@ mod tests {
         };
         SessionBundle {
             meta: SessionMeta {
+                kind: None,
                 id: "sess1".into(),
                 title: Some("test".into()),
                 agent: Some("act".into()),
@@ -257,8 +260,6 @@ mod tests {
                 skill: None,
                 task_type: None,
                 requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
             },
             messages: vec![msg],
             events: vec![],
@@ -331,6 +332,7 @@ mod tests {
 
         let bundle = SessionBundle {
             meta: SessionMeta {
+                kind: None,
                 id: "sess-c1".into(),
                 title: Some("t".into()),
                 agent: Some("act".into()),
@@ -348,8 +350,6 @@ mod tests {
                 skill: None,
                 task_type: None,
                 requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
             },
             messages: vec![Message::user("u1", "hi"), Message::assistant("a1")],
             events: vec![],
@@ -393,6 +393,7 @@ mod tests {
         // Child bundle carries its own workdir_hash.
         let child = SessionBundle {
             meta: SessionMeta {
+                kind: None,
                 id: "child-1".into(),
                 title: Some("t".into()),
                 agent: Some("act".into()),
@@ -409,8 +410,6 @@ mod tests {
                 skill: None,
                 task_type: None,
                 requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
             },
             messages: vec![],
             events: vec![],
@@ -420,6 +419,7 @@ mod tests {
 
         let bundle = SessionBundle {
             meta: SessionMeta {
+                kind: None,
                 id: "parent-1".into(),
                 title: Some("t".into()),
                 agent: Some("act".into()),
@@ -436,8 +436,6 @@ mod tests {
                 skill: None,
                 task_type: None,
                 requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
             },
             messages: vec![],
             events: vec![],
@@ -536,6 +534,7 @@ mod tests {
     fn rollback_bundle(event_session: &str) -> SessionBundle {
         SessionBundle {
             meta: SessionMeta {
+                kind: None,
                 id: "sess-rollback".into(),
                 title: Some("t".into()),
                 agent: Some("act".into()),
@@ -552,8 +551,6 @@ mod tests {
                 skill: None,
                 task_type: None,
                 requirement: None,
-                plan_snapshot: None,
-                plan_input_count: 0,
             },
             messages: vec![Message::user("u1", "hi"), Message::assistant("a1")],
             events: vec![SessionEventRecord {
@@ -582,6 +579,7 @@ mod tests {
             let parent_id = format!("nest-{i}");
             bundle = SessionBundle {
                 meta: SessionMeta {
+                    kind: None,
                     id: parent_id.clone(),
                     ..sample_bundle().meta
                 },

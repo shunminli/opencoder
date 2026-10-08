@@ -1,15 +1,16 @@
-//! Queueable control commands: `/act`, `/plan`, `/act_clear_context`.
+//! Queueable control commands: `/act`, `/plan`, `/act_clear_context`
+//! (`/clear_context` is the accepted legacy alias).
 //!
-//! These slash commands switch the runtime agent (mode) and/or clear the
-//! transcript. Unlike normal prompts, they take effect *immediately* when
-//! consumed by the drain loop — they do NOT consume an LLM turn. Public UI
+//! These slash commands switch the runtime agent and/or clear the transcript.
+//! They take effect *immediately* when consumed by the drain loop. Pure mode
+//! switches do not consume an LLM turn; a clear with preserved context does,
+//! so act can continue from the seed or execute the preserved plan. Public UI
 //! admission rejects them while a run is active; the runner parser remains so
-//! idle submissions and already-persisted/internal recovery inputs behave
-//! deterministically:
+//! idle submissions and persisted/internal recovery inputs stay deterministic:
 //!
 //! ```text
 //! queue: [/plan] -> [review skill] -> [/act]
-//! drain: switch->plan (no turn) . run "review" in plan . switch->act (no turn)
+//! drain: switch->plan (no turn) . run "review" . switch->act (no turn)
 //! ```
 //!
 //! Integration points (all in [`crate::runner`]):
@@ -21,7 +22,10 @@
 //!   command is applied immediately instead of being recorded as user text.
 
 use anyhow::Result;
-use opencoder_core::{message::now_ms, resolve_agent, AgentKind, ContentBlock, Message};
+use opencoder_core::agent::list_agents;
+use opencoder_core::{
+    builtin_agents, message::now_ms, resolve_agent, AgentKind, AgentMode, ContentBlock, Message,
+};
 use opencoder_store::SessionPatch;
 
 use crate::runner::new_id;
@@ -29,16 +33,17 @@ use crate::runner::SessionEvent;
 use crate::SessionState;
 
 /// Sentinel value stored in `handoff_plan` so [`crate::resume`] reconstructs a
-/// fresh-start marker (not a plan->act handoff instruction) after a
+/// fresh-start marker (not a directive boundary) after a
 /// [`ControlCmd::ClearContext`]. The distinctive ASCII framing guarantees it
-/// never collides with real plan text (no LLM/user output starts with this).
+/// never collides with real content (no LLM/user output starts with this).
 pub(crate) const CLEAR_CONTEXT_SENTINEL: &str = "<<OPENCODER_CLEAR_CONTEXT_MARKER>>";
 
 /// True when a persisted `handoff_plan` is the clear-context sentinel — i.e.
-/// the boundary was written by [`ControlCmd::ClearContext`], not a plan->act
-/// handoff. Public so display layers (TUI plan card, CLI JSON dump) can skip
-/// the raw sentinel instead of ever outputting it; the LLM must never see it
-/// (resume converts it to [`fresh_start_message`] before rebuilding context).
+/// the boundary was written by [`ControlCmd::ClearContext`] and preserved
+/// nothing. Public so display layers (TUI handoff card, CLI JSON dump) can
+/// skip the raw sentinel instead of ever outputting it; the LLM must never
+/// see it (resume converts it to [`fresh_start_message`] before rebuilding
+/// context).
 pub fn is_clear_context_handoff(handoff_plan: &str) -> bool {
     handoff_plan == CLEAR_CONTEXT_SENTINEL
 }
@@ -47,14 +52,14 @@ pub fn is_clear_context_handoff(handoff_plan: &str) -> bool {
 /// preserved the last assistant reply as a continuity seed: the persisted
 /// value is this prefix followed by the preserved reply text. Same ASCII
 /// framing rationale as [`CLEAR_CONTEXT_SENTINEL`] — it can never collide
-/// with real plan text.
+/// with real content.
 pub(crate) const CLEAR_CONTEXT_SEED_PREFIX: &str = "<<OPENCODER_CLEAR_SEED>>";
 
 /// True when a persisted `handoff_plan` is a clear-context seed boundary —
-/// the clear preserved the last assistant reply instead of a plan. Public so
-/// display layers (TUI replay, CLI JSON dump) can strip the marker and render
-/// the preserved text; the LLM must never see the raw marker (resume converts
-/// it back to a [`seed_message`] before rebuilding context).
+/// the clear preserved the last assistant reply. Public so display layers
+/// (TUI replay, CLI JSON dump) can strip the marker and render the preserved
+/// text; the LLM must never see the raw marker (resume converts it back to a
+/// [`seed_message`] before rebuilding context).
 pub fn is_clear_context_seed(handoff_plan: &str) -> bool {
     handoff_plan.starts_with(CLEAR_CONTEXT_SEED_PREFIX)
 }
@@ -74,11 +79,11 @@ fn clear_seed_marker(text: &str) -> String {
 }
 
 /// Body of the fresh-start marker message left after a context clear.
-const CLEAR_CONTEXT_BODY: &str = "[Context cleared - starting fresh in act mode.]";
+const CLEAR_CONTEXT_BODY: &str = "[Context cleared - starting fresh.]";
 
-/// Neutral wrapper for the preserved last say. Deliberately NOT the plan→act
-/// "execute this plan" directive (`plan_handoff::HANDOFF_PREFIX`): the
-/// preserved text is a plain prior answer ("task done"), not a plan, and an
+/// Neutral wrapper for the preserved last say. Deliberately NOT an execution
+/// directive ([`crate::handoff`] prefixes the autopilot handoff instead): the
+/// preserved text is a plain prior answer ("task done"), not a task, and an
 /// execution directive would fabricate a task out of finished work.
 const CLEAR_SEED_BODY_PREFIX: &str = "[Context cleared. The previous assistant reply below \
 is preserved as continuity context - prior context, not a new instruction.]\n\n";
@@ -86,28 +91,47 @@ is preserved as continuity context - prior context, not a new instruction.]\n\n"
 /// A control command parsed from a slash-command string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlCmd {
-    /// Switch the active agent (mode) without resetting context.
+    /// Switch the active agent without resetting context. The name may be a
+    /// builtin (`act`/`plan` via `/act`//`/plan`) or any resolvable
+    /// file-based agent (via `/agent <name>`).
     SwitchAgent(String),
-    /// Clear the transcript and switch to act. Never a full wipe: a finalized
-    /// plan is handed off as the plan→act directive; otherwise the last
-    /// assistant reply survives as a neutral continuity seed; only a
-    /// transcript with no assistant content collapses to the blank
-    /// fresh-start marker.
+    /// Bare `/agent`: list the available agents (primary builtins plus every
+    /// file-based agent card) in an info event. No state change.
+    AgentList,
+    /// Clear the transcript. From plan mode, the newest plan is preserved as
+    /// an execution directive and the session converges to act; this is the
+    /// handoff promised by the `/act_` prefix. From act, the newest assistant
+    /// reply remains a neutral continuity seed. Only a transcript with no
+    /// assistant content collapses to the blank fresh-start marker.
     ClearContext,
 }
 
 /// Split a compound prompt into its leading control command and any trailing
 /// argument text. Supports `/plan <args>` and `/act <args>` so a single
-/// submission like `/plan review` switches mode *and* runs the rest as a
-/// prompt in the new mode.
+/// submission like `/plan review` switches agent *and* runs the rest as a
+/// prompt in the new agent.
 ///
-/// `/act_clear_context` supports compound inputs like `/act_clear_context
-/// review` where the trailing text runs as a prompt in the fresh context.
+/// `/agent <name> [args]` switches to ANY resolvable agent — builtin or
+/// file-based (`resolve_agent` decides). The first token after `/agent` is
+/// the agent name; anything after it is a compound prompt in the new agent
+/// (`/agent plan review` ≡ `/plan review`). A bare `/agent` (no name) parses
+/// to [`ControlCmd::AgentList`], which lists the available agents instead of
+/// switching.
+///
+/// The clear-context fold is canonicalized as `/act_clear_context` — the
+/// `act` prefix kept explicit so the command reads as the act-agent
+/// fold-and-restart it is. It supports compound inputs like
+/// `/act_clear_context review` where the trailing text runs as a prompt in
+/// the fresh context. The legacy spelling `/clear_context` still parses
+/// (mapped to the same command) so already-persisted inputs keep behaving
+/// deterministically. From plan mode the clear preserves the plan as an
+/// execution directive and converges to act before the continuation turn.
 ///
 /// Returns `None` for anything that is not a control command. The rest text is
-/// the trimmed remainder after the command token, or `None` when the input was
-/// a bare command with nothing following (e.g. `/plan`). Inline `$skill`
-/// tokens in the rest are preserved verbatim for downstream resolution.
+/// the trimmed remainder after the command token (for `/agent`, after the
+/// agent-name token), or `None` when the input was a bare command with
+/// nothing following (e.g. `/act`). Inline `$skill` tokens in the rest are
+/// preserved verbatim for downstream resolution.
 pub fn split_control_prefix(prompt: &str) -> Option<(ControlCmd, Option<String>)> {
     let trimmed = prompt.trim();
     let mut parts = trimmed.split_whitespace();
@@ -115,31 +139,58 @@ pub fn split_control_prefix(prompt: &str) -> Option<(ControlCmd, Option<String>)
     let cmd = match head {
         "/act" => ControlCmd::SwitchAgent("act".into()),
         "/plan" => ControlCmd::SwitchAgent("plan".into()),
-        "/act_clear_context" => ControlCmd::ClearContext,
+        "/act_clear_context" | "/clear_context" => ControlCmd::ClearContext,
+        "/agent" => {
+            // The token after `/agent` is the target agent name; anything
+            // beyond it is a compound prompt (like `/plan review`).
+            match parts.next() {
+                Some(name) => ControlCmd::SwitchAgent(name.into()),
+                None => ControlCmd::AgentList,
+            }
+        }
         _ => return None,
     };
-    let rest: String = parts.collect::<Vec<_>>().join(" ");
-    let rest = (!rest.is_empty()).then_some(rest);
+    // The prompt tail after the command head: for `/agent <name> …` the
+    // name token is part of the command, so the tail starts after it.
+    let after_head = trimmed.strip_prefix(head).map(str::trim);
+    let rest = match (&cmd, head) {
+        (ControlCmd::SwitchAgent(name), "/agent") => after_head
+            .and_then(|after| after.strip_prefix(name.as_str()))
+            .map(str::trim),
+        _ => after_head,
+    }
+    .filter(|s| !s.is_empty())
+    .map(str::to_string);
     Some((cmd, rest))
 }
 
-/// Whether `prompt` requests a user-visible mode transition.
-///
-/// Pure classification of `/act`, `/plan` and `/act_clear_context` (bare or
-/// compound). No longer used to reject textual mode commands from a running
+/// The transcript echo for a consumed input: for a compound control command
+/// the tail (exactly what `record_compound` records as the real user turn),
+/// `None` for a bare control command (applied inline — nothing recorded, so
+/// nothing to echo), and the input itself for non-control text. Single source
+/// of truth for the "slash command never echoes; its compound tail does"
+/// contract across the runner events, the TUI transcript and the CLI header.
+pub fn consumed_echo_text(input: &str) -> Option<String> {
+    match split_control_prefix(input) {
+        Some((_, Some(rest))) => Some(rest),
+        Some((_, None)) => None,
+        None => Some(input.to_string()),
+    }
+}
+
 /// PARENT session: queue/steer submissions are admitted and the runner applies
 /// them at the next idle/turn boundary, which structurally has no turn in
 /// flight. Still the admission guard for subagent steers (subagents have no
-/// mode concept) and the TUI's subagent-focus gate.
+/// agent concept) and the TUI's subagent-focus gate.
 pub fn is_mode_control(prompt: &str) -> bool {
     split_control_prefix(prompt).is_some()
 }
 
-/// Parse a user prompt into a control command. Returns `None` for anything that
-/// is not `/act`, `/plan`, or `/act_clear_context` (all three accept an
-/// optional trailing argument). Compound inputs like `/plan review` are now
-/// recognized as a control command; use [`split_control_prefix`] to also
-/// recover the trailing argument.
+/// Parse a user prompt into a control command. Returns `None` for anything
+/// that is not `/act`, `/plan`, `/act_clear_context` (or the legacy
+/// `/clear_context`); all accept an optional trailing argument. Compound
+/// inputs like `/plan review` are recognized as a control command; use
+/// [`split_control_prefix`] to also recover the trailing argument.
 pub fn parse(prompt: &str) -> Option<ControlCmd> {
     split_control_prefix(prompt).map(|(cmd, _)| cmd)
 }
@@ -154,91 +205,134 @@ pub async fn apply(
 ) -> Result<()> {
     match cmd {
         ControlCmd::SwitchAgent(name) => {
-            if let Some(a) = resolve_agent(name) {
-                session.agent = a;
-                if name == "plan" {
-                    // Fresh plan phase: drop the counter AND any snapshot
-                    // captured in a previous phase, then persist the reset so
-                    // a resumed session does not inherit stale arming.
-                    session.reset_plan_phase();
-                    session.persist_plan_phase().await;
+            if session.harness.harness == opencoder_core::harness::Harness::Codex
+                && session.harness.thread_id.is_some()
+                && name != &session.agent.name
+            {
+                return Err(anyhow::anyhow!("Codex agent instructions are fixed for this thread; start a new session to select another agent"));
+            }
+            match resolve_agent(name) {
+                Some(a) => {
+                    // Switching to the agent already in charge is a pure no-op:
+                    // no persistence write, no AgentSwitch event, no transcript
+                    // side effects. `/act` on an act session (e.g. the second leg
+                    // of a `/plan` -> `/act` round trip) must stay silent.
+                    if session.agent.name == a.name {
+                        return Ok(());
+                    }
+                    // Replace the WHOLE agent struct and refresh the pool
+                    // snapshots (tools PATH dirs + skill roots) so subsequent
+                    // turns rebuild the system prompt from the new agent and
+                    // the skill choke points / bash PATH follow it.
+                    session.agent = a;
+                    crate::agent_pools::refresh(session);
+                    persist_agent(session, name).await?;
+                    crate::harness::prepare(session).await?;
+                    on_event(SessionEvent::AgentSwitch(name.clone()));
                 }
-                persist_agent(session, name).await?;
-                on_event(SessionEvent::AgentSwitch(name.clone()));
+                // Unknown/unresolvable name: name it in an Error event instead
+                // of silently no-opping — a typo'd `/agent <name>` must tell
+                // the user the switch did not happen. Still `Ok(())` so the
+                // drain loop consumes the input rather than retrying forever.
+                // (`/act`//`/plan` can never reach this arm: their names are
+                // builtins and always resolve.)
+                None => on_event(SessionEvent::Error(format!(
+                    "unknown agent `{name}` — switch not applied"
+                ))),
             }
         }
+        ControlCmd::AgentList => {
+            on_event(SessionEvent::Status(agent_listing(&session.agent.name)));
+        }
         ControlCmd::ClearContext => {
-            // Plan-provenance gate: only a session that IS in plan mode, or
-            // recorded plan-mode inputs earlier in this phase (the counter
-            // survives a plain `/act` switch and resets on handoff), may hand
-            // a plan forward. `handoff`'s plan extraction is phase-bounded
-            // (snapshot or plan-tagged transcript text) — in act mode with no
-            // plan provenance the previous answer ("task done") must NOT be
-            // wrapped in the plan→act directive (no-fabrication). The clear
-            // is never a full wipe though: see the preserve chain below.
-            let from_plan_mode = session.agent.kind == AgentKind::Plan
-                || session.plan_input_count > 0
-                || session.plan_snapshot.is_some();
-            let plan_display = if from_plan_mode {
-                crate::plan_handoff::handoff(session, "")
-            } else {
-                None
-            };
+            if session.harness.harness == opencoder_core::harness::Harness::Codex {
+                session.harness.thread_id = None;
+                session.harness.fork_from = None;
+                session.harness.last_input_id = None;
+                session.harness.in_flight = false;
+            }
+            let plan_to_act = session.agent.kind == AgentKind::Plan;
 
-            if plan_display.is_none() {
-                // Preserve chain (never a full blank wipe): keep the last
-                // say — the newest non-empty assistant reply — as a neutral
-                // continuity seed. Only a transcript with NO assistant
-                // content at all (a brand-new session) degrades to the blank
-                // fresh-start sentinel. NOTE: the seed deliberately diverges
-                // from the pre-653e5bd behavior of wrapping the last reply
-                // in the plan→act directive: the preserved reply travels as
-                // prior context in a neutral wrapper, never as an "execute
-                // this plan" instruction, and no PlanHandoff event fires for
-                // it. A failed-turn transcript keeps its earlier reply as the
-                // seed — prior context survives as context, never as a task.
-                //
-                // Total store messages that predate the clear (the history to
-                // trim on resume). Accounts for any in-memory-only summary.
-                let store_msg_count = session.store_message_count();
-                let preserved_images = crate::compaction::collect_head_images(&session.messages);
-                let (mut marker, boundary) =
-                    match crate::plan_handoff::final_plan_text(&session.messages) {
-                        Some(last_say) => {
-                            let last_say = last_say.trim().to_string();
-                            (seed_message(&last_say), clear_seed_marker(&last_say))
-                        }
-                        None => (fresh_start_message(), CLEAR_CONTEXT_SENTINEL.to_string()),
-                    };
-                for url in &preserved_images {
-                    marker.blocks.push(ContentBlock::Image {
-                        url: url.clone(),
-                        detail: None,
-                    });
-                }
-                session.messages = vec![marker];
-                // Record the boundary (sentinel or seed marker) so resume
-                // reconstructs the marker, not the full cleared history.
-                session.after_handoff(store_msg_count as i64, boundary);
+            // A plan clear is an execution handoff, not a neutral history
+            // fold: retain the newest real plan under HANDOFF_PREFIX so the
+            // next act turn has an explicit instruction to implement it.
+            // Other modes keep the existing neutral last-say seed contract.
+            let directive_ready =
+                plan_to_act && crate::handoff::reset_to_directive(session, "").is_some();
+            if !directive_ready {
+                fold_to_continuity_seed(session);
             }
 
-            // Clear context always switches to act.
-            if let Some(a) = resolve_agent("act") {
-                session.agent = a;
-            }
-            session.set_skill(None);
-
+            // Clear BOTH skill locks (body + names) via the shared seam: a
+            // body-only clear left `active_skill_names` stale, keeping latent
+            // tools unlocked across the clear boundary.
+            crate::skill_lifecycle::clear_skill_state(session);
+            let switched = plan_to_act.then(|| {
+                let agent = resolve_agent("act").expect("built-in act agent must exist");
+                let name = agent.name.clone();
+                session.agent = agent;
+                // Converged to a builtin: drop any file-agent pool surfaces
+                // the plan session may have carried.
+                crate::agent_pools::refresh(session);
+                name
+            });
+            // Persist the boundary and converged agent atomically so resume
+            // cannot resurrect plan mode behind an act handoff.
             persist_clear(session).await?;
-            on_event(SessionEvent::AgentSwitch("act".into()));
+            crate::harness::prepare(session).await?;
             on_event(SessionEvent::TranscriptReset(session.messages.clone()));
-            // When a plan was handed off, surface it so the display layer can
-            // render a read-only plan card (mirrors the TUI worker path).
-            if let Some(plan) = plan_display {
-                on_event(SessionEvent::PlanHandoff(plan));
+            if let Some(name) = switched {
+                on_event(SessionEvent::AgentSwitch(name));
             }
         }
     }
     Ok(())
+}
+
+/// Fold a non-plan transcript to one neutral continuity seed. This is also
+/// the plan fallback when no real assistant plan exists.
+fn fold_to_continuity_seed(session: &mut SessionState) {
+    let store_msg_count = session.store_message_count();
+    let preserved_images = crate::compaction::collect_head_images(&session.messages);
+    let (mut marker, boundary) = match crate::handoff::last_assistant_text(&session.messages) {
+        Some(last_say) => {
+            let last_say = last_say.trim().to_string();
+            (seed_message(&last_say), clear_seed_marker(&last_say))
+        }
+        None => {
+            // No assistant text in the live transcript. The common cause is a
+            // RE-clear (second Shift+Tab confirm, resume-then-clear, clear
+            // before any act output): the transcript here holds ONLY
+            // synthetic messages — the previous clear's boundary marker —
+            // which `last_assistant_text` can never see again. If that
+            // previous clear preserved a boundary (a directive display or a
+            // continuity seed in `handoff_plan`), re-fold it AS-IS instead of
+            // overwriting it with the blank sentinel: the sentinel would
+            // silently drop the preserved plan both from the UI (the Plan
+            // card rebuild filters it) and from the model. The marker
+            // rebuild mirrors resume.rs so the in-memory transcript and a
+            // later resume reconstruct the exact same flavour.
+            match session.handoff_plan.clone() {
+                Some(prev) if !prev.is_empty() && !is_clear_context_handoff(&prev) => {
+                    if is_clear_context_seed(&prev) {
+                        (seed_message(clear_seed_text(&prev)), prev)
+                    } else {
+                        (crate::handoff::handoff_message(&prev), prev)
+                    }
+                }
+                // Genuinely nothing preserved anywhere: blank fresh start.
+                _ => (fresh_start_message(), CLEAR_CONTEXT_SENTINEL.to_string()),
+            }
+        }
+    };
+    for url in &preserved_images {
+        marker.blocks.push(ContentBlock::Image {
+            url: url.clone(),
+            detail: None,
+        });
+    }
+    session.messages = vec![marker];
+    session.after_handoff(store_msg_count as i64, boundary);
 }
 
 /// Build the synthetic fresh-start marker message. Exposed so [`crate::resume`]
@@ -259,10 +353,40 @@ pub fn seed_message(text: &str) -> Message {
     msg
 }
 
+/// One-line agent listing for the bare `/agent` command: primary builtin
+/// agents plus every file-based agent card (builtins win on a name
+/// collision), the session's current agent marked with a leading `*`.
+/// Pure: filesystem access is the agents-root listing, which degrades to
+/// empty when no root exists.
+pub fn agent_listing(current: &str) -> String {
+    let mut names: Vec<String> = builtin_agents()
+        .into_iter()
+        .filter(|a| a.mode == AgentMode::Primary)
+        .map(|a| a.name)
+        .collect();
+    for name in list_agents() {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let joined = names
+        .iter()
+        .map(|n| {
+            if n == current {
+                format!("*{n}")
+            } else {
+                n.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("agents: {joined}")
+}
+
 /// Persist an agent switch to the store. Closes the latent
-/// resume-persistence gap where a mode switch via `UiCmd::SwitchAgent` (TUI
-/// key handler) was not durably recorded: the worker now calls this so
-/// `resume()` and the `/task` picker read the switched mode.
+/// resume-persistence gap where a switch via the TUI key handler was not
+/// durably recorded: the worker now calls this so `resume()` and the `/task`
+/// picker read the switched agent.
 pub async fn persist_agent(session: &SessionState, agent: &str) -> Result<()> {
     if let Some(store) = &session.store {
         store
@@ -279,23 +403,18 @@ pub async fn persist_agent(session: &SessionState, agent: &str) -> Result<()> {
     Ok(())
 }
 
-/// Persist the clear-context boundary: handoff metadata + agent = act.
+/// Persist the clear-context boundary: handoff metadata + active agent.
 async fn persist_clear(session: &SessionState) -> Result<()> {
     if let Some(store) = &session.store {
         store
             .update_session(
                 &session.id,
                 &SessionPatch {
-                    agent: Some("act".into()),
+                    agent: Some(session.agent.name.clone()),
                     handoff_seq: session.handoff_seq,
                     handoff_plan: session.handoff_plan.clone(),
                     clear_summary: true,
                     clear_skill: true,
-                    // The plan phase ended at this boundary: `after_handoff`
-                    // consumed the snapshot and reset the counter on every
-                    // clear path (plan handoff, seed, sentinel) — mirror both.
-                    clear_plan_snapshot: true,
-                    plan_input_count: Some(session.plan_input_count as i64),
                     updated_at: Some(now_ms()),
                     ..Default::default()
                 },
@@ -306,362 +425,5 @@ async fn persist_clear(session: &SessionState) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    use opencoder_core::{resolve_agent, Config, ContentBlock};
-    use opencoder_llm::{ChatStream, MockChatClient};
-    use opencoder_store::LibsqlStore;
-
-    fn make_session(store: Option<Arc<dyn opencoder_store::Store>>) -> SessionState {
-        let working_dir = std::env::temp_dir().join("opencoder-control-cmd-tests");
-        let mut s = SessionState::new(
-            "sess-ctrl",
-            resolve_agent("act").unwrap(),
-            Config::default(),
-            Arc::new(MockChatClient::new()) as Arc<dyn ChatStream>,
-            working_dir,
-        );
-        if let Some(st) = store {
-            s = s.with_store(st).mark_session_created();
-        }
-        s
-    }
-
-    #[test]
-    fn clear_context_sentinel_predicate() {
-        assert!(is_clear_context_handoff(CLEAR_CONTEXT_SENTINEL));
-        assert!(!is_clear_context_handoff("## Plan\n1. do X"));
-        assert!(!is_clear_context_handoff(""));
-    }
-
-    #[test]
-    fn parse_exact_matches() {
-        assert_eq!(parse("/act"), Some(ControlCmd::SwitchAgent("act".into())));
-        assert_eq!(parse("/plan"), Some(ControlCmd::SwitchAgent("plan".into())));
-        assert_eq!(parse("/act_clear_context"), Some(ControlCmd::ClearContext));
-    }
-
-    #[test]
-    fn parse_trims_whitespace() {
-        assert_eq!(
-            parse("  /plan  "),
-            Some(ControlCmd::SwitchAgent("plan".into()))
-        );
-        assert_eq!(
-            parse("\t/act\n"),
-            Some(ControlCmd::SwitchAgent("act".into()))
-        );
-    }
-
-    #[test]
-    fn parse_rejects_non_matches() {
-        assert_eq!(parse("/act "), Some(ControlCmd::SwitchAgent("act".into()))); // trailing ws ok
-        assert_eq!(parse("/acting"), None);
-        assert_eq!(parse("/act_clear"), None);
-        assert_eq!(parse("hello"), None);
-        assert_eq!(parse(""), None);
-        assert_eq!(parse("/compact"), None);
-    }
-
-    #[test]
-    fn split_compound_plan_returns_rest() {
-        let (cmd, rest) = split_control_prefix("/plan review the code").unwrap();
-        assert_eq!(cmd, ControlCmd::SwitchAgent("plan".into()));
-        assert_eq!(rest.as_deref(), Some("review the code"));
-    }
-
-    #[test]
-    fn split_compound_act_returns_rest() {
-        let (cmd, rest) = split_control_prefix("/act do thing").unwrap();
-        assert_eq!(cmd, ControlCmd::SwitchAgent("act".into()));
-        assert_eq!(rest.as_deref(), Some("do thing"));
-    }
-
-    #[test]
-    fn split_bare_command_returns_none_rest() {
-        let (cmd, rest) = split_control_prefix("/plan").unwrap();
-        assert_eq!(cmd, ControlCmd::SwitchAgent("plan".into()));
-        assert!(rest.is_none(), "bare command has no rest");
-    }
-
-    #[test]
-    fn split_trims_whitespace_no_rest() {
-        let (cmd, rest) = split_control_prefix("  /act  ").unwrap();
-        assert_eq!(cmd, ControlCmd::SwitchAgent("act".into()));
-        assert!(rest.is_none());
-    }
-
-    #[test]
-    fn split_clear_context_takes_no_args() {
-        let (cmd, rest) = split_control_prefix("/act_clear_context").unwrap();
-        assert_eq!(cmd, ControlCmd::ClearContext);
-        assert!(rest.is_none());
-    }
-
-    #[test]
-    fn split_clear_context_compound_returns_rest() {
-        // `/act_clear_context review` is now a compound command: ClearContext
-        // with "review" as the trailing prompt to run in the fresh context.
-        let (cmd, rest) = split_control_prefix("/act_clear_context review").unwrap();
-        assert_eq!(cmd, ControlCmd::ClearContext);
-        assert_eq!(rest.as_deref(), Some("review"));
-    }
-
-    #[test]
-    fn split_rejects_non_commands() {
-        assert_eq!(split_control_prefix("/acting"), None);
-        assert_eq!(split_control_prefix("/act_clear"), None);
-        assert_eq!(split_control_prefix("hello world"), None);
-        assert_eq!(split_control_prefix(""), None);
-        assert_eq!(split_control_prefix("/compact"), None);
-    }
-
-    #[test]
-    fn mode_control_predicate_covers_bare_and_compound_commands_only() {
-        for prompt in ["/act", "  /plan review  ", "/act_clear_context continue"] {
-            assert!(is_mode_control(prompt), "missed {prompt:?}");
-        }
-        for prompt in ["", "continue", "/acting", "/compact"] {
-            assert!(!is_mode_control(prompt), "false positive {prompt:?}");
-        }
-    }
-
-    #[test]
-    fn split_preserves_dollar_tokens_in_rest() {
-        // `$skill` tokens survive in the rest for downstream skill resolution.
-        let (cmd, rest) = split_control_prefix("/plan $review do it").unwrap();
-        assert_eq!(cmd, ControlCmd::SwitchAgent("plan".into()));
-        assert_eq!(rest.as_deref(), Some("$review do it"));
-    }
-
-    #[test]
-    fn parse_compound_recognized_as_command() {
-        // The fix: parse now returns the command for compound inputs.
-        assert_eq!(
-            parse("/plan review"),
-            Some(ControlCmd::SwitchAgent("plan".into()))
-        );
-    }
-
-    fn collect_events(session: &mut SessionState, cmd: ControlCmd) -> Vec<SessionEvent> {
-        let mut evs = Vec::new();
-        let mut on_event = |ev: SessionEvent| evs.push(ev);
-        let _ = futures::executor::block_on(apply(session, &cmd, &mut on_event));
-        evs
-    }
-
-    #[tokio::test]
-    async fn apply_switch_agent_changes_agent_and_emits() {
-        let store =
-            Arc::new(LibsqlStore::open_memory().await.unwrap()) as Arc<dyn opencoder_store::Store>;
-        store
-            .create_session(&opencoder_store::SessionMeta {
-                id: "sess-ctrl".into(),
-                agent: Some("act".into()),
-                created_at: 0,
-                updated_at: 0,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let mut session = make_session(Some(store.clone()));
-
-        let evs = collect_events(&mut session, ControlCmd::SwitchAgent("plan".into()));
-        assert_eq!(session.agent.name, "plan");
-        assert!(evs
-            .iter()
-            .any(|e| matches!(e, SessionEvent::AgentSwitch(a) if a == "plan")));
-
-        // Persisted to the store.
-        let meta = store.get_session(&session.id).await.unwrap().unwrap();
-        assert_eq!(meta.agent.as_deref(), Some("plan"));
-    }
-
-    #[tokio::test]
-    async fn apply_clear_context_collapses_and_emits() {
-        // A finalized plan exists -> ClearContext preserves it via plan->act
-        // handoff rather than wiping to a blank fresh-start.
-        let store =
-            Arc::new(LibsqlStore::open_memory().await.unwrap()) as Arc<dyn opencoder_store::Store>;
-        store
-            .create_session(&opencoder_store::SessionMeta {
-                id: "sess-ctrl".into(),
-                agent: Some("plan".into()),
-                created_at: 0,
-                updated_at: 0,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let mut session = make_session(Some(store.clone()));
-        // Start in plan mode with some history. Routed through `record` so the
-        // assistant text lands in the phase-bounded `plan_snapshot` (the only
-        // plan source `handoff` accepts).
-        session.agent = resolve_agent("plan").unwrap();
-        session.record(Message::user("u1", "hello")).await;
-        let mut a = Message::assistant("a1");
-        a.blocks.push(ContentBlock::text("plan text"));
-        session.record(a).await;
-
-        let evs = collect_events(&mut session, ControlCmd::ClearContext);
-
-        assert_eq!(
-            session.messages.len(),
-            1,
-            "transcript collapses to 1 handoff marker"
-        );
-        assert_eq!(session.agent.name, "act", "switches to act");
-        assert!(session.handoff_seq.is_some(), "handoff_seq set");
-        // The plan is preserved, not replaced by the blank sentinel.
-        assert_eq!(session.handoff_plan.as_deref(), Some("plan text"));
-        assert!(
-            session.messages[0].text().contains("plan text"),
-            "marker carries the preserved plan"
-        );
-
-        let has_switch = evs
-            .iter()
-            .any(|e| matches!(e, SessionEvent::AgentSwitch(a) if a == "act"));
-        let has_reset = evs
-            .iter()
-            .any(|e| matches!(e, SessionEvent::TranscriptReset(_)));
-        let has_handoff = evs
-            .iter()
-            .any(|e| matches!(e, SessionEvent::PlanHandoff(p) if p == "plan text"));
-        assert!(has_switch, "AgentSwitch(act) emitted");
-        assert!(has_reset, "TranscriptReset emitted");
-        assert!(has_handoff, "PlanHandoff emitted carrying the plan");
-        // AgentSwitch must come before TranscriptReset.
-        let switch_idx = evs
-            .iter()
-            .position(|e| matches!(e, SessionEvent::AgentSwitch(_)));
-        let reset_idx = evs
-            .iter()
-            .position(|e| matches!(e, SessionEvent::TranscriptReset(_)));
-        assert!(switch_idx < reset_idx, "AgentSwitch before TranscriptReset");
-    }
-
-    #[tokio::test]
-    async fn apply_clear_context_no_plan_falls_back_to_fresh_start() {
-        // No assistant plan text exists -> ClearContext falls back to the blank
-        // fresh-start sentinel path (no plan to hand off).
-        let mut session = make_session(None);
-        session.messages.push(Message::user("u1", "hello"));
-        session.messages.push(Message::user("u2", "still no plan"));
-
-        let evs = collect_events(&mut session, ControlCmd::ClearContext);
-
-        assert_eq!(
-            session.messages.len(),
-            1,
-            "transcript collapses to 1 fresh-start marker"
-        );
-        assert_eq!(session.agent.name, "act", "switches to act");
-        assert!(session.handoff_seq.is_some(), "handoff_seq set");
-        // No plan -> blank sentinel stored so resume reconstructs fresh-start.
-        assert_eq!(
-            session.handoff_plan.as_deref(),
-            Some(CLEAR_CONTEXT_SENTINEL),
-        );
-        assert!(
-            session.messages[0].text().contains("Context cleared"),
-            "marker is the blank fresh-start"
-        );
-
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, SessionEvent::AgentSwitch(a) if a == "act")),
-            "AgentSwitch(act) emitted"
-        );
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, SessionEvent::TranscriptReset(_))),
-            "TranscriptReset emitted"
-        );
-        assert!(
-            !evs.iter()
-                .any(|e| matches!(e, SessionEvent::PlanHandoff(_))),
-            "no PlanHandoff when there is no plan"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_clear_context_clears_skill_in_store() {
-        // Regression: /act_clear_context cleared the in-memory skill but left
-        // the store's `skill` column populated, so resume() reloaded a stale
-        // skill. Both layers must now be empty after the clear.
-        let store =
-            Arc::new(LibsqlStore::open_memory().await.unwrap()) as Arc<dyn opencoder_store::Store>;
-        store
-            .create_session(&opencoder_store::SessionMeta {
-                id: "sess-ctrl".into(),
-                agent: Some("plan".into()),
-                skill: Some("reviewer".into()),
-                created_at: 0,
-                updated_at: 0,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let mut session = make_session(Some(store.clone()));
-        session.agent = resolve_agent("plan").unwrap();
-        session.messages.push(Message::user("u1", "hello"));
-        let mut a = Message::assistant("a1");
-        a.blocks.push(ContentBlock::text("plan text"));
-        session.messages.push(a);
-        // A skill is active both in the store and in memory.
-        session.set_skill(Some("reviewer".into()));
-        assert_eq!(session.skill_prompt_cloned().as_deref(), Some("reviewer"));
-
-        let _ = collect_events(&mut session, ControlCmd::ClearContext);
-
-        // In-memory skill cleared.
-        assert_eq!(
-            session.skill_prompt_cloned(),
-            None,
-            "in-memory skill must be cleared"
-        );
-        // Persisted skill cleared -- the exact regression this guards.
-        let persisted = store.get_session("sess-ctrl").await.unwrap().unwrap();
-        assert_eq!(
-            persisted.skill, None,
-            "store skill must be NULL after clear-context (resume must not reload it)"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_clear_context_with_no_skill_is_harmless() {
-        // No skill was ever set: clearing must be a no-op, never panic/error.
-        let store =
-            Arc::new(LibsqlStore::open_memory().await.unwrap()) as Arc<dyn opencoder_store::Store>;
-        store
-            .create_session(&opencoder_store::SessionMeta {
-                id: "sess-ctrl".into(),
-                agent: Some("plan".into()),
-                created_at: 0,
-                updated_at: 0,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let mut session = make_session(Some(store.clone()));
-        session.agent = resolve_agent("plan").unwrap();
-        session.messages.push(Message::user("u1", "hello"));
-
-        let _ = collect_events(&mut session, ControlCmd::ClearContext);
-
-        assert_eq!(session.skill_prompt_cloned(), None);
-        let persisted = store.get_session("sess-ctrl").await.unwrap().unwrap();
-        assert_eq!(persisted.skill, None, "skill stays None");
-    }
-
-    #[test]
-    fn apply_switch_noop_for_unknown_agent() {
-        let mut session = make_session(None);
-        let evs = collect_events(&mut session, ControlCmd::SwitchAgent("nonexistent".into()));
-        assert_eq!(session.agent.name, "act", "unchanged");
-        assert!(evs.is_empty(), "no events for unknown agent");
-    }
-}
+#[path = "control_cmd_tests.rs"]
+mod tests;

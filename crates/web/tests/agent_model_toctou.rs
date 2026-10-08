@@ -54,12 +54,17 @@ async fn state(sid: &str) -> (Arc<opencoder_web::AppState>, Arc<SessionHandle>) 
     handles.lock().await.insert(sid.into(), handle.clone());
     (
         Arc::new(opencoder_web::AppState {
+            config_home: None,
             client_override: None,
+            brain: opencoder_web::api_brain::mock_brain(store.clone()),
             store,
             workdir: std::env::temp_dir(),
             handles,
 
             nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+            controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+            team: opencoder_web::team_state::mock(),
+            project: opencoder_web::ProjectService::new(),
         }),
         handle,
     )

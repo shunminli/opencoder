@@ -165,8 +165,7 @@ async fn seed(state: &opencoder_web::AppState, sid: &str) {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();
@@ -192,11 +191,16 @@ async fn overlap_window_event_is_deduped_once() {
         seeded: AtomicBool::new(false),
     });
     let state = Arc::new(opencoder_web::AppState {
+        config_home: None,
         client_override: None,
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store,
         workdir: std::env::temp_dir(),
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
     });
     seed(&state, sid).await;
 

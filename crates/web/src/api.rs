@@ -18,6 +18,7 @@ use tracing::warn;
 
 use opencoder_core::Config;
 use opencoder_llm::{ChatClient, ChatStream};
+use opencoder_session::SessionEvent;
 use opencoder_store::{Delivery, EventKind, SessionFilter, SessionMeta, SessionPatch};
 
 use crate::handle::{admit_and_drain_guarded, AdmissionError, SseEvt};
@@ -25,6 +26,9 @@ use crate::AppState;
 
 #[derive(Deserialize)]
 pub struct CreateBody {
+    harness: Option<opencoder_core::harness::Harness>,
+    #[serde(default)]
+    envs: std::collections::BTreeMap<String, String>,
     agent: Option<String>,
     model: Option<String>,
 }
@@ -33,10 +37,18 @@ pub async fn create_session(
     State(state): State<Arc<AppState>>,
     body: Option<Json<CreateBody>>,
 ) -> impl IntoResponse {
+    if let Some(body) = &body {
+        for (key, value) in &body.envs {
+            if let Err(e) = opencoder_core::harness::validate_env(key, value) {
+                return error_400(e);
+            }
+        }
+    }
     let id = opencoder_session::runner::new_id();
     let now = opencoder_core::message::now_ms();
     let meta = SessionMeta {
         id: id.clone(),
+        kind: None,
         title: None,
         agent: body
             .as_ref()
@@ -58,11 +70,22 @@ pub async fn create_session(
         skill: None,
         task_type: None,
         requirement: None,
-        plan_snapshot: None,
-        plan_input_count: 0,
     };
     if let Err(e) = state.store.create_session(&meta).await {
         return error_500(format!("create_session: {e:#}"));
+    }
+    let selection = body.as_ref().and_then(|b| b.harness);
+    let envs = body.as_ref().map(|b| b.envs.clone()).unwrap_or_default();
+    if let Err(e) = opencoder_session::harness::initialize(
+        state.store.as_ref(),
+        &id,
+        meta.agent.as_deref().unwrap_or("act"),
+        selection,
+        envs,
+    )
+    .await
+    {
+        return error_400(e.to_string());
     }
     Json(json!({ "id": id })).into_response()
 }
@@ -80,7 +103,7 @@ pub struct ListQuery {
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListQuery>,
-) -> Result<Response, Response> {
+) -> Response {
     let filter = SessionFilter {
         limit: q.limit.unwrap_or(50).clamp(1, 500),
         cursor: q.cursor,
@@ -90,13 +113,13 @@ pub async fn list_sessions(
             .map(|w| opencoder_core::workdir_hash(std::path::Path::new(w))),
         search: q.search,
         include_subagents: false,
+        kind: None,
     };
-    let items = state
-        .store
-        .list_sessions(&filter)
-        .await
-        .map_err(|e| error_500(format!("list_sessions: {e:#}")))?;
-    Ok(Json(json!({ "sessions": items })).into_response())
+    let items = match state.store.list_sessions(&filter).await {
+        Ok(items) => items,
+        Err(e) => return error_500(format!("list_sessions: {e:#}")),
+    };
+    Json(json!({ "sessions": items })).into_response()
 }
 
 pub async fn get_session(
@@ -150,22 +173,41 @@ pub async fn get_messages(
     messages_response(&state, &id).await
 }
 
-async fn messages_response(state: &AppState, id: &str) -> Result<Response, Response> {
+async fn messages_response(state: &AppState, id: &str) -> Response {
     let meta = match state.store.get_session(id).await {
         Ok(m) => m,
-        Err(e) => return Err(error_500(format!("get_session: {e:#}"))),
+        Err(e) => return error_500(format!("get_session: {e:#}")),
     };
-    let messages = state
-        .store
-        .load_messages(id)
+    let messages = match state.store.load_messages(id).await {
+        Ok(messages) => messages,
+        Err(e) => return error_500(format!("load_messages: {e:#}")),
+    };
+    // Run-state flag for the console: lets a client tell "stream live" from
+    // "stream ended" without inferring from frames (found by real-browser
+    // acceptance of the interrupt/reconnect flow).
+    let draining = state
+        .handles
+        .lock()
         .await
-        .map_err(|e| error_500(format!("load_messages: {e:#}")))?;
-    Ok(Json(json!({ "id": id, "meta": meta, "messages": messages })).into_response())
+        .get(id)
+        .map(|h| h.draining.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false);
+    let harness = match state.store.harness_runtime(id).await {
+        Ok(runtime) => runtime.unwrap_or_default().harness,
+        Err(e) => return error_500(format!("harness state: {e:#}")),
+    };
+    Json(json!({ "id": id, "meta": meta, "harness": harness, "messages": messages, "draining": draining }))
+        .into_response()
 }
 
 #[derive(Deserialize)]
 pub struct PromptBody {
     pub prompt: String,
+    /// Verbatim user input when the execution adds an internal preamble.
+    pub display: Option<String>,
+    /// Optional idempotency key scoped to this session. An identical retry
+    /// returns the first admitted row; reusing it for another prompt is 409.
+    pub input_id: Option<String>,
     /// Optional image attachments as data URIs (`data:image/<fmt>;base64,...`)
     /// or `http(s)://` URLs. Forwarded to `SessionInput.images` so vision
     /// models receive them. Empty/absent for plain-text prompts.
@@ -193,6 +235,7 @@ pub struct SubagentSteerBody {
 pub async fn post_prompt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    runtime_config: Option<axum::Extension<Config>>,
     Json(mut body): Json<PromptBody>,
 ) -> Response {
     if let Some(resp) = reject_node_session(&state, &id).await {
@@ -200,8 +243,8 @@ pub async fn post_prompt(
     }
     // Only an explicit `agent` field is an admission-time mode change: it
     // rewrites the session config, so it must be refused while a drain runs.
-    // Textual mode commands (/plan, /act, /act_clear_context) are admitted
-    // like any prompt — the runner applies them at the next idle/turn
+    // Textual control commands (/plan, /act, /act_clear_context) are
+    // admitted like any prompt — the runner applies them at the next idle/turn
     // boundary, which structurally has no turn in flight.
     let agent_override = body.agent.is_some();
     // Fast-path an already-running agent-field request before config/client
@@ -218,11 +261,33 @@ pub async fn post_prompt(
     {
         return error_409("mode switch refused while drain running");
     }
-    let mut config = match Config::load(&state.workdir) {
+    let mut config = match crate::api_ops::load_config(&state, runtime_config) {
         Ok(c) => c,
-        Err(e) => return error_500(format!("config: {e:#}")),
+        Err(response) => return *response,
     };
-    if let Some(resp) = crate::api_ops::apply_prompt_model(&mut config, body.model.take()) {
+    let runtime = match state.store.harness_runtime(&id).await {
+        Ok(runtime) => runtime.unwrap_or_default(),
+        Err(e) => return error_500(format!("harness state: {e:#}")),
+    };
+    let harness = runtime.harness;
+    if harness == opencoder_core::harness::Harness::Codex {
+        if body
+            .model
+            .as_ref()
+            .is_some_and(|model| Some(model) != runtime.model.as_ref())
+        {
+            return error_409("Codex model is fixed when the session starts");
+        }
+        if let Some(agent) = &body.agent {
+            match state.store.get_session(&id).await {
+                Ok(Some(meta)) if meta.agent.as_ref() != Some(agent) => {
+                    return error_409("Codex agent is fixed when the session starts")
+                }
+                Err(e) => return error_500(format!("session: {e:#}")),
+                _ => {}
+            }
+        }
+    } else if let Some(resp) = crate::api_ops::apply_prompt_model(&mut config, body.model.take()) {
         return resp;
     }
     if let Some(a) = &body.agent {
@@ -232,18 +297,15 @@ pub async fn post_prompt(
     // `ChatClient` from config + the resolved API key (production).
     let client: Arc<dyn ChatStream> = match state.client_override.clone() {
         Some(c) => c,
+        None if harness == opencoder_core::harness::Harness::Codex => {
+            opencoder_session::harness::configured_client(config.clone())
+        }
         None => {
             let ep = match config.resolve_endpoint() {
                 Ok(v) => v,
                 Err(e) => return error_500(format!("api_key: {e:#}")),
             };
-            match ChatClient::new_with_read_timeout(
-                &ep.base_url,
-                &ep.api_key,
-                &ep.headers,
-                config.stream_idle_timeout(),
-                config.network.proxy.as_deref(),
-            ) {
+            match ChatClient::from_config(&config, &ep) {
                 Ok(c) => Arc::new(c),
                 Err(e) => return error_500(format!("client: {e:#}")),
             }
@@ -276,14 +338,23 @@ pub async fn post_prompt(
         delivery,
         client,
         state.workdir.clone(),
+        state.config_home.clone(),
         config,
+        body.input_id,
         body.skill,
+        body.display,
         agent_override,
     )
     .await
     {
-        Ok(seq) => Json(json!({ "admitted_seq": seq, "ok": true })).into_response(),
+        Ok(admission) => Json(json!({
+            "admitted_seq": admission.seq,
+            "driver_ensured": admission.driver_ensured,
+            "ok": true
+        }))
+        .into_response(),
         Err(AdmissionError::BusyModeSwitch) => error_409("mode switch refused while drain running"),
+        Err(AdmissionError::InputConflict(e)) => error_409(&e.to_string()),
         Err(AdmissionError::Other(e)) => error_500(format!("admit: {e:#}")),
     }
 }
@@ -303,6 +374,7 @@ async fn ensure_session_row(
     state
         .store
         .create_session(&SessionMeta {
+            kind: None,
             id: id.to_string(),
             title: Some(prompt.chars().take(80).collect()),
             agent: Some(config.agent.default.clone()),
@@ -321,8 +393,6 @@ async fn ensure_session_row(
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
         })
         .await
         .map_err(|e| format!("create_session: {e:#}"))
@@ -348,14 +418,33 @@ pub async fn post_agent(
     if handle.draining.load(Ordering::SeqCst) {
         return error_409("agent switch refused while drain running");
     }
-    let plan_input_count = (body.value == "plan").then_some(0);
+    if let Some(response) = crate::api_ops::reject_codex_override(&state, &id).await {
+        return response;
+    }
+    // The switch surface carries the primary agents only: `act` (default),
+    // `plan` (read-only), and `command` (one-shot). `workflow` resolves as a
+    // Primary builtin but is the TODO-internal scheduler — excluded here the
+    // same way every other consumer computes its primary set (`GET
+    // /api/agents`'s `primary` field, the TUI `/agent` picker). The interlude
+    // `sandbox` name no longer resolves (`resolve_agent("sandbox")` is None;
+    // the store normalizes stored rows to `plan` on read), and subagent kinds
+    // (explore/build) are unreachable as a session's primary agent — all of
+    // them get the standard unknown-agent 400 before any persistence or
+    // handle mutation.
+    if !opencoder_core::resolve_agent(&body.value)
+        .is_some_and(|a| a.is_primary() && a.name != "workflow")
+    {
+        return error_400(format!(
+            "unknown agent {:?}: expected a builtin primary agent (act/plan/command) or a registered file agent name",
+            body.value
+        ));
+    }
     if let Err(e) = state
         .store
         .update_session(
             &id,
             &SessionPatch {
                 agent: Some(body.value.clone()),
-                plan_input_count,
                 updated_at: Some(opencoder_core::message::now_ms()),
                 ..Default::default()
             },
@@ -365,6 +454,17 @@ pub async fn post_agent(
         return error_500(format!("update_session: {e:#}"));
     }
     handle.overrides.lock().await.agent = Some(body.value.clone());
+    // TUI parity (worker.rs control_cmd): a switch is a visible event. Live
+    // SSE subscribers get the frame; the append keeps replay faithful
+    // (reduce.js renders `agent_switched`). Idle-only by the 409 above, so
+    // the append cannot interleave with a run's event sequence.
+    crate::handle::broadcast_persist_event(
+        &state.store,
+        &handle,
+        &id,
+        SessionEvent::AgentSwitch(body.value.clone()),
+    )
+    .await;
     Json(json!({ "ok": true, "agent": body.value })).into_response()
 }
 
@@ -394,6 +494,9 @@ pub async fn post_model(
         crate::handle_lifecycle::lock_session_lifecycle(&state.handles, &id).await;
     if handle.draining.load(Ordering::SeqCst) {
         return error_409("model switch refused while drain running");
+    }
+    if let Some(response) = crate::api_ops::reject_codex_override(&state, &id).await {
+        return response;
     }
     // Keep the old value only for a global-config save failure rollback.
     let old_model = match state.store.get_session(&id).await {
@@ -428,6 +531,14 @@ pub async fn post_model(
         }
     }
     handle.overrides.lock().await.model = Some(body.value.clone());
+    // TUI parity: same broadcast+persist contract as POST /agent above.
+    crate::handle::broadcast_persist_event(
+        &state.store,
+        &handle,
+        &id,
+        SessionEvent::ModelSwitch(body.value.clone()),
+    )
+    .await;
     Json(json!({ "ok": true, "model": body.value })).into_response()
 }
 
@@ -627,6 +738,16 @@ pub(crate) fn error_500(msg: String) -> Response {
         .into_response()
 }
 
+/// 502 Bad Gateway: the node (our upstream) answered the relay with a
+/// failure. Used by the P3 message relay; the payload is never persisted.
+pub(crate) fn error_502(msg: String) -> Response {
+    (
+        axum::http::StatusCode::BAD_GATEWAY,
+        Json(json!({ "ok": false, "error": msg })),
+    )
+        .into_response()
+}
+
 pub(crate) fn event_kind_str(k: EventKind) -> &'static str {
     match k {
         EventKind::PromptAdmitted => "prompt_admitted",
@@ -648,7 +769,13 @@ pub(crate) fn event_kind_str(k: EventKind) -> &'static str {
 /// to be silently dropped (`r.ok()`), which could swallow a terminal
 /// `done`/`error` event and freeze the UI (busy never resets). Now it is
 /// surfaced as a synthetic `error` event so the client knows it must re-sync.
-/// Pure so the lag handling is directly unit-testable.
+///
+/// The `lag` field is a wire CONTRACT with the SPA (`spa/src/sse.js`): a lag
+/// frame means "this consumer fell behind, re-connect from the persisted
+/// head" — the run itself is usually still fine. Without the marker the client
+/// cannot distinguish this recoverable case from a terminal run error and
+/// would close the stream for good. Pure so the lag handling is directly
+/// unit-testable.
 pub fn map_broadcast_result(
     r: Result<SseEvt, tokio_stream::wrappers::errors::BroadcastStreamRecvError>,
 ) -> Option<SseEvt> {
@@ -656,7 +783,7 @@ pub fn map_broadcast_result(
         Ok(evt) => Some(evt),
         Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => Some(SseEvt {
             kind: "error".into(),
-            data: json!({ "error": format!("event lag: {n} events dropped") }),
+            data: json!({ "error": format!("event lag: {n} events dropped"), "lag": n }),
             ts: opencoder_core::message::now_ms(),
             seq: None,
         }),

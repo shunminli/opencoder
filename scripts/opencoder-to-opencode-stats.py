@@ -157,6 +157,10 @@ def compute_session_payload(session, messages):
     """
     target_id = "enc_" + session["id"]
     model_json = parse_model(session.get("model"))
+    # Per-message model wins; session model is only the fallback. Message-level
+    # `messages.model` is authoritative: sessions with NULL model (subagents)
+    # and sessions that switched models mid-run would otherwise be mis- or
+    # un-attributed (e.g. glm-5.3-flash usage landing in "unknown"/"glm-5.3").
 
     msg_payloads = []
     tokens_list = []
@@ -167,6 +171,7 @@ def compute_session_payload(session, messages):
             continue
         msg_id = target_id + "_" + msg["id"]
         ts = int(msg.get("created_at", 0) or 0)
+        msg_model = parse_model(msg.get("model") or session.get("model"))
         msg_payloads.append({
             "msg_id": msg_id,
             "part_id": msg_id + "_sf",
@@ -179,8 +184,8 @@ def compute_session_payload(session, messages):
                 "path": {"cwd": "/", "root": "/"},
                 "cost": 0,
                 "tokens": tok,
-                "modelID": model_json["id"],
-                "providerID": model_json["providerID"],
+                "modelID": msg_model["id"],
+                "providerID": msg_model["providerID"],
                 "time": {"created": ts, "completed": ts},
                 "finish": "stop",
             },
@@ -316,11 +321,21 @@ def connect_target(db_path=OPENCODE_DB, read_only=False):
     return conn
 
 def collect_changes(encoder_dir, offset):
-    """Return list of (db_path, session_dict) for changed sessions."""
+    """Return list of (db_path, session_dict) for changed sessions.
+
+    Tolerates empty/uninitialized per-project DBs (0-byte files with no
+    tables): skip them with a warning instead of failing the whole run,
+    which would freeze the watermark and starve opencode.db (and kaboo's
+    opencode tool type) until the stray file is removed.
+    """
     changes = []
     for db in find_encoder_dbs(encoder_dir):
-        for sess in read_changed_sessions(db, offset):
-            changes.append((db, sess))
+        try:
+            for sess in read_changed_sessions(db, offset):
+                changes.append((db, sess))
+        except sqlite3.Error as exc:
+            print(f"[sync] WARN: skipping unreadable source {db}: {exc}",
+                  file=sys.stderr)
     return changes
 
 def run(args):
@@ -340,7 +355,12 @@ def run(args):
     skipped = 0
     max_updated = offset
     for db, sess in changes:
-        msgs = read_assistant_messages(db, sess["id"])
+        try:
+            msgs = read_assistant_messages(db, sess["id"])
+        except sqlite3.Error as exc:
+            print(f"[sync] WARN: skipping session {sess.get('id')} in {db}: {exc}",
+                  file=sys.stderr)
+            continue
         max_updated = max(max_updated, int(sess.get("updated_at", 0) or 0))
         p = compute_session_payload(sess, msgs)
         if p is None:

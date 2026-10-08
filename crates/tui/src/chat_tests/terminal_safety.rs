@@ -21,7 +21,8 @@ fn thinking_delta_is_sanitized_once_before_it_reaches_rendering() {
     view.apply(&SessionEvent::ReasoningDelta(
         "old\rNEW\x08\x1b[2J\u{009b}31m\tline".into(),
     ));
-    view.toggle_thinking_at(0);
+    view.toggle_tool_call_at(0, 0);
+    view.toggle_tool_call_at(0, 1);
 
     let text = flattened_text(&view);
     assert_no_terminal_controls(&text);
@@ -45,7 +46,10 @@ fn every_dynamic_chat_block_uses_the_same_terminal_safety_boundary() {
         is_error: false,
         images: Vec::new(),
     });
-    view.toggle_tool_at(1);
+    // Cycle a step open/closed (net closed): dirty content must survive the
+    // toggle path untouched.
+    view.toggle_tool_call_at(1, 0);
+    view.toggle_tool_call_at(1, 0);
     view.apply(&SessionEvent::CompactionDelta(dirty.into()));
     view.apply(&SessionEvent::Status(dirty.into()));
     view.apply(&SessionEvent::Error(dirty.into()));

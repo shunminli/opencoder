@@ -27,33 +27,25 @@
 //!
 //! When frontmatter is absent the name falls back to the file/dir stem and the
 //! description to the first non-empty, non-heading body line.
+//!
+//! Discovery is multi-root with first-wins shadowing ([`discover_all`]):
+//! skills are discovered from the global `~/.opencoder/skills` (历史上还会
+//! 先扫激活 agent 的私有技能池，全局激活 agent 移除后只保留全局根).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
-/// Cache entry: the (path, mtime) fingerprint captured at discovery time plus
-/// the discovered skills behind an Arc so hits clone cheaply.
-struct DiscoverCacheEntry {
-    files: Vec<(PathBuf, SystemTime)>,
-    skills: Arc<Vec<Skill>>,
-}
+/// Multi-root discovery cache (single-entry, keyed on the ordered root
+/// list, invalidated by a combined (path, mtime) fingerprint) — split into
+/// [`skill_cache`] to respect this file's line budget. `discover_cached`
+/// is re-exported so callers keep importing it from here.
+mod skill_cache;
 
-/// Process-level discovery cache, keyed on the single most recently scanned
-/// root.
-///
-/// Purpose: the UI submit path (`skill_persist::resolve_persist`) calls
-/// [`discover`] on every Enter/Tab submit, which without this cache means a
-/// full `read_to_string` sweep of the skills directory per keypress. With the
-/// cache, a hit costs one `read_dir` plus N `stat` calls and never reads a
-/// skill file. Invalidation is exact: any (path, mtime) change in the watched
-/// file set (see [`fingerprint`]) makes the next call a miss and forces a
-/// rescan. [`discover_in`] stays uncached so tests pointing at tempdirs
-/// always observe the real directory.
-static DISCOVER_CACHE: Mutex<Option<(PathBuf, DiscoverCacheEntry)>> = Mutex::new(None);
+pub use skill_cache::discover_cached;
 
+mod runtime;
 mod seed;
+pub use runtime::{execution_root, pin_runtime_skills, with_execution};
 
 pub use seed::{
     seed_builtin_skills, seed_builtin_skills_in, seed_dep_gated_skills, seed_dep_gated_skills_in,
@@ -69,52 +61,41 @@ pub struct Skill {
     pub source: PathBuf,
 }
 
-/// Default discovery root: the binary's own global config home
-/// (`~/.opencoder/skills`). `None` when no home directory can be resolved
-/// (no `HOME`, no passwd entry): callers must skip skill features gracefully
-/// — the old behavior of falling back to a *relative* `./.opencoder/skills`
-/// made seeding write into whatever the current working directory happened
-/// to be, so it is deliberately gone.
+/// Default discovery root, in priority order:
+///
+/// 1. the execution-scoped root (`skill::runtime::with_execution`) — an
+///    operator execution's frozen `<home>/.opencoder/skills`;
+/// 2. the node-level pinned runtime snapshot (once per runtime, mirrors the
+///    user's global dir at startup);
+/// 3. the real `~/.opencoder/skills` for interactive processes.
+///
+/// `None` only when no root can be resolved (no `HOME`, no passwd entry):
+/// callers must skip skill features gracefully — the old behavior of
+/// falling back to a *relative* `./.opencoder/skills` made seeding write
+/// into whatever the current working directory happened to be, so it is
+/// deliberately gone.
 pub fn skills_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".opencoder").join("skills"))
+    runtime::execution_root()
+        .or_else(runtime::pinned_root)
+        .or_else(|| crate::platform::home_dir().map(|h| h.join(".opencoder").join("skills")))
 }
 
-/// Scan `~/.opencoder/skills` and return every skill found, sorted by name.
+/// Production discovery: scan the global `~/.opencoder/skills` through the
+/// cache (see [`production_skill_roots`] and [`discover_all`]).
 ///
 /// A missing or unreadable directory is not an error — it yields an empty
 /// `Vec`, so the TUI picker simply reports "no skills" instead of crashing.
-/// A missing home directory likewise yields an empty `Vec`.
+/// No home directory likewise yields an empty `Vec`.
 pub fn discover() -> Vec<Skill> {
-    skills_dir()
-        .map(|root| discover_cached(&root))
-        .unwrap_or_default()
+    discover_cached(&production_skill_roots())
 }
 
-/// Cached variant of [`discover_in`] for hot paths: returns the previously
-/// discovered skills when `root` matches the cached root and its
-/// [`fingerprint`] is unchanged, otherwise rescans via [`discover_in`] and
-/// refreshes the cache. The lock is never held across the rescan itself, so
-/// concurrent callers never serialize on file I/O.
-pub fn discover_cached(root: &Path) -> Vec<Skill> {
-    let files = fingerprint(root);
-    {
-        let cache = DISCOVER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached_root, entry)) = cache.as_ref() {
-            if cached_root == root && entry.files == files {
-                return entry.skills.as_ref().clone();
-            }
-        }
-    }
-    let skills = discover_in(root);
-    let mut cache = DISCOVER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    *cache = Some((
-        root.to_path_buf(),
-        DiscoverCacheEntry {
-            files,
-            skills: Arc::new(skills.clone()),
-        },
-    ));
-    skills
+/// Ordered production root list behind [`discover`]: the global skills
+/// dir. Historical versions also layered the active file agent's private
+/// pools in front of it (全局激活 agent 已移除，技能发现只看全局根);
+/// either layer may be absent without affecting the other.
+pub(crate) fn production_skill_roots() -> Vec<PathBuf> {
+    skills_dir().into_iter().collect()
 }
 
 /// Directory-scanning core, factored out so tests can point at a tempdir.
@@ -154,46 +135,26 @@ pub fn discover_in(root: &Path) -> Vec<Skill> {
     out
 }
 
-/// Build the (path, mtime) fingerprint of exactly the file set
-/// [`discover_in`] reads: top-level `*.md` files plus `<dir>/SKILL.md` for
-/// each subdirectory that has one. Sorted for stable comparison. An empty
-/// result (unreadable root or any stat failure) always mismatches a cached
-/// non-empty fingerprint, forcing a rescan.
-fn fingerprint(root: &Path) -> Vec<(PathBuf, SystemTime)> {
-    let mut out = Vec::new();
-    let entries = match std::fs::read_dir(root) {
-        Ok(it) => it,
-        Err(_) => return out,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        let target = if ft.is_file() {
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                path
-            } else {
-                continue;
+/// Scan every root in order and merge the per-root skill lists by name,
+/// FIRST-WINS: a skill from an earlier root shadows same-name skills in
+/// every later root (dedupe happens AFTER the merge, keeping the first
+/// occurrence, so ordering — not sort order — decides the winner). Missing
+/// or unreadable roots silently contribute nothing, which is
+/// [`discover_in`]'s contract. Result sorted by name.
+pub fn discover_all(roots: &[PathBuf]) -> Vec<Skill> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut merged = Vec::new();
+    for root in roots {
+        for skill in discover_in(root) {
+            // `insert` returns false for a name an earlier root already
+            // claimed — that later shadow copy is dropped, not merged.
+            if seen.insert(skill.name.clone()) {
+                merged.push(skill);
             }
-        } else if ft.is_dir() {
-            let inner = path.join("SKILL.md");
-            if inner.is_file() {
-                inner
-            } else {
-                continue;
-            }
-        } else {
-            continue;
-        };
-        match std::fs::metadata(&target).and_then(|m| m.modified()) {
-            Ok(mtime) => out.push((target, mtime)),
-            Err(_) => return Vec::new(),
         }
     }
-    out.sort();
-    out
+    merged.sort_by(|a, b| a.name.cmp(&b.name));
+    merged
 }
 
 /// Parse one markdown file into a [`Skill`]. Returns `None` on read error.
@@ -701,66 +662,112 @@ mod tests {
         assert_eq!(clean, " first task then  second task");
         assert_eq!(names, vec!["a", "b"]);
     }
-}
 
-#[cfg(test)]
-mod cache_tests {
-    use super::*;
-    use std::thread;
-    use std::time::Duration;
+    // ----- production root assembly (global layer only) -----
 
-    // Tests share the process-global cache across threads, so every test uses
-    // a fresh tempdir to guarantee fingerprints never collide.
-    fn write(path: impl AsRef<Path>, contents: &str) {
-        let p = path.as_ref();
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, contents).unwrap();
+    /// Point the process-global agents-root override at `root` under the
+    /// lock shared with the meta tests (`crate::agent::meta::tests`); hold
+    /// the returned guard for the whole test body — the override is
+    /// process-global, so without it parallel tests race. Clear it with
+    /// `set_agents_dir_override(None)` before dropping the guard so the
+    /// next test sees the neutral state.
+    fn agents_override(root: &Path) -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::agent::meta::tests::OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::agent::meta::set_agents_dir_override(Some(root.to_path_buf()));
+        guard
+    }
+
+    /// Build an agents-root fixture with a `work` agent card referencing
+    /// skills pool `pack` (current version `v1`), and plant `skills` in the
+    /// pool's version dir. Returns the pool's version dir. Fixture shape
+    /// mirrors `crate::agent::meta::tests`.
+    fn agent_pool_with_skills(root: &Path, skills: &[(&str, &str)]) -> PathBuf {
+        let vdir = root.join("skills").join("pack").join("v1");
+        fs::create_dir_all(&vdir).unwrap();
+        for (file, body) in skills {
+            let path = vdir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        fs::write(
+            root.join("skills").join("pack").join("meta.json"),
+            r#"{ "name": "pack", "current": 1, "history": [1] }"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("work")).unwrap();
+        fs::write(
+            root.join("work").join("meta.json"),
+            r#"{ "current": { "skills": "pack" } }"#,
+        )
+        .unwrap();
+        vdir
     }
 
     #[test]
-    fn cache_serves_repeat_calls_and_invalidates_on_edit() {
+    fn execution_root_shadows_the_node_and_home_roots() {
+        let execution = tempfile::tempdir().unwrap();
+        let exec_skills = execution.path().join(".opencoder").join("skills");
+        fs::create_dir_all(&exec_skills).unwrap();
+        fs::write(exec_skills.join("only-operator.md"), "operator pack").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let inside =
+                crate::skill::with_execution(Some(exec_skills.clone()), async { skills_dir() })
+                    .await;
+            assert_eq!(
+                inside,
+                Some(exec_skills.clone()),
+                "the execution root must win inside its scope"
+            );
+            assert_ne!(
+                skills_dir(),
+                Some(exec_skills.clone()),
+                "outside the scope the node/home roots apply again"
+            );
+        });
+    }
+
+    #[test]
+    fn production_skill_roots_is_global_only() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path().join("alpha.md"), "one");
-        let first = discover_cached(dir.path());
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].name, "alpha");
-        // Unchanged fingerprint must be served from the cache verbatim.
-        let second = discover_cached(dir.path());
-        assert_eq!(first, second);
-        thread::sleep(Duration::from_millis(15));
-        write(dir.path().join("alpha.md"), "---\nname: beta\n---\ntwo");
-        let third = discover_cached(dir.path());
-        assert_eq!(third.len(), 1);
-        assert_eq!(third[0].name, "beta", "mtime change must force a rescan");
+        let _g = agents_override(dir.path()); // agents root irrelevant now
+        let roots = production_skill_roots();
+        crate::agent::meta::set_agents_dir_override(None);
+        match skills_dir() {
+            Some(global) => assert_eq!(roots, vec![global]),
+            None => assert!(roots.is_empty()),
+        }
     }
 
     #[test]
-    fn cache_invalidates_on_file_add() {
+    fn discover_ignores_agent_skill_pools() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path().join("alpha.md"), "one");
-        assert_eq!(discover_cached(dir.path()).len(), 1);
-        thread::sleep(Duration::from_millis(15));
-        write(dir.path().join("second.md"), "two");
-        assert_eq!(discover_cached(dir.path()).len(), 2);
-    }
-
-    #[test]
-    fn distinct_roots_do_not_collide() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        write(a.path().join("alpha.md"), "one");
-        write(b.path().join("beta.md"), "two");
-        // Alternate roots against the single-entry cache: each lookup must
-        // key on the root and never serve the other directory's skills.
-        let in_a = discover_cached(a.path());
-        let in_b = discover_cached(b.path());
-        let in_a_again = discover_cached(a.path());
-        let in_b_again = discover_cached(b.path());
-        assert_eq!(in_a.len(), 1);
-        assert_eq!(in_a[0].name, "alpha");
-        assert_eq!(in_b.len(), 1);
-        assert_eq!(in_b[0].name, "beta");
-        assert_eq!(in_a_again, in_a);
-        assert_eq!(in_b_again, in_b);
+        let root = dir.path();
+        agent_pool_with_skills(
+            root,
+            &[(
+                "shared.md",
+                "---\nname: shared\ndescription: from agent pool\n---\nagent body",
+            )],
+        );
+        let _g = agents_override(root);
+        let found = discover();
+        // Stable across a second (cached) call.
+        assert_eq!(found, discover());
+        crate::agent::meta::set_agents_dir_override(None);
+        // 全局激活已移除：agent 私有技能池不再进入生产发现根，任何
+        // surfaced 技能的 source 都不能落在 agents root 之下。
+        for skill in &found {
+            assert!(
+                !skill.source.starts_with(root),
+                "agent pool skill leaked into discovery: {}",
+                skill.source.display()
+            );
+        }
     }
 }

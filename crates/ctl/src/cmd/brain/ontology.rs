@@ -1,0 +1,185 @@
+use super::required_body;
+use crate::http::RequestPlan;
+use anyhow::Result;
+use clap::Subcommand;
+
+#[derive(Subcommand, Debug)]
+pub enum PlansCmd {
+    List,
+    Save {
+        #[arg(long)]
+        json: String,
+    },
+    Validate {
+        #[arg(long)]
+        json: String,
+    },
+    Get {
+        id: String,
+        version: u64,
+    },
+    Versions {
+        id: String,
+        #[arg(long)]
+        before: Option<u64>,
+    },
+    Stable {
+        id: String,
+        version: u64,
+    },
+    Diff {
+        id: String,
+        from: u64,
+        to: u64,
+    },
+}
+#[derive(Subcommand, Debug)]
+pub enum RunsCmd {
+    List,
+    Create {
+        #[arg(long)]
+        json: String,
+    },
+    Get {
+        id: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+    },
+    /// Layered canvas: run, plan, layers and operations.
+    Layered {
+        id: String,
+    },
+    /// Layered round detail for one layer.
+    LayeredRound {
+        id: String,
+        round: u32,
+    },
+    Events {
+        id: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+    },
+    Command {
+        id: String,
+        action: String,
+    },
+}
+pub fn plans(command: &PlansCmd) -> Result<RequestPlan> {
+    let base = "/api/brain/plan-defs";
+    Ok(match command {
+        PlansCmd::List => RequestPlan::get(base),
+        PlansCmd::Save { json } => RequestPlan::post(base).with_body(required_body(json)?),
+        PlansCmd::Validate { json } => {
+            RequestPlan::post(format!("{base}/validate")).with_body(required_body(json)?)
+        }
+        PlansCmd::Get { id, version } => {
+            RequestPlan::get(format!("{base}/{id}/versions/{version}"))
+        }
+        PlansCmd::Versions { id, before } => RequestPlan::get(format!(
+            "{base}/{id}/versions{}",
+            before.map(|v| format!("?before={v}")).unwrap_or_default()
+        )),
+        PlansCmd::Stable { id, version } => RequestPlan::post(format!("{base}/{id}/stable"))
+            .with_body(serde_json::json!({"version":version})),
+        PlansCmd::Diff { id, from, to } => {
+            RequestPlan::get(format!("{base}/{id}/diff?from={from}&to={to}"))
+        }
+    })
+}
+pub fn runs(command: &RunsCmd) -> Result<RequestPlan> {
+    let base = "/api/brain/runs";
+    Ok(match command {
+        RunsCmd::List => RequestPlan::get(base),
+        RunsCmd::Create { json } => RequestPlan::post(base).with_body(scheduler_body(json)?),
+        RunsCmd::Get { id, offset } => RequestPlan::get(format!("{base}/{id}?offset={offset}")),
+        RunsCmd::Layered { id } => RequestPlan::get(format!("{base}/{id}/layered")),
+        RunsCmd::LayeredRound { id, round } => {
+            RequestPlan::get(format!("{base}/{id}/layered/rounds/{round}"))
+        }
+        RunsCmd::Events { id, after } => {
+            RequestPlan::get(format!("{base}/{id}/events-page?after={after}"))
+        }
+        RunsCmd::Command { id, action } => RequestPlan::post(format!("{base}/{id}/commands"))
+            .with_body(serde_json::json!({"action":action})),
+    })
+}
+
+/// Only explicit layered requests reach the create endpoint.
+fn scheduler_body(raw: &str) -> Result<serde_json::Value> {
+    let body = required_body(raw)?;
+    anyhow::ensure!(
+        body["schema_version"] == opencoder_core::brain::layered::LAYERED_SCHEMA_VERSION,
+        "brain runs create requires an explicit schema_version: 7"
+    );
+    Ok(body)
+}
+
+pub async fn activate(
+    context: &std::path::Path,
+    config: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<i32> {
+    let context: serde_json::Value = serde_json::from_slice(&std::fs::read(context)?)?;
+    let mut config: opencoder_core::Config = serde_json::from_slice(&std::fs::read(config)?)?;
+    config.local_memory = false;
+    config.autopilot.mode = opencoder_core::ApMode::Off;
+    config.compaction.auto = false;
+    let client = LocalClient(config.clone());
+    anyhow::ensure!(
+        context["schema_version"] == opencoder_core::brain::layered::LAYERED_SCHEMA_VERSION,
+        "unsupported brain schema; expected 7"
+    );
+    let context: opencoder_core::brain::layered::LayeredContext = serde_json::from_value(context)?;
+    let agent = opencoder_core::Agent {
+        name: "act".into(),
+        kind: opencoder_core::AgentKind::Act,
+        mode: opencoder_core::agent::AgentMode::Primary,
+        description: "One event-driven Brain decision".into(),
+        prompt: opencoder_brain::layered::PROMPT.into(),
+        tools: opencoder_core::agent::ToolFilter::Allow(vec![]),
+    };
+    let mut session = opencoder_session::SessionState::new(
+        format!("{}-a{}", context.run_id, context.generation),
+        agent,
+        config,
+        std::sync::Arc::new(client),
+        std::env::current_dir()?,
+    );
+    session.harness.harness = opencoder_core::harness::Harness::Opencoder;
+    opencoder_session::run_with_registry(
+        &mut session,
+        opencoder_brain::layered::instruction(&context)?,
+        vec![],
+        &std::collections::HashMap::new(),
+        |_| {},
+    )
+    .await?;
+    let text = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == opencoder_core::Role::Assistant)
+        .map(|message| message.text())
+        .ok_or_else(|| anyhow::anyhow!("Brain agent loop produced no assistant decision"))?;
+    let decision = opencoder_brain::layered::parse_decision(&text)
+        .map_err(|error| anyhow::anyhow!("invalid layered decision: {error:#}"))?;
+    opencoder_core::atomic_write_json(output, &serde_json::to_value(decision)?)?;
+    Ok(0)
+}
+
+struct LocalClient(opencoder_core::Config);
+
+impl opencoder_llm::ChatStream for LocalClient {
+    fn chat_stream(
+        &self,
+        request: opencoder_llm::ChatRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<opencoder_llm::LlmEvent>> {
+        let endpoint = self.0.resolve_endpoint()?;
+        opencoder_llm::ChatClient::from_config(&self.0, &endpoint)?.chat_stream(
+            opencoder_brain::activation::configured_request(&self.0, request),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests;

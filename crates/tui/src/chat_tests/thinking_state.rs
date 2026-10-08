@@ -1,9 +1,23 @@
 use super::super::*;
 
+/// The top-level Thinking block is a legacy/replay shape (live reasoning
+/// streams into the step ladder) — these tests build it directly to keep the
+/// block machinery (collapse/toggle/headers) covered.
+fn legacy_thinking_view(runs: &[(&str, bool)]) -> ChatView {
+    let mut v = ChatView::default();
+    for &(text, sealed) in runs {
+        v.blocks.push(ChatBlock::Thinking {
+            text: text.into(),
+            collapsed: true,
+            sealed,
+        });
+    }
+    v
+}
+
 #[test]
 fn thinking_block_collapses() {
-    let mut v = ChatView::default();
-    v.apply(&SessionEvent::ReasoningDelta("line1\nline2\nline3".into()));
+    let mut v = legacy_thinking_view(&[("line1\nline2\nline3", false)]);
     // Collapsed by default: header only, content hidden
     let text = block_text(&v);
     assert!(text.contains("Thinking"));
@@ -19,12 +33,21 @@ fn thinking_block_collapses() {
 
 #[test]
 fn thinking_headers_match_flatten_line_indices() {
-    let mut v = ChatView::default();
     // Two thinking blocks separated by an assistant block.
-    v.apply(&SessionEvent::ReasoningDelta("think-a".into()));
-    v.apply(&SessionEvent::TextDelta("hi".into()));
-    v.apply(&SessionEvent::Done);
-    v.apply(&SessionEvent::ReasoningDelta("think-b-1\nthink-b-2".into()));
+    let mut v = legacy_thinking_view(&[("think-a", false)]);
+    // Built directly: a streamed Say would close its turn and fold the
+    // pending thinking into the ladder, but these tests target the legacy
+    // top-level Thinking block machinery itself.
+    v.blocks.push(ChatBlock::Assistant {
+        raw: "hi".into(),
+        rendered: Vec::new(),
+        done: true,
+    });
+    v.blocks.push(ChatBlock::Thinking {
+        text: "think-b-1\nthink-b-2".into(),
+        collapsed: true,
+        sealed: false,
+    });
 
     let flat = v.flatten();
     let headers = v.thinking_headers();
@@ -57,35 +80,52 @@ fn thinking_headers_match_flatten_line_indices() {
 
 #[test]
 fn toggle_thinking_at_toggles_specific_block() {
-    let mut v = ChatView::default();
-    v.apply(&SessionEvent::ReasoningDelta("first".into()));
-    v.apply(&SessionEvent::TextDelta("between".into()));
-    v.apply(&SessionEvent::Done);
-    v.apply(&SessionEvent::ReasoningDelta("second".into()));
+    // Legacy shape: two Thinking blocks separated by an assistant, built
+    // directly (live reasoning goes into the step ladder, and a streamed
+    // Say would close its turn and fold the pending thinking away).
+    let mut v = legacy_thinking_view(&[("first run", false)]);
+    v.blocks.push(ChatBlock::Assistant {
+        raw: "between".into(),
+        rendered: Vec::new(),
+        done: true,
+    });
+    v.blocks.push(ChatBlock::Thinking {
+        text: "second run".into(),
+        collapsed: true,
+        sealed: false,
+    });
 
     let headers = v.thinking_headers();
     assert_eq!(headers.len(), 2);
     // Both collapsed initially.
-    assert!(!block_text(&v).contains("first"));
-    assert!(!block_text(&v).contains("second"));
+    assert!(!block_text(&v).contains("first run"));
+    assert!(!block_text(&v).contains("second run"));
     // Toggle only the first: its content shows, second stays hidden.
     v.toggle_thinking_at(headers[0].block_idx);
-    assert!(block_text(&v).contains("first"));
-    assert!(!block_text(&v).contains("second"));
+    assert!(block_text(&v).contains("first run"));
+    assert!(!block_text(&v).contains("second run"));
     // Out-of-range / non-thinking index is a no-op.
     v.toggle_thinking_at(999);
     v.toggle_thinking_at(headers[0].block_idx + 1); // assistant block index
-    assert!(block_text(&v).contains("first"));
+    assert!(block_text(&v).contains("first run"));
 }
 
 #[test]
 fn collapse_all_collapsible_collapses_every_thinking_block() {
-    let mut v = ChatView::default();
     // Two thinking blocks separated by an assistant block.
-    v.apply(&SessionEvent::ReasoningDelta("think-a".into()));
-    v.apply(&SessionEvent::TextDelta("hi".into()));
-    v.apply(&SessionEvent::Done);
-    v.apply(&SessionEvent::ReasoningDelta("think-b\nthink-c".into()));
+    let mut v = legacy_thinking_view(&[("think-a", false)]);
+    // Built directly: a streamed Say would close its turn and fold the
+    // pending thinking into the ladder (see `append_text_delta`).
+    v.blocks.push(ChatBlock::Assistant {
+        raw: "hi".into(),
+        rendered: Vec::new(),
+        done: true,
+    });
+    v.blocks.push(ChatBlock::Thinking {
+        text: "think-b\nthink-c".into(),
+        collapsed: true,
+        sealed: false,
+    });
 
     let headers = v.thinking_headers();
     assert_eq!(headers.len(), 2);
@@ -128,15 +168,13 @@ fn last_open_thinking_collapsed_empty_view() {
 
 #[test]
 fn last_open_thinking_collapsed_true_when_collapsed() {
-    let mut view = ChatView::default();
-    view.apply(&SessionEvent::ReasoningDelta("thinking...".into()));
+    let view = legacy_thinking_view(&[("thinking...", false)]);
     assert!(view.last_open_thinking_collapsed());
 }
 
 #[test]
 fn last_open_thinking_collapsed_false_when_expanded() {
-    let mut view = ChatView::default();
-    view.apply(&SessionEvent::ReasoningDelta("thinking...".into()));
+    let mut view = legacy_thinking_view(&[("thinking...", false)]);
     // Toggle expands the (only) thinking block at index 0.
     view.toggle_thinking_at(0);
     assert!(!view.last_open_thinking_collapsed());
@@ -144,18 +182,15 @@ fn last_open_thinking_collapsed_false_when_expanded() {
 
 #[test]
 fn last_open_thinking_collapsed_false_when_last_block_not_thinking() {
-    let mut view = ChatView::default();
-    view.apply(&SessionEvent::ReasoningDelta("thinking...".into()));
-    // A TextDelta seals the thinking block and opens an assistant block.
+    let mut view = legacy_thinking_view(&[("thinking...", true)]);
+    // A sealed thinking block followed by an assistant block.
     view.apply(&SessionEvent::TextDelta("answer".into()));
     assert!(!view.last_open_thinking_collapsed());
 }
 
 #[test]
 fn last_open_thinking_collapsed_false_when_sealed() {
-    let mut view = ChatView::default();
-    view.apply(&SessionEvent::ReasoningDelta("thinking...".into()));
-    view.apply(&SessionEvent::Done);
+    let view = legacy_thinking_view(&[("thinking...", true)]);
     assert!(!view.last_open_thinking_collapsed());
 }
 
@@ -164,9 +199,8 @@ fn last_open_thinking_collapsed_false_when_sealed() {
 /// accidentally removed from the shared `render_collapsible`.
 #[test]
 fn thinking_header_shows_line_count_when_collapsed() {
-    let mut v = ChatView::default();
     // Body is 4 lines.
-    v.apply(&SessionEvent::ReasoningDelta("l1\nl2\nl3\nl4".into()));
+    let mut v = legacy_thinking_view(&[("l1\nl2\nl3\nl4", false)]);
 
     // Collapsed: header carries the line count.
     let flat = v.flatten();
@@ -191,7 +225,7 @@ fn thinking_header_shows_line_count_when_collapsed() {
 }
 
 #[test]
-fn interleaved_reasoning_keeps_one_losslessly_joined_assistant() {
+fn interleaved_reasoning_opens_a_new_turn_under_each_say() {
     let mut v = ChatView::default();
     v.apply(&SessionEvent::LlmRoundStart { started_at_ms: 1 });
     v.apply(&SessionEvent::ReasoningDelta("plan regression".into()));
@@ -201,8 +235,20 @@ fn interleaved_reasoning_keeps_one_losslessly_joined_assistant() {
         "通过，无失败。统计总数并写 changelog。".into(),
     ));
 
-    assert!(matches!(v.blocks[0], ChatBlock::Thinking { .. }));
-    assert!(matches!(v.blocks[1], ChatBlock::Thinking { .. }));
+    // Contract: `1 Turn = n Steps + Say`; one submission may hold several
+    // turns. The first Say closes turn 1 ("plan regression" is ITS ladder);
+    // the reasoning after it opens turn 2's ladder BELOW the Say and the
+    // second Say closes that turn. Nothing merges across a closed Say.
+    let thinking_of = |v: &ChatView, group_idx: usize| match &v.blocks[group_idx] {
+        ChatBlock::StepGroup { steps, .. } => steps[0].thinking_raw.clone(),
+        _ => unreachable!("block {group_idx} must be a step group"),
+    };
+    assert!(matches!(v.blocks[0], ChatBlock::StepGroup { .. }));
+    assert!(matches!(v.blocks[1], ChatBlock::Assistant { .. }));
+    assert!(matches!(v.blocks[2], ChatBlock::StepGroup { .. }));
+    assert!(matches!(v.blocks[3], ChatBlock::Assistant { .. }));
+    assert_eq!(thinking_of(&v, 0), "plan regression");
+    assert_eq!(thinking_of(&v, 2), "record totals");
     let assistants: Vec<_> = v
         .blocks
         .iter()
@@ -213,30 +259,69 @@ fn interleaved_reasoning_keeps_one_losslessly_joined_assistant() {
         .collect();
     assert_eq!(
         assistants,
-        ["全量回归通过，无失败。统计总数并写 changelog。"]
+        ["全量回归", "通过，无失败。统计总数并写 changelog。"]
     );
 
+    // Each Say merges into its preceding group: `{glyph} Say(n step{s}):`
+    // — one merged header per turn pair.
     let say_headers = v
         .flatten()
         .iter()
-        .filter(|line| line.spans.iter().any(|span| span.content.contains("Say:")))
+        .filter(|line| line.spans.iter().any(|span| span.content.contains("Say(")))
         .count();
-    assert_eq!(say_headers, 1, "one LLM round must render one Say header");
+    assert_eq!(
+        say_headers, 2,
+        "each Say of the pairing contract renders its own merged header"
+    );
 }
 
 #[test]
-fn interleaved_open_thinking_still_uses_collapsed_render_gate() {
+fn collapsed_live_reasoning_stays_raw_until_the_step_opens() {
     let mut v = ChatView::default();
     v.apply(&SessionEvent::ReasoningDelta("first".into()));
     v.apply(&SessionEvent::TextDelta("answer".into()));
     v.apply(&SessionEvent::ReasoningDelta("second".into()));
 
+    // The Say in between closed turn 1 ("first" is ITS sealed ladder) and
+    // opened turn 2 BELOW it, so "second" streams into the new group at
+    // blocks[2] — never back into the closed turn's step.
+    assert!(matches!(v.blocks[1], ChatBlock::Assistant { .. }));
+    assert!(matches!(v.blocks[2], ChatBlock::StepGroup { .. }));
+
+    // The trailing step is structurally present but hidden, so deltas only
+    // append raw source and the render loop may skip a delta-only frame.
     assert!(
         v.last_open_thinking_collapsed(),
-        "open Thinking immediately before Assistant must remain detectable"
+        "collapsed step reasoning is not visible"
     );
-    v.toggle_thinking_at(1);
-    assert!(!v.last_open_thinking_collapsed());
+    let (thinking_raw, thinking_rendered) = match &v.blocks[0] {
+        ChatBlock::StepGroup { steps, .. } => (
+            steps[0].thinking_raw.clone(),
+            crate::chat::steps::span_text(&steps[0].thinking),
+        ),
+        _ => unreachable!("first block must be the step group"),
+    };
+    assert_eq!(thinking_raw, "first");
+    // Closing the Say sealed turn 1's step: its thinking is rendered then
+    // and there (counted exactly once), so the closed turn carries the
+    // rendered body already.
+    assert_eq!(thinking_rendered, "first");
+    let (raw2, empty2) = match &v.blocks[2] {
+        ChatBlock::StepGroup { steps, .. } => {
+            (steps[0].thinking_raw.clone(), steps[0].thinking.is_empty())
+        }
+        _ => unreachable!("third block must be the step group"),
+    };
+    assert_eq!(raw2, "second");
+    assert!(empty2);
+
+    v.toggle_tool_call_at(2, 0);
+    v.toggle_tool_call_at(2, 1);
+    let thinking = match &v.blocks[2] {
+        ChatBlock::StepGroup { steps, .. } => crate::chat::steps::span_text(&steps[0].thinking),
+        _ => unreachable!("third block must be the step group"),
+    };
+    assert_eq!(thinking, "second");
 }
 
 #[test]
@@ -250,8 +335,12 @@ fn interleaved_round_finalization_counts_once_and_hard_bounds_next_round() {
     let expected =
         estimate("think-a") as u64 + estimate("think-b") as u64 + estimate("answer-a") as u64;
     assert_eq!(v.context_used, expected);
+    // The Say closed its Turn and the reasoning that followed opened the
+    // NEXT turn's ladder below it: the last block is that ladder, and the
+    // Say itself (blocks[1]) is the one finalized by this round end.
+    assert!(matches!(v.blocks.last(), Some(ChatBlock::StepGroup { .. })));
     assert!(matches!(
-        v.blocks.last(),
+        v.blocks.get(1),
         Some(ChatBlock::Assistant { done: true, .. })
     ));
 
@@ -296,11 +385,20 @@ fn completed_answer_repairs_dropped_chunks_without_touching_previous_turn() {
         })
         .collect();
     assert_eq!(assistants, ["old answer", "全量回归通过，无失败。"]);
-    assert_eq!(
+    // Turn one is pure text (standalone `❯ Say:` header); the repaired turn
+    // has a ladder (merged `Say(n steps)` header) — exactly one Say per turn.
+    let count_say_rows = |v: &ChatView| {
         v.flatten()
             .iter()
-            .filter(|line| line.spans.iter().any(|span| span.content.contains("Say:")))
-            .count(),
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("Say(") || span.content.contains("Say:"))
+            })
+            .count()
+    };
+    assert_eq!(
+        count_say_rows(&v),
         2,
         "one Say per turn remains after completed-text repair"
     );
@@ -314,9 +412,13 @@ fn completed_answer_creates_say_when_every_text_delta_was_dropped() {
     v.apply(&SessionEvent::Done);
     v.reconcile_completed_assistant("recovered answer");
 
+    // The pending Thinking was flushed into a call-less step at Done; the
+    // recovered Say lands AFTER the ladder (it is the turn's conclusion).
     assert!(matches!(
         v.blocks[0],
-        ChatBlock::Thinking { sealed: true, .. }
+        ChatBlock::StepGroup { ref steps, .. } if !steps.is_empty()
+            && !steps[0].thinking.is_empty()
+            && steps[0].calls.is_empty()
     ));
     assert!(matches!(
         v.blocks[1],
@@ -326,7 +428,15 @@ fn completed_answer_creates_say_when_every_text_delta_was_dropped() {
             ..
         } if raw == "recovered answer"
     ));
-    assert!(matches!(v.blocks[2], ChatBlock::Marker(_)));
+    // A StepGroup self-terminates with its own trailing blank, so Done must
+    // NOT stack a boundary marker after it ("exactly one blank after the
+    // turn"): the recovered Say is the turn's final block.
+    assert_eq!(
+        v.blocks.len(),
+        2,
+        "no boundary marker after a self-terminating StepGroup: {:?}",
+        v.blocks
+    );
     assert_eq!(
         v.context_used,
         estimate("thinking") as u64 + estimate("recovered answer") as u64

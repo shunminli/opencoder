@@ -5,17 +5,22 @@
 //! the same in-process engine, and `.gitignore` / `.ignore` / hidden files are
 //! honoured exactly as ripgrep does by default.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{Searcher, Sink, SinkMatch};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use opencoder_core::{json, tool::truncate_output, Tool, ToolContext, ToolOutput};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+mod bounded;
 
 /// Maximum number of matching lines returned before the search short-circuits.
 const MAX_MATCHES: usize = 1000;
@@ -71,8 +76,7 @@ impl Tool for SearchTool {
             None => ctx.working_dir.clone(),
         };
         let max_output = ctx.max_output;
-
-        let out = tokio::task::spawn_blocking(move || -> ToolOutput {
+        let out = bounded::run(move |cancel| -> ToolOutput {
             let matcher = match RegexMatcherBuilder::new().build(&pattern) {
                 Ok(m) => m,
                 Err(e) => return ToolOutput::err(format!("invalid regex: {e}")),
@@ -82,26 +86,47 @@ impl Tool for SearchTool {
                 results: Vec::new(),
                 rel: String::new(),
                 max: MAX_MATCHES,
+                bytes: 0,
+                truncated: false,
+                cancel: cancel.clone(),
             };
-            let mut searcher = SearcherBuilder::new().line_number(true).build();
+            let mut searcher = bounded::searcher();
+
+            if let Err(error) = base.metadata() {
+                return ToolOutput::err(format!("search {}: {error}", base.display()));
+            }
 
             if base.is_file() {
                 collector.rel = path_str
                     .clone()
                     .unwrap_or_else(|| base.display().to_string());
-                let _ = searcher.search_path(&matcher, &base, &mut collector);
+                if let Err(error) =
+                    bounded::search_file(&mut searcher, &matcher, &base, &mut collector, &cancel)
+                {
+                    return ToolOutput::err(format!("search {}: {error}", base.display()));
+                }
             } else {
                 let mut wb = WalkBuilder::new(&base);
-                // Follow symlinks (parity with the former grep tool); the `ignore`
-                // walker performs its own loop/cycle detection so this is safe.
+                // Follow symlinks (parity with the former grep tool), but never
+                // re-enter a directory: the walker's built-in loop detection only
+                // catches a directory reappearing in its own ancestor chain. Links
+                // whose hops are distinct directories (`/proc/<pid>/root` resolves
+                // to `/`, sysfs `subsystem/devices` chains grow new paths every
+                // hop) defeat it and expand the walk exponentially without ever
+                // terminating. The `dir_first_visit` guard prunes any physical
+                // directory already visited once, bounding the walk to one visit
+                // per directory while still following links.
                 wb.follow_links(true);
+                let visited: Arc<Mutex<HashSet<(u64, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
+                let walking = cancel.clone();
+                wb.filter_entry(move |e| !walking.is_cancelled() && dir_first_visit(e, &visited));
                 if let Some(inc) = include.as_deref() {
                     if let Ok(built) = ov_build(&base, inc) {
                         wb.overrides(built);
                     }
                 }
                 for entry in wb.build() {
-                    if collector.results.len() >= collector.max {
+                    if cancel.is_cancelled() || collector.full() {
                         break;
                     }
                     let entry = match entry {
@@ -112,7 +137,18 @@ impl Tool for SearchTool {
                         continue;
                     }
                     collector.rel = rel_path(&base, entry.path());
-                    let _ = searcher.search_path(&matcher, entry.path(), &mut collector);
+                    if let Err(error) = bounded::search_file(
+                        &mut searcher,
+                        &matcher,
+                        entry.path(),
+                        &mut collector,
+                        &cancel,
+                    ) {
+                        return ToolOutput::err(format!(
+                            "search {}: {error}",
+                            entry.path().display()
+                        ));
+                    }
                 }
             }
 
@@ -123,12 +159,53 @@ impl Tool for SearchTool {
             if collector.results.len() >= collector.max {
                 out.push_str(&format!("\n(truncated at {MAX_MATCHES} matches)"));
             }
+            if collector.truncated {
+                out.push_str("\n(truncated at search output byte limit)");
+            }
             truncate_output(out, max_output)
         })
-        .await
-        .unwrap_or_else(|e| ToolOutput::err(format!("search task failed: {e}")));
+        .await;
 
         Ok(out)
+    }
+}
+
+/// Re-entry guard for symlink-following walks: returns `true` only the first
+/// time a physical directory (identified by `(dev, ino)`) is seen. Symlinks
+/// may be followed, but a directory already visited anywhere earlier in the
+/// walk is pruned, so no directory is ever re-entered. Without this, link
+/// chains such as `/proc/<pid>/root` (distinct hop dirs, same target `/`)
+/// turn the walk into an unbounded, core-pinning traversal.
+fn dir_first_visit(e: &ignore::DirEntry, visited: &Mutex<HashSet<(u64, u64)>>) -> bool {
+    if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match e.metadata() {
+            Ok(md) => {
+                let mut seen = visited.lock().expect("search walk dedup lock poisoned");
+                seen.insert((md.dev(), md.ino()))
+            }
+            // Un-stat-able directory: let the walker surface the error itself.
+            Err(_) => true,
+        }
+    }
+    #[cfg(windows)]
+    {
+        match opencoder_core::platform::fs::directory_identity(e.path()) {
+            Ok(identity) => visited
+                .lock()
+                .expect("search walk dedup lock poisoned")
+                .insert(identity),
+            Err(_) => true,
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = visited;
+        true
     }
 }
 
@@ -153,91 +230,40 @@ struct Collector {
     results: Vec<String>,
     rel: String,
     max: usize,
+    bytes: usize,
+    truncated: bool,
+    cancel: CancellationToken,
+}
+
+impl Collector {
+    fn full(&self) -> bool {
+        self.results.len() >= self.max || self.truncated
+    }
 }
 
 impl Sink for Collector {
     type Error = io::Error;
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
-        if self.results.len() >= self.max {
+        if self.cancel.is_cancelled() || self.full() {
             return Ok(false);
         }
         let line = mat.line_number().unwrap_or(0);
         let text = String::from_utf8_lossy(mat.bytes());
         let text = text.trim_end_matches(['\r', '\n']);
-        self.results
-            .push(format!("{}:{}: {}", self.rel, line, text));
-        Ok(true)
+        let result = format!("{}:{}: {}", self.rel, line, text);
+        let remaining = bounded::OUTPUT_BYTES.saturating_sub(self.bytes);
+        let mut end = result.len().min(remaining);
+        while !result.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.truncated = end < result.len() || result.len() >= remaining;
+        self.bytes += end;
+        self.results.push(result[..end].to_owned());
+        Ok(!self.full())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use opencoder_core::Tool;
-    use serde_json::json;
-    use std::io::Write;
-
-    fn ctx_for(dir: &tempfile::TempDir) -> ToolContext {
-        ToolContext {
-            session_id: "test".into(),
-            message_id: "test".into(),
-            agent: "explore".into(),
-            working_dir: dir.path().to_path_buf(),
-            max_output: 4096,
-            proxy: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn search_finds_matching_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut f = std::fs::File::create(dir.path().join("greet.rs")).unwrap();
-        writeln!(f, "fn main() {{").unwrap();
-        writeln!(f, "    println!(\"hello world\");").unwrap();
-        writeln!(f, "}}").unwrap();
-        let ctx = ctx_for(&dir);
-        let tool = SearchTool;
-        let out = tool
-            .execute(json!({ "pattern": "hello world" }), &ctx)
-            .await
-            .unwrap();
-        assert!(!out.is_error, "expected success, got: {}", out.content);
-        // Match line is line 2 in `greet.rs`; expect `greet.rs:2: ...hello world...`.
-        assert!(
-            out.content.contains("greet.rs:2:"),
-            "expected match path:line marker, got: {}",
-            out.content
-        );
-        assert!(
-            out.content.contains("hello world"),
-            "expected match content, got: {}",
-            out.content
-        );
-    }
-
-    #[tokio::test]
-    async fn search_no_matches_returns_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut f = std::fs::File::create(dir.path().join("f.txt")).unwrap();
-        writeln!(f, "alpha").unwrap();
-        writeln!(f, "beta").unwrap();
-        let ctx = ctx_for(&dir);
-        let tool = SearchTool;
-        let out = tool
-            .execute(json!({ "pattern": "this_pattern_does_not_exist" }), &ctx)
-            .await
-            .unwrap();
-        assert!(!out.is_error, "no matches is not an error");
-        assert_eq!(out.content, "no matches");
-    }
-
-    #[tokio::test]
-    async fn search_empty_pattern_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = ctx_for(&dir);
-        let tool = SearchTool;
-        let out = tool.execute(json!({ "pattern": "" }), &ctx).await.unwrap();
-        assert!(out.is_error, "empty pattern must be an error");
-        assert!(out.content.contains("non-empty"));
-    }
-}
+mod limits_tests;
+#[cfg(test)]
+mod tests;

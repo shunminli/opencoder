@@ -1,6 +1,6 @@
 //! Contract tests for `GET /api/sessions/:id/subagents` (api_subagents.rs):
 //! the durable subagent-task listing that backs the SPA's post-refresh card
-//! restore and child-transcript drill-down, and `opencode client session
+//! restore and child-transcript drill-down, and `opencoder client session
 //! tasks`. Assertions: field shape (id/kind/status/child_session_id/prompt/
 //! parent_message_id/created_at/updated_at), 200 on an empty list, 404 when
 //! the parent session does not exist. Uses the full `build_app` router so
@@ -17,11 +17,16 @@ use opencoder_store::{LibsqlStore, SessionMeta, Store, SubagentStatus, SubagentT
 async fn app() -> (axum::Router, Arc<opencoder_web::AppState>) {
     let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
     let state = Arc::new(opencoder_web::AppState {
+        config_home: None,
         client_override: None,
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store: store.clone(),
         workdir: std::env::temp_dir(),
         handles: opencoder_web::handle::new_handle_map(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
     });
     (opencoder_web::build_app(state.clone(), None, false), state)
 }
@@ -46,8 +51,7 @@ async fn seed_session(state: &opencoder_web::AppState, sid: &str) {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();

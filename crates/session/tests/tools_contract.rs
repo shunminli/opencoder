@@ -1,20 +1,24 @@
 //! Tool contract tests — each tool exercised with real tempdir + ToolContext.
 //! Per rules/01-mandatory-tests.md: every business function gets a real behavior test.
 
+#[cfg(unix)]
+use opencoder_session::tools::bash::BashTool;
 use std::path::Path;
 
 use opencoder_core::{Tool, ToolContext};
-use opencoder_session::tools::{bash::BashTool, edit::EditTool, ls::ListTool, search::SearchTool};
+use opencoder_session::tools::{edit::EditTool, ls::ListTool, search::SearchTool};
 use serde_json::json;
 
 fn ctx(dir: &Path) -> ToolContext {
     ToolContext {
+        extra_env: Vec::new(),
         session_id: "test-session".into(),
         message_id: "test-msg".into(),
         agent: "act".into(),
         working_dir: dir.to_path_buf(),
         max_output: 4096,
         proxy: None,
+        tools_path: None,
     }
 }
 
@@ -145,11 +149,14 @@ async fn bash_tool_detaches_controlling_terminal() {
     let c = ctx(dir.path());
     let out = BashTool
         .execute(
-            json!({"command": "ps -o pid=,sid= -p \"$$\" | tr -s ' '"}),
+            // exec keeps bash's PID/session while getsid avoids ps fields
+            // that differ between Linux and macOS.
+            json!({"command": "exec python3 -c 'import os; print(os.getpid(), os.getsid(0))'"}),
             &c,
         )
         .await
         .unwrap();
+    assert!(!out.is_error, "session inspection failed: {out:?}");
     let nums: Vec<u64> = out
         .content
         .split_whitespace()

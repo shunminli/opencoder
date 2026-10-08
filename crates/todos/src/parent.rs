@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use opencoder_core::{message::now_ms, resolve_agent, Config, Role};
 use opencoder_llm::ChatStream;
 use opencoder_store::{SessionMeta, Store, TASK_TYPE_TODO_WORKFLOW};
+use tokio_util::sync::CancellationToken;
 
 use crate::{domain, types::*};
 
@@ -12,6 +13,7 @@ pub struct DecisionRuntime {
     pub client: Arc<dyn ChatStream>,
     pub config: Config,
     pub workdir: PathBuf,
+    pub cancel: CancellationToken,
 }
 
 pub async fn create_session(
@@ -22,6 +24,7 @@ pub async fn create_session(
     let now = now_ms();
     store
         .create_session(&SessionMeta {
+            kind: Some("todos".into()),
             id: state.parent_session_id.clone(),
             title: Some(format!("todos workflow {}", state.workflow_id)),
             agent: Some("workflow".into()),
@@ -39,8 +42,6 @@ pub async fn create_session(
             skill: None,
             task_type: Some(TASK_TYPE_TODO_WORKFLOW.into()),
             requirement: Some("Manage global TODO state and acceptance".into()),
-            plan_snapshot: None,
-            plan_input_count: 0,
         })
         .await
 }
@@ -60,9 +61,11 @@ pub async fn schedule(
          {{\"operation\":\"rewind\",\"milestone_todo_id\":\"...\",\"reason\":\"...\"}}\n\
          {{\"operation\":\"complete|fail|suspend\",\"reason\":\"...\"}}\n\
          Dispatch only IDs in runnable. Use new for first attempt, resume to continue the same interrupted/revision session, fork for a clean attempt. Complete only when every TODO passed.\n\
-         RUNNABLE={}\nSTATE={}\nTODO_SUMMARY={}",
+         WORKFLOW_OBJECTIVE={}\nCONSTRAINTS={}\nRUNNABLE={}\nSTATE={}\nTODO_SUMMARY={}",
+        serde_json::to_string(&spec.objective)?,
+        serde_json::to_string(&spec.constraints)?,
         serde_json::to_string(&runnable)?,
-        serde_json::to_string(state)?,
+        serde_json::to_string(&crate::review::context::scheduling_state(state))?,
         serde_json::to_string(&spec.todos.iter().map(|t| serde_json::json!({"id":t.id,"title":t.title,"depends_on":t.depends_on})).collect::<Vec<_>>())?
     );
     // `None` keeps the prompt byte-identical to the pre-correction form.
@@ -134,6 +137,7 @@ async fn decide<T: serde::de::DeserializeOwned>(
     )
     .await?;
     session.agent = resolve_agent("workflow").context("workflow agent not registered")?;
+    session.cancel = Some(runtime.cancel.clone());
     // Bug #16b: one unparseable reply must not suspend the whole workflow.
     // Re-ask in the same session with a correction prompt, bounded retries.
     // Only assistant messages produced by each ask count as its answer — the

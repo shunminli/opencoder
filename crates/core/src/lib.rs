@@ -1,11 +1,21 @@
 pub mod agent;
+pub mod brain;
 pub mod config;
 pub mod data_dir;
 pub mod error;
+pub mod harness;
+pub mod identity;
 pub mod json;
 pub mod message;
+pub mod platform;
+pub mod provider;
+pub use provider::{ProviderProtocol, ProviderState};
 pub mod net;
 pub mod node_protocol;
+pub mod schedule;
+pub mod share_fs;
+#[cfg(test)]
+mod share_fs_tests;
 pub mod skill;
 pub mod sse;
 pub mod tool;
@@ -13,26 +23,32 @@ pub mod tool_deps;
 pub mod tool_guard_config;
 pub mod version;
 
+pub use agent::BUILD_DELEGATION_CLAUSE;
 pub use agent::{
-    builtin_agents, resolve_agent, tool_preamble, Agent, AgentKind, AgentMode, ToolFilter,
+    build_delegation_hidden, builtin_agents, effective_default_agent, resolve_agent,
+    strip_build_delegation, tool_preamble, Agent, AgentKind, AgentMode, ToolFilter,
 };
-pub use config::envs::{
-    active_env, create_env, delete_env, env_dir, envs_home, list_envs, recapture_env,
-    set_active_env, validate_env_name,
-};
+pub use config::validate_team_turn_budgets;
 pub use config::{
     looks_like_env_var, scoped_config_home, AgentDefaults, ApMode, AutoPilotConfig, CliConfig,
     CompactionConfig, Config, Endpoint, HttpHeader, InjectionTarget, KeymapConfig, McpServerConfig,
     NetworkConfig, OutputStreamlineConfig, ProviderConfig, ScopedConfigHome, DEFAULT_CONTEXT_LIMIT,
-    KEYMAP_INFO,
+    KEYMAP_INFO, TEAM_TURN_BUDGET_MAX,
 };
 pub use data_dir::{data_dir_for, data_root, workdir_hash};
 pub use tool_deps::{all_installed, check_tool_deps, ToolDepStatus};
 pub use tool_guard_config::ToolGuardConfig;
 
 pub use error::{CoreError, Result};
+pub use identity::{parse_role, token_hash, Identity};
 pub use message::{ContentBlock, Message, MessageUsage, Role};
 pub use net::{build_http_client, effective_proxy};
+pub use share_fs::{
+    agent_tool_path, atomic_write, atomic_write_json, effective_share_dir, env_context_path,
+    list_child_dirs, list_child_files, read_json_opt, resolve_tool_ref, set_share_dir_override,
+    todo_context_path, todo_dir, todo_env_binding_path, todo_meta_path, todo_version_dir, tool_ref,
+    validate_share_name, AGENT_TOOLS_PREFIX,
+};
 pub use skill::{
     body_with_source, discover as discover_skills, discover_in, extract_skill_tokens,
     seed_builtin_skills, seed_builtin_skills_in, seed_dep_gated_skills, seed_dep_gated_skills_in,
@@ -41,3 +57,4 @@ pub use skill::{
 };
 pub use sse::SseEvt;
 pub use tool::{Tool, ToolArc, ToolContext, ToolOutput, ToolSchema};
+pub mod fleet;

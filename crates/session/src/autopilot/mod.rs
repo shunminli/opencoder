@@ -3,12 +3,14 @@
 //! When `config.autopilot.mode` is `"ap"` the session runner hands control to
 //! [`drive`] after the initial task. Each iteration:
 //!
-//! - **PLAN** — switch to the plan agent, inject a continuation prompt, run one
-//!   loop. Plan turns stay in the transcript (legitimate work record).
-//! - **ACT** — reset the transcript via plan→act handoff (ACT sees only the
-//!   plan output as its execution instruction), switch to the act agent, run
-//!   one loop. Inject an execute prompt only as a fallback when no handoff
-//!   plan is found.
+//! - **PLAN** — switch to the plan agent (read-only explorer), activate
+//!   the task-plan skill (unlocking the latent `question` tool), inject a
+//!   continuation prompt, run one loop. Plan turns stay in the transcript
+//!   (legitimate work record).
+//! - **ACT** — reset the transcript via execution handoff (ACT sees only the
+//!   brief as its execution instruction), switch to the act agent, run one
+//!   loop. Inject an execute prompt only as a fallback when no handoff brief
+//!   is found.
 //! - **VERIFY** — an isolated *shadow* one-shot: it clones the current
 //!   transcript into a throwaway snapshot, asks a small model "is the goal
 //!   fully achieved?", parses a single yes/no, then discards the snapshot.
@@ -154,8 +156,11 @@ pub async fn drive(
 /// phase loop runs through `run_loop_one_shot`, this explicit call is
 /// idempotent double-insurance covering the paths OUTSIDE a loop (cancel
 /// before a phase, `finish` bookkeeping).
-pub(crate) async fn clear_injected_skill(session: &SessionState) {
-    crate::skill_lifecycle::clear_on_run_end(session).await;
+pub(crate) async fn clear_injected_skill(
+    session: &SessionState,
+    on_event: &mut (dyn FnMut(SessionEvent) + Send),
+) {
+    crate::skill_lifecycle::clear_on_run_end(session, on_event).await;
 }
 
 /// Terminal bookkeeping for every outcome: clear the active skill (memory +
@@ -167,7 +172,7 @@ async fn finish(
     on_event: &mut (dyn FnMut(SessionEvent) + Send),
     outcome: ApOutcome,
 ) -> Result<ApOutcome> {
-    clear_injected_skill(session).await;
+    clear_injected_skill(session, on_event).await;
     on_event(SessionEvent::Done);
     Ok(outcome)
 }

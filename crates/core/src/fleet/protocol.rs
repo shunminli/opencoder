@@ -1,0 +1,612 @@
+use super::{
+    paging::{ArtifactRequest, DetailFieldRequest, EventPayloadRequest, MessageCursor},
+    IndexReportEnvelope,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+// Versioned fleet transport with immutable execution configuration.
+pub const PROTOCOL_VERSION: u32 = 10;
+pub const HEARTBEAT_MS: u64 = 5_000;
+pub const STALE_MS: i64 = 20_000;
+pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionKind {
+    Brain,
+    Agent,
+    Dag,
+    Team,
+    Todos,
+    Project,
+    Maintenance,
+    Operator,
+    System,
+}
+
+impl ExecutionKind {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Brain => "brain",
+            Self::Agent => "agent",
+            Self::Dag => "dag",
+            Self::Team => "team",
+            Self::Todos => "todos",
+            Self::Project => "project",
+            Self::Maintenance => "maintenance",
+            Self::Operator => "operator",
+            Self::System => "system",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatus {
+    Pending,
+    Running,
+    Idle,
+    Cancelling,
+    Interrupted,
+    Done,
+    Error,
+    Cancelled,
+}
+
+impl ExecutionStatus {
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Error | Self::Cancelled)
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Idle => "idle",
+            Self::Cancelling => "cancelling",
+            Self::Interrupted => "interrupted",
+            Self::Done => "done",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// The entire persistent server-side execution record. Do not add detail fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionIndex {
+    pub id: String,
+    pub created_at: i64,
+    pub kind: ExecutionKind,
+    pub node_id: String,
+    pub status: ExecutionStatus,
+}
+
+/// Stable identity used when the control plane asks the owning node for data.
+/// The kind is explicit so neither side has to infer routing from an ID prefix.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionRef {
+    pub id: String,
+    pub kind: ExecutionKind,
+}
+
+impl ExecutionIndex {
+    pub fn execution_ref(&self) -> ExecutionRef {
+        ExecutionRef {
+            id: self.id.clone(),
+            kind: self.kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreateExecution {
+    pub id: String,
+    pub kind: ExecutionKind,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub node_id: Option<String>,
+}
+
+impl CreateExecution {
+    pub fn validate(&self) -> Result<(), String> {
+        if !valid_id(&self.id) || !self.id.starts_with(&format!("{}-", self.kind.prefix())) {
+            return Err(format!(
+                "id must start with {}- and contain only letters, digits, '-' or '_'",
+                self.kind.prefix()
+            ));
+        }
+        if self.node_id.as_deref().is_some_and(|id| !valid_id(id)) {
+            return Err("invalid node_id".into());
+        }
+        Ok(())
+    }
+}
+
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Assignment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_context: Option<super::PrivateExecutionContext>,
+    #[serde(default)]
+    pub runtime: Option<Box<crate::harness::RuntimeSettings>>,
+    #[serde(default)]
+    pub codex: Option<Box<crate::harness::CodexSettings>>,
+    pub index: ExecutionIndex,
+    pub request: CreateExecution,
+    #[serde(default)]
+    pub definition: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionCommand {
+    pub action: String,
+    #[serde(default)]
+    pub input: Value,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeAdmissionCommand {
+    Freeze,
+    Reopen,
+    Status,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeRegistration {
+    pub protocol_version: u32,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub maintenance_agent_id: String,
+    pub kinds: Vec<ExecutionKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeSnapshot {
+    #[serde(default)]
+    pub pending_runs: u64,
+    #[serde(default)]
+    pub queue_order: super::QueueOrder,
+    pub generation: String,
+    pub sequence: u64,
+    pub cpu_capacity: f64,
+    pub active_agent_loops: u64,
+    pub active_runs: u64,
+    pub max_runs: u64,
+    pub ready: bool,
+    #[serde(default)]
+    pub resource_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeView {
+    #[serde(flatten)]
+    pub registration: NodeRegistration,
+    pub online: bool,
+    pub last_seen_at: i64,
+    pub snapshot: Option<NodeSnapshot>,
+    pub reserved_loops: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum NodeOperation {
+    Brain {
+        execution: ExecutionRef,
+        action: String,
+        #[serde(default)]
+        input: Value,
+    },
+    Admission {
+        command: NodeAdmissionCommand,
+    },
+    Create {
+        assignment: Assignment,
+    },
+    Inspect {
+        execution: ExecutionRef,
+    },
+    /// Return only the durable request receipt, without loading execution detail.
+    AcceptedRequest {
+        execution: ExecutionRef,
+    },
+    Command {
+        execution: ExecutionRef,
+        command: ExecutionCommand,
+    },
+    Events {
+        execution: ExecutionRef,
+        after: i64,
+    },
+    EventPayload {
+        request: EventPayloadRequest,
+    },
+    DetailField {
+        request: DetailFieldRequest,
+    },
+    Messages {
+        execution: ExecutionRef,
+        #[serde(default)]
+        cursor: MessageCursor,
+    },
+    TodoItems {
+        execution: ExecutionRef,
+        #[serde(default)]
+        after_ordinal: Option<i64>,
+    },
+    ProjectRuns {
+        execution: ExecutionRef,
+        #[serde(default)]
+        before_version: Option<i64>,
+    },
+    TeamTurns {
+        execution: ExecutionRef,
+        #[serde(default)]
+        after_turn: u32,
+    },
+    DagInstances {
+        execution: ExecutionRef,
+        step: String,
+        #[serde(default)]
+        index: Option<usize>,
+        #[serde(default)]
+        offset: usize,
+        limit: usize,
+    },
+    DagInstanceEvents {
+        execution: ExecutionRef,
+        step: String,
+        index: usize,
+        #[serde(default)]
+        after: i64,
+    },
+    DagSteps {
+        execution: ExecutionRef,
+        #[serde(default)]
+        step: Option<String>,
+    },
+    /// One DAG step's event stream: the step's child session for `agent`
+    /// steps, otherwise the run session filtered down to this step.
+    DagStepEvents {
+        execution: ExecutionRef,
+        step: String,
+        #[serde(default)]
+        after: i64,
+    },
+    Artifact {
+        request: ArtifactRequest,
+    },
+    /// Structured local maintenance; execution control uses Command with an ID.
+    Maintenance {
+        command: ExecutionCommand,
+    },
+}
+
+impl NodeOperation {
+    /// Queries do not change execution inventory. Mutations still publish load
+    /// before their reply; periodic and revision-driven reports remain active.
+    pub fn refreshes_inventory(&self) -> bool {
+        match self {
+            Self::Brain { .. }
+            | Self::Admission { .. }
+            | Self::Create { .. }
+            | Self::Command { .. }
+            | Self::Maintenance { .. } => true,
+            Self::Inspect { .. }
+            | Self::AcceptedRequest { .. }
+            | Self::Events { .. }
+            | Self::EventPayload { .. }
+            | Self::DetailField { .. }
+            | Self::Messages { .. }
+            | Self::TodoItems { .. }
+            | Self::ProjectRuns { .. }
+            | Self::TeamTurns { .. }
+            | Self::DagInstances { .. }
+            | Self::DagInstanceEvents { .. }
+            | Self::DagSteps { .. }
+            | Self::DagStepEvents { .. }
+            | Self::Artifact { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcReply {
+    pub status: u16,
+    pub body: Value,
+}
+
+impl RpcReply {
+    pub fn ok(body: Value) -> Self {
+        Self { status: 200, body }
+    }
+    pub fn error(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: serde_json::json!({"error": message.into()}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerFrame {
+    Call {
+        request_id: String,
+        operation: NodeOperation,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NodeFrame {
+    Brain {
+        execution: ExecutionRef,
+        action: String,
+        input: Value,
+    },
+    Hello {
+        registration: NodeRegistration,
+        snapshot: NodeSnapshot,
+    },
+    Snapshot {
+        snapshot: NodeSnapshot,
+    },
+    IndexReport {
+        report: IndexReportEnvelope,
+    },
+    Reply {
+        request_id: String,
+        reply: RpcReply,
+    },
+}
+
+/// One team member: the member *is* an agent (identity = agent name).
+/// `capabilities` is not user input — the control plane freezes the agent's
+/// brain-bound capability summaries into the pinned definition at resolve
+/// time (`serde(default)` keeps the minimal `{agent}` wire shape legal).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMember {
+    pub agent: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamDefinition {
+    pub name: String,
+    pub captain: String,
+    pub members: Vec<TeamMember>,
+}
+
+impl TeamDefinition {
+    /// Validate and canonicalize in place. Member agent names and the
+    /// captain are trimmed first — mirroring brain bind's trim-on-store —
+    /// so every consumer (capability resolve, worker member keying, the
+    /// SPA echo) agrees on one agent key. Without this a padded name
+    /// validated but matched nothing at resolve time, freezing an empty
+    /// capability snapshot; names that collide only after trimming are
+    /// caught by the duplicate check.
+    pub fn validate(&mut self) -> Result<(), String> {
+        self.captain = self.captain.trim().to_string();
+        for member in &mut self.members {
+            member.agent = member.agent.trim().to_string();
+        }
+        let agents: std::collections::HashSet<_> = self.members.iter().map(|m| &m.agent).collect();
+        if !valid_id(&self.name)
+            || !self.name.as_bytes()[0].is_ascii_alphanumeric()
+            || self
+                .name
+                .bytes()
+                .any(|b| !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+            || self.name == "system"
+            || self.members.is_empty()
+            || agents.len() != self.members.len()
+            || !agents.contains(&self.captain)
+            || self.members.iter().any(|m| m.agent.is_empty())
+        {
+            return Err("team requires a unique non-empty agent per member and a captain belonging to the team; the team name 'system' is reserved".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityTarget {
+    pub kind: ExecutionKind,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_outputs: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Project the new variant into plain data so the round-trip assertions
+    /// do not need `PartialEq` on the whole operation enum.
+    fn describe_step_events(operation: NodeOperation) -> Option<(String, String, i64)> {
+        match operation {
+            NodeOperation::DagStepEvents {
+                execution,
+                step,
+                after,
+            } => Some((execution.id, step, after)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn execution_reference_preserves_explicit_kind() {
+        let index = ExecutionIndex {
+            id: "agent-example".into(),
+            created_at: 7,
+            kind: ExecutionKind::Agent,
+            node_id: "node-a".into(),
+            status: ExecutionStatus::Running,
+        };
+
+        assert_eq!(
+            index.execution_ref(),
+            ExecutionRef {
+                id: "agent-example".into(),
+                kind: ExecutionKind::Agent,
+            }
+        );
+    }
+
+    #[test]
+    fn team_definition_accepts_the_minimal_agent_shape() {
+        let mut team: TeamDefinition = serde_json::from_value(serde_json::json!({
+            "name": "release", "captain": "act",
+            "members": [{"agent": "act"}, {"agent": "plan", "capabilities": ["db 迁移"]}]
+        }))
+        .unwrap();
+        assert!(team.validate().is_ok());
+        assert!(team.members[0].capabilities.is_empty());
+        assert_eq!(team.members[1].capabilities, vec!["db 迁移"]);
+        // Legacy member fields (id/role) are ignored on deserialize.
+        let mut legacy: TeamDefinition = serde_json::from_value(serde_json::json!({
+            "name": "release", "captain": "act",
+            "members": [{"id": "m1", "agent": "act", "role": "captain"}]
+        }))
+        .unwrap();
+        assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn team_definition_rejects_duplicate_blank_and_foreign_captain() {
+        for body in [
+            serde_json::json!({"name":"t","captain":"act","members":[{"agent":"act"},{"agent":"act"}]}),
+            serde_json::json!({"name":"t","captain":"act","members":[{"agent":"act"},{"agent":"  "}]}),
+            serde_json::json!({"name":"t","captain":"plan","members":[{"agent":"act"}]}),
+            serde_json::json!({"name":"t","captain":"act","members":[]}),
+            serde_json::json!({"name":"system","captain":"act","members":[{"agent":"act"}]}),
+        ] {
+            let mut team: TeamDefinition = serde_json::from_value(body).unwrap();
+            assert!(team.validate().is_err(), "{team:?}");
+        }
+    }
+
+    #[test]
+    fn team_definition_trims_padded_member_and_captain_names() {
+        let mut team: TeamDefinition = serde_json::from_value(serde_json::json!({
+            "name": "release", "captain": " plan ",
+            "members": [{"agent": " act "}, {"agent": "plan"}]
+        }))
+        .unwrap();
+        assert!(team.validate().is_ok());
+        assert_eq!(team.captain, "plan");
+        assert_eq!(team.members[0].agent, "act");
+
+        // Names that collide only after trimming are duplicates, not twins
+        // that would key two worker sessions apart.
+        let mut twins: TeamDefinition = serde_json::from_value(serde_json::json!({
+            "name": "release", "captain": "act", "members": [{"agent": "act"}, {"agent": " act "}]
+        }))
+        .unwrap();
+        assert!(twins.validate().is_err(), "{twins:?}");
+    }
+
+    #[test]
+    fn wire_index_requires_kind() {
+        let missing_kind = serde_json::json!({
+            "id": "agent-example",
+            "created_at": 7,
+            "node_id": "node-a",
+            "status": "running"
+        });
+        assert!(serde_json::from_value::<ExecutionIndex>(missing_kind).is_err());
+
+        let operation = NodeOperation::Inspect {
+            execution: ExecutionRef {
+                id: "agent-example".into(),
+                kind: ExecutionKind::Agent,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(operation).unwrap(),
+            serde_json::json!({
+                "operation": "inspect",
+                "execution": {"id": "agent-example", "kind": "agent"}
+            })
+        );
+    }
+
+    #[test]
+    fn dag_step_events_wire_shape_is_additive() {
+        let operation = NodeOperation::DagStepEvents {
+            execution: ExecutionRef {
+                id: "dag-run-1".into(),
+                kind: ExecutionKind::Dag,
+            },
+            step: "fetch".into(),
+            after: 12,
+        };
+        let wire = serde_json::to_value(&operation).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "operation": "dag_step_events",
+                "execution": {"id": "dag-run-1", "kind": "dag"},
+                "step": "fetch",
+                "after": 12
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<NodeOperation>(wire)
+                .map(describe_step_events)
+                .unwrap(),
+            Some(("dag-run-1".to_string(), "fetch".to_string(), 12))
+        );
+
+        // Backward compatible: a caller that omits `after` starts from 0, and
+        // the pre-existing `dag_steps` wire shape is untouched.
+        let defaulted = serde_json::from_value::<NodeOperation>(serde_json::json!({
+            "operation": "dag_step_events",
+            "execution": {"id": "dag-run-1", "kind": "dag"},
+            "step": "fetch"
+        }))
+        .map(describe_step_events)
+        .unwrap();
+        assert_eq!(
+            defaulted,
+            Some(("dag-run-1".to_string(), "fetch".to_string(), 0))
+        );
+        assert_eq!(
+            serde_json::to_value(NodeOperation::DagSteps {
+                execution: ExecutionRef {
+                    id: "dag-run-1".into(),
+                    kind: ExecutionKind::Dag,
+                },
+                step: None,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "operation": "dag_steps",
+                "execution": {"id": "dag-run-1", "kind": "dag"},
+                "step": null
+            })
+        );
+        // A step is mandatory: without it the operation is not decodable.
+        assert!(serde_json::from_value::<NodeOperation>(serde_json::json!({
+            "operation": "dag_step_events",
+            "execution": {"id": "dag-run-1", "kind": "dag"}
+        }))
+        .is_err());
+    }
+}

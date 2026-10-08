@@ -9,11 +9,17 @@
 //! independent all-space spans whose width carries the slot exactly — no
 //! 4-vs-2-space guessing — and rows that merely *contain* decoration glyphs
 //! (e.g. `---` YAML frontmatter inside a fenced block, which carries a `│ `
-//! prefix span) are content, not chrome, and survive verbatim.
+//! prefix span) are content, not chrome, and survive verbatim. The merged
+//! `{❯|▸} Say(n step{s}): ` pair header is half-chrome: its label and live
+//! spinner spans go, but its preview span is the Say's first line and
+//! survives (see [`LineKind::SayPairHeader`]).
 
 use ratatui::text::{Line, Span};
 
-use crate::chat::{PLAN_HEADER, ROLE_SAY_HEADER, ROLE_USER_HEADER};
+use crate::chat::{
+    GROUP_ROW_CLOSED_PREFIX, GROUP_ROW_OPEN_PREFIX, PLAN_HEADER, ROLE_SAY_HEADER, ROLE_USER_HEADER,
+    STEP_ROW_CLOSED_PREFIX, STEP_ROW_OPEN_PREFIX, STEP_THINKING_HEADER,
+};
 use crate::markdown::{
     CODE_BOTTOM, CODE_ROW_EMPTY, CODE_ROW_PREFIX, CODE_TOP_PREFIX, QUOTE_PREFIX, RULE_LINE,
 };
@@ -37,6 +43,23 @@ pub(crate) enum LineKind {
     Rule,
     /// `╸─ plan ─╸` plan header — dropped.
     PlanHeader,
+    /// `❯ Step(n)` / `▸ Step(n)` step row — dropped (chrome).
+    StepRow,
+    /// `❯ N Steps` / `▸ N Steps` group row (optionally + spinner span) —
+    /// dropped (chrome).
+    GroupRow,
+    /// `❯ N Function calls` / `▸ N Function calls` aggregation row —
+    /// dropped (chrome).
+    CallsRow,
+    /// `{❯|▸} Say(n step{s}): ` merged pair header — the label span (and the
+    /// live `⠋ running ` spinner span) are chrome, but the preview payload
+    /// span is the Say's first line and must survive: the body below SKIPS
+    /// that line (preview dedup, `merged_say_body`) and a single-line Say
+    /// renders body-hidden, so this row is the ONLY place that line exists.
+    SayPairHeader,
+    /// `💭 Thinking` header row (standalone expanded block, or an open
+    /// step's folded thinking) — dropped.
+    ThinkingHeader,
 }
 
 /// Classify a rendered line and report its decoration slot width in
@@ -74,6 +97,9 @@ fn classify_spans(spans: &[Span<'_>]) -> Option<(LineKind, usize)> {
         if t == ROLE_USER_HEADER || t == ROLE_SAY_HEADER {
             return Some((LineKind::RoleHeader, 0));
         }
+        if t == STEP_THINKING_HEADER {
+            return Some((LineKind::ThinkingHeader, 0));
+        }
         if t == RULE_LINE {
             return Some((LineKind::Rule, 0));
         }
@@ -83,13 +109,99 @@ fn classify_spans(spans: &[Span<'_>]) -> Option<(LineKind, usize)> {
         if t == PLAN_HEADER {
             return Some((LineKind::PlanHeader, 0));
         }
+        // Step rows carry the step label as ONE span after the indent gutter;
+        // a markdown row could only collide by literally opening with
+        // `❯ Step(` / `▸ Step(` as its entire first span.
+        if t.starts_with(STEP_ROW_OPEN_PREFIX) || t.starts_with(STEP_ROW_CLOSED_PREFIX) {
+            return Some((LineKind::StepRow, 0));
+        }
         // `┌ {label} ` with any (possibly empty) label. A code *content* row
         // can never match: it always carries a `│ ` prefix span first.
         if t.starts_with(CODE_TOP_PREFIX) && t.ends_with(' ') && !t.contains('\n') {
             return Some((LineKind::CodeTop, 0));
         }
     }
+    if is_group_row(spans) {
+        return Some((LineKind::GroupRow, 0));
+    }
+    if is_calls_row(spans) {
+        return Some((LineKind::CallsRow, 0));
+    }
+    if is_say_pair_header(spans) {
+        return Some((LineKind::SayPairHeader, 0));
+    }
     None
+}
+
+/// `true` for the merged StepGroup+Say pair header: one styled
+/// `{❯|▸} Say(n step{s}): ` label span (count digits, singular/plural),
+/// optionally followed by the preview and `⠋ running ` spinner spans.
+/// Half-chrome (unlike the standalone role headers): the Say body below
+/// SKIPS its preview line (a single-line Say renders body-hidden entirely),
+/// so the header's preview payload is the ONLY rendering of that line;
+/// only the label/spinner spans are chrome (see
+/// [`LineKind::SayPairHeader`] / [`say_pair_payload`]). A markdown row
+/// could only collide by literally opening with the
+/// glyph + `Say(` label as its entire first span.
+fn is_say_pair_header(spans: &[Span<'_>]) -> bool {
+    let Some(first) = spans.first() else {
+        return false;
+    };
+    let t = first.content.as_ref();
+    let Some(body) = t
+        .strip_prefix(GROUP_ROW_OPEN_PREFIX)
+        .or_else(|| t.strip_prefix(GROUP_ROW_CLOSED_PREFIX))
+    else {
+        return false;
+    };
+    let Some(inner) = body.strip_prefix("Say(") else {
+        return false;
+    };
+    let Some((count, tail)) = inner.split_once(" step") else {
+        return false;
+    };
+    !count.is_empty()
+        && count.bytes().all(|b| b.is_ascii_digit())
+        && (tail == "): " || tail == "s): ")
+}
+
+/// Match one fold-glyph count row — a single label span `{❯|▸} {count}{unit}`
+/// (unit given as its plural/singular suffixes), optionally followed by the
+/// `⠋ running ` spinner span — returning the count. The label is navigation
+/// chrome, so a markdown row could only collide by being exactly such a
+/// label (same caveat as StepRow). Shared by the group and calls rows.
+fn count_row_label(spans: &[Span<'_>], plural: &str, singular: &str) -> Option<u32> {
+    let (label, spinner) = match spans {
+        [label] => (label, None),
+        [label, spinner] => (label, Some(spinner)),
+        _ => return None,
+    };
+    if spinner.is_some_and(|sp| !sp.content.ends_with("running ")) {
+        return None;
+    }
+    let t = label.content.as_ref();
+    let body = t
+        .strip_prefix(GROUP_ROW_OPEN_PREFIX)
+        .or_else(|| t.strip_prefix(GROUP_ROW_CLOSED_PREFIX))?;
+    let count = body
+        .strip_suffix(plural)
+        .or_else(|| body.strip_suffix(singular))?;
+    if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    count.parse().ok()
+}
+
+/// `true` for the group's L0 row: one span `{❯|▸} N Steps` (count non-empty,
+/// digits), optionally followed by the `⠋ running ` spinner span.
+fn is_group_row(spans: &[Span<'_>]) -> bool {
+    count_row_label(spans, " Steps", " Step").is_some()
+}
+
+/// `true` for a step's calls aggregation row. The renderer supplies its
+/// four-space gutter as a separate span, removed by `classify` first.
+fn is_calls_row(spans: &[Span<'_>]) -> bool {
+    count_row_label(spans, " Function calls", " Function call").is_some()
 }
 
 /// Width of `s` when it is a pure ASCII-space gutter span of 1..=8 columns.
@@ -116,17 +228,43 @@ pub fn plain_text(line: &Line<'_>) -> String {
 pub fn clean_line(line: &Line<'_>) -> Option<String> {
     let (kind, _) = classify(line);
     match kind {
+        // The merged pair header's preview span IS the Say's first line —
+        // and its only rendering once the body dedup kicks in.
+        LineKind::SayPairHeader => say_pair_payload(skip_gutter(line.spans.as_slice())),
         LineKind::RoleHeader
+        | LineKind::ThinkingHeader
         | LineKind::CodeTop
         | LineKind::CodeBottom
         | LineKind::Rule
-        | LineKind::PlanHeader => None,
+        | LineKind::PlanHeader
+        | LineKind::StepRow
+        | LineKind::GroupRow
+        | LineKind::CallsRow => None,
         // Code payloads stay verbatim (only the `│ `/`│` slot goes); text
         // rows additionally lose a `▎ ` quote prefix inside their first
         // content span, since blockquotes push it into the text span.
         LineKind::CodeRow => Some(payload_text(line, false)),
         LineKind::Text => Some(payload_text(line, true)),
     }
+}
+
+/// Payload of the merged Say pair header: the preview span between the
+/// label span and the (optional) trailing live-spinner span. `None` when
+/// there is no preview (whitespace-only Say — nothing to copy).
+fn say_pair_payload(spans: &[Span<'_>]) -> Option<String> {
+    // spans[0] is the label (validated by `is_say_pair_header`); the
+    // spinner span shape is `"  {glyph} running "` (two leading spaces +
+    // `running ` tail — same grammar `count_row_label` matches).
+    let mut rest = spans.get(1..).unwrap_or(&[]);
+    if let Some(last) = rest.last() {
+        let t = last.content.as_ref();
+        if t.starts_with("  ") && t.ends_with("running ") {
+            rest = &rest[..rest.len() - 1];
+        }
+    }
+    let preview: String = rest.iter().map(|s| s.content.as_ref()).collect();
+    let preview = preview.trim();
+    (!preview.is_empty()).then(|| preview.to_string())
 }
 
 /// Concatenate the line's span payload after removing decoration slots
@@ -201,6 +339,7 @@ mod tests {
         run(&[
             ("role user header", &[ROLE_USER_HEADER], None),
             ("role say header", &[ROLE_SAY_HEADER], None),
+            ("thinking header", &[STEP_THINKING_HEADER], None),
             ("plan header", &[PLAN_HEADER], None),
             ("rule line", &[RULE_LINE], None),
             ("code bottom frame", &[CODE_BOTTOM], None),
@@ -210,6 +349,12 @@ mod tests {
             (
                 "role header behind 4-gutter",
                 &["    ", ROLE_SAY_HEADER],
+                None,
+            ),
+            // An open step's folded-thinking header sits behind a 4-gutter.
+            (
+                "thinking header behind 4-gutter",
+                &["    ", STEP_THINKING_HEADER],
                 None,
             ),
             ("rule behind 4-gutter", &["    ", RULE_LINE], None),
@@ -301,10 +446,13 @@ mod tests {
                 &["\u{25b8} bash ls -la"],
                 Some("\u{25b8} bash ls -la"),
             ),
+            // A COLLAPSED standalone Thinking header carries the line count
+            // in the same span, so it does not exact-match the chrome shape
+            // and survives verbatim.
             (
-                "thinking header",
-                &["\u{1f4ad} Thinking"],
-                Some("\u{1f4ad} Thinking"),
+                "collapsed thinking header keeps count",
+                &["\u{1f4ad} Thinking (3 lines)"],
+                Some("\u{1f4ad} Thinking (3 lines)"),
             ),
             // Tool/thinking body rows merge their 2-space lead into the
             // content span — no all-space gutter span, nothing to strip.
@@ -363,6 +511,21 @@ mod tests {
             (&[RULE_LINE], LineKind::Rule, 0),
             (&[CODE_BOTTOM], LineKind::CodeBottom, 0),
             (&[PLAN_HEADER], LineKind::PlanHeader, 0),
+            (&[STEP_THINKING_HEADER], LineKind::ThinkingHeader, 0),
+            (&["    ", STEP_THINKING_HEADER], LineKind::ThinkingHeader, 4),
+            (&["\u{25b8} 2 Steps"], LineKind::GroupRow, 0),
+            (&["\u{276f} 1 Step"], LineKind::GroupRow, 0),
+            (
+                &["    ", "\u{25b8} 2 Function calls"],
+                LineKind::CallsRow,
+                4,
+            ),
+            (&["\u{25b8} Say(1 step): ", "x"], LineKind::SayPairHeader, 0),
+            (
+                &["\u{276f} Say(2 steps): ", "x", "  \u{280b} running "],
+                LineKind::SayPairHeader,
+                0,
+            ),
             (&["\u{250c} rust "], LineKind::CodeTop, 0),
             (&[CODE_ROW_PREFIX, "x"], LineKind::CodeRow, 2),
             (&[CODE_ROW_EMPTY], LineKind::CodeRow, 1),
@@ -388,5 +551,107 @@ mod tests {
     fn plain_text_concatenates_spans() {
         assert_eq!(plain_text(&line_of(&["a", "b", "c"])), "abc");
         assert_eq!(plain_text(&Line::from("")), "");
+    }
+
+    #[test]
+    fn say_pair_headers_keep_preview_payload() {
+        run(&[
+            (
+                "closed singular + preview",
+                &["\u{25b8} Say(1 step): ", "the answer"],
+                Some("the answer"),
+            ),
+            (
+                "open plural + preview",
+                &["\u{276f} Say(2 steps): ", "first line"],
+                Some("first line"),
+            ),
+            (
+                "preview + live spinner",
+                &["\u{25b8} Say(1 step): ", "ans", "  \u{280b} running "],
+                Some("ans"),
+            ),
+            (
+                "streaming, empty preview",
+                &["\u{276f} Say(1 step): ", "  \u{280b} running "],
+                None,
+            ),
+            ("no preview span", &["\u{25b8} Say(1 step): "], None),
+            (
+                "whitespace-only preview",
+                &["\u{25b8} Say(1 step): ", "   "],
+                None,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn group_rows_are_dropped_with_and_without_spinner() {
+        run(&[
+            ("closed singular", &["\u{25b8} 1 Step"], None),
+            ("closed plural", &["\u{25b8} 3 Steps"], None),
+            ("open marker", &["\u{276f} 2 Steps"], None),
+            ("open singular", &["\u{276f} 1 Step"], None),
+            (
+                "marker + spinner",
+                &["\u{25b8} 2 Steps", "  \u{280b} running "],
+                None,
+            ),
+            (
+                "open marker + spinner",
+                &["\u{276f} 1 Step", "  \u{2824} running "],
+                None,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn calls_aggregation_rows_are_dropped() {
+        run(&[
+            (
+                "closed singular",
+                &["    ", "\u{25b8} 1 Function call"],
+                None,
+            ),
+            ("open plural", &["    ", "\u{276f} 3 Function calls"], None),
+            ("no gutter", &["\u{25b8} 2 Function calls"], None),
+        ]);
+    }
+
+    #[test]
+    fn group_row_lookalikes_survive() {
+        run(&[
+            ("no count", &["\u{25b8} Step"], Some("\u{25b8} Step")),
+            (
+                "non-digit count",
+                &["\u{25b8} x Steps"],
+                Some("\u{25b8} x Steps"),
+            ),
+            ("missing glyph", &["1 Step"], Some("1 Step")),
+            // The old static marker glyph no longer opens a group row — a
+            // leftover-looking span is plain content.
+            (
+                "old static marker is content",
+                &["\u{2261} 2 Steps"],
+                Some("\u{2261} 2 Steps"),
+            ),
+            (
+                "spinner-less tail span is not a group row",
+                &["\u{25b8} 2 Steps", "extra"],
+                Some("\u{25b8} 2 Stepsextra"),
+            ),
+            // Three spans can never be a group row (label + spinner max).
+            (
+                "three spans",
+                &["\u{25b8} 2 Steps", "\u{280b} running ", "x"],
+                Some("\u{25b8} 2 Steps\u{280b} running x"),
+            ),
+            // Spinner span that does not end in `running ` is content.
+            (
+                "tail span is not a spinner",
+                &["\u{25b8} 2 Steps", "\u{280b} paused"],
+                Some("\u{25b8} 2 Steps\u{280b} paused"),
+            ),
+        ]);
     }
 }

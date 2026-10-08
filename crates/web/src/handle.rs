@@ -6,7 +6,7 @@
 //! /events replays persisted events after a cursor, then forwards the live
 //! broadcast — so any process (or browser tab) sees a consistent stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -14,15 +14,19 @@ use anyhow::Result;
 use opencoder_core::Config;
 use opencoder_llm::{ChatClient, ChatStream};
 use opencoder_session::compaction;
-use opencoder_session::plan_handoff;
+use opencoder_session::handoff;
 use opencoder_session::tools::registry as build_registry;
-use opencoder_session::{resume_and_replay as resume_session, run, SessionEvent};
-use opencoder_store::{Delivery, EventKind, SessionInput, SessionPatch, Store};
+use opencoder_session::SessionEvent;
+use opencoder_store::{
+    Delivery, EventKind, InputAdmission, InputConflict, SessionInput, SessionPatch, Store,
+};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::cmd::DrainCmd;
+mod drain;
+use drain::{drain_to_completion, DrainContext};
 
 /// Shared SSE envelope (re-exported from `opencoder-core` so the server and a
 /// remote client agree on the wire shape).
@@ -46,6 +50,18 @@ pub fn sse_from_session_event(_session_id: &str, ev: &SessionEvent) -> (SseEvt, 
 /// the background drain task.
 pub struct SessionHandle {
     pub tx: broadcast::Sender<SseEvt>,
+    /// pre-subscribe gap 桥接：近期已广播事件的环形快照。
+    ///
+    /// SSE 客户端通常在 POST /prompt 之后才建立连接，而 drain 侧的事件落库走
+    /// 异步 flusher（`event_sink` 对 delta 攒批），因此存在一个窗口：事件已
+    /// `broadcast` 但客户端尚未 subscribe、且回放查询 `events_after` 执行时还
+    /// 未落库 —— 该事件对这条连接永久丢失（实测 reasoning_delta 丢失导致直播
+    /// 态布局与 done 后快照重建不一致）。此 ring 让订阅者在 subscribe 原子地
+    /// 拿到「已广播」快照，由 `get_events` 补发其中未被回放覆盖的条目。
+    ///
+    /// 容量与 `event_sink::CAPACITY`(4096) 对齐：flusher 批次上限 512，环形
+    /// 缓冲只需覆盖 flusher 攒批滞后 + 订阅延迟，4096 足以兜住整个在途 turn。
+    pub recent: std::sync::Mutex<VecDeque<SseEvt>>,
     pub cancel: Mutex<CancellationToken>,
     pub overrides: Mutex<RuntimeOverrides>,
     pub draining: AtomicBool,
@@ -84,12 +100,43 @@ pub struct SessionHandle {
 
 const BROADCAST_CAPACITY: usize = 256;
 
+/// 近期广播环形缓冲容量：与 `event_sink::CAPACITY`(4096) 对齐。flusher 的
+/// delta 批次上限是 512（条数）/8KB，环形缓冲只需覆盖「flusher 攒批滞后 +
+/// 订阅延迟」即可保证不丢，4096 与 flusher channel 同量级兜底。
+const RING_CAP: usize = 4096;
+
+impl SessionHandle {
+    /// 广播一条 SSE 事件：先入 ring、再发直播流。
+    ///
+    /// 锁序是关键：append(ring) 与 send(tx) 在同一把 `recent` 锁内完成，而
+    /// `subscribe_recent` 的「subscribe(tx) + ring 快照」也持同一把锁，两者
+    /// 互斥。由此保证：subscribe 之前广播的事件必然已写进快照（不会丢），
+    /// subscribe 之后广播的事件必然只走直播流（不会因快照双发）。
+    /// `broadcast::Sender::send` 本身非阻塞，锁内调用安全。
+    pub fn broadcast_evt(&self, sse: SseEvt) {
+        let mut ring = self.recent.lock().expect("recent ring poisoned");
+        ring.push_back(sse.clone());
+        while ring.len() > RING_CAP {
+            ring.pop_front();
+        }
+        let _ = self.tx.send(sse);
+    }
+
+    /// 订阅直播流并原子地取得 ring 快照（见 `broadcast_evt` 的锁序说明）。
+    /// 快照返回后调用方自行用回放窗口做指纹/seq 去重，只补发未落库条目。
+    pub fn subscribe_recent(&self) -> (broadcast::Receiver<SseEvt>, Vec<SseEvt>) {
+        let ring = self.recent.lock().expect("recent ring poisoned");
+        (self.tx.subscribe(), ring.iter().cloned().collect())
+    }
+}
+
 impl SessionHandle {
     pub fn new() -> Arc<Self> {
         let (tx, _rx) = broadcast::channel::<SseEvt>(BROADCAST_CAPACITY);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<DrainCmd>();
         Arc::new(SessionHandle {
             tx,
+            recent: std::sync::Mutex::new(VecDeque::new()),
             cancel: Mutex::new(CancellationToken::new()),
             overrides: Mutex::new(RuntimeOverrides::default()),
             draining: AtomicBool::new(false),
@@ -110,13 +157,23 @@ impl SessionHandle {
 #[derive(Debug)]
 pub enum AdmissionError {
     BusyModeSwitch,
+    InputConflict(InputConflict),
     Other(anyhow::Error),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainAdmission {
+    pub seq: i64,
+    /// This input is new or still pending, so the Web lifecycle owns driving
+    /// it. `false` means the stable input was already consumed.
+    pub driver_ensured: bool,
 }
 
 impl std::fmt::Display for AdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BusyModeSwitch => write!(f, "mode switch refused while drain running"),
+            Self::InputConflict(error) => write!(f, "{error}"),
             Self::Other(error) => write!(f, "{error:#}"),
         }
     }
@@ -126,7 +183,10 @@ impl std::error::Error for AdmissionError {}
 
 impl From<anyhow::Error> for AdmissionError {
     fn from(error: anyhow::Error) -> Self {
-        Self::Other(error)
+        match error.downcast::<InputConflict>() {
+            Ok(conflict) => Self::InputConflict(conflict),
+            Err(error) => Self::Other(error),
+        }
     }
 }
 
@@ -206,7 +266,9 @@ impl<S> Drop for DropGuardStream<S> {
     }
 }
 
-pub(crate) use crate::handle_lifecycle::release_events_subscriber;
+pub(crate) use crate::handle_lifecycle::{
+    broadcast_persist_event, ensure_run_error_frame, release_events_subscriber,
+};
 
 /// Admit a prompt durably, then ensure exactly one drain task is running.
 #[allow(clippy::too_many_arguments)]
@@ -222,9 +284,11 @@ pub async fn admit_and_drain(
     config: Config,
 ) -> Result<i64> {
     admit_and_drain_guarded(
-        handles, store, session_id, prompt, images, delivery, client, workdir, config, None, false,
+        handles, store, session_id, prompt, images, delivery, client, workdir, None, config, None,
+        None, None, false,
     )
     .await
+    .map(|admission| admission.seq)
     .map_err(anyhow::Error::new)
 }
 
@@ -246,10 +310,15 @@ pub async fn admit_and_drain_guarded(
     delivery: Delivery,
     client: Arc<dyn ChatStream>,
     workdir: std::path::PathBuf,
+    // Frozen per-execution config home (operator isolation). `None` keeps
+    // the default `~/.opencoder` discovery for the drain's config reloads.
+    config_home: Option<std::path::PathBuf>,
     config: Config,
+    input_id: Option<String>,
     skill: Option<String>,
+    display: Option<String>,
     agent_override: bool,
-) -> std::result::Result<i64, AdmissionError> {
+) -> std::result::Result<DrainAdmission, AdmissionError> {
     let (handle, lifecycle) =
         crate::handle_lifecycle::lock_session_lifecycle(&handles, session_id).await;
     if agent_override && handle.draining.load(Ordering::SeqCst) {
@@ -270,32 +339,59 @@ pub async fn admit_and_drain_guarded(
             // (store_error_surfacing.rs) after the admission refactor.
             .map_err(|e| anyhow::anyhow!("persist skill: {e:#}"))?;
     }
+    let idempotent = input_id.is_some();
     let input = SessionInput {
         seq: None,
-        id: uuid::Uuid::new_v4().to_string(),
+        id: input_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         session_id: session_id.to_string(),
         delivery,
         prompt,
         images,
-        display_text: None,
+        display_text: display,
         admitted_seq: 0,
         promoted_seq: None,
     };
-    let seq = store.admit_input(&input).await?;
-    let started_new_drain = start_drain_locked(
-        handles.clone(),
-        store.clone(),
-        session_id,
-        client.clone(),
-        workdir.clone(),
-        config.clone(),
-        &handle,
-    )
-    .await;
+    let admission = if idempotent {
+        store.admit_input_once(&input).await?
+    } else {
+        InputAdmission {
+            seq: store.admit_input(&input).await?,
+            inserted: true,
+        }
+    };
+    // Capture an already-running driver while the session lifecycle lock is
+    // held. Even if that driver finishes before this call returns, callers
+    // have a durable credential that they must not start a second driver for
+    // this admission.
+    let driver_was_active = handle.draining.load(Ordering::SeqCst);
+    // A stable-id retry may refer to an already-consumed row. Starting a
+    // drain for that row would replay the session without a new input. A
+    // crash-retry whose original row is still pending must still drive it.
+    let needs_drain = admission.inserted
+        || store
+            .pending_inputs(session_id, delivery)
+            .await?
+            .iter()
+            .any(|row| row.seq == Some(admission.seq));
+    let started_new_drain = if needs_drain {
+        start_drain_locked(
+            handles.clone(),
+            store.clone(),
+            session_id,
+            client.clone(),
+            workdir.clone(),
+            config_home.clone(),
+            config.clone(),
+            &handle,
+        )
+        .await
+    } else {
+        false
+    };
     drop(lifecycle);
-    if !started_new_drain {
+    if !started_new_drain && needs_drain {
         // Steers interrupt the current turn; queued inputs wait for idle.
-        if delivery == Delivery::Steer {
+        if admission.inserted && delivery == Delivery::Steer {
             opencoder_session::fire_turn_cancel(&handle.turn_cancel);
             opencoder_session::fire_child_cancels(&handle.child_cancels);
         }
@@ -305,6 +401,7 @@ pub async fn admit_and_drain_guarded(
         let cfg_w = config.clone();
         let client_w = client.clone();
         let wd_w = workdir.clone();
+        let ch_w = config_home.clone();
         let handle_w = handle.clone();
         tokio::spawn(async move {
             // Poll for at most ten minutes, then defensively restart if an
@@ -346,16 +443,20 @@ pub async fn admit_and_drain_guarded(
                 &sid_w,
                 client_w,
                 wd_w,
+                ch_w,
                 cfg_w,
                 &restart_handle,
             )
             .await;
         });
     }
-    if started_new_drain {
+    if started_new_drain && admission.inserted {
         let _ = opencoder_session::fire_child_cancels(&handle.child_cancels);
     }
-    Ok(seq)
+    Ok(DrainAdmission {
+        seq: admission.seq,
+        driver_ensured: driver_was_active || needs_drain,
+    })
 }
 
 /// Ensure exactly one drain task is running WITHOUT admitting a prompt.
@@ -366,11 +467,22 @@ pub async fn ensure_drain(
     session_id: &str,
     client: Arc<dyn ChatStream>,
     workdir: std::path::PathBuf,
+    config_home: Option<std::path::PathBuf>,
     config: Config,
 ) {
     let (handle, _lifecycle) =
         crate::handle_lifecycle::lock_session_lifecycle(&handles, session_id).await;
-    start_drain_locked(handles, store, session_id, client, workdir, config, &handle).await;
+    start_drain_locked(
+        handles,
+        store,
+        session_id,
+        client,
+        workdir,
+        config_home,
+        config,
+        &handle,
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -380,6 +492,7 @@ pub(crate) async fn start_drain_locked(
     session_id: &str,
     client: Arc<dyn ChatStream>,
     workdir: std::path::PathBuf,
+    config_home: Option<std::path::PathBuf>,
     config: Config,
     handle: &Arc<SessionHandle>,
 ) -> bool {
@@ -391,8 +504,29 @@ pub(crate) async fn start_drain_locked(
         }
         let sid = session_id.to_string();
         let handle_clone = handle.clone();
+        // Node admission owns a fixed resource snapshot; carry it across the
+        // native HTTP config reload and the non-inheriting tokio spawn.
+        let mut config = config;
+        config.agent.agents_dir =
+            opencoder_core::agent::scope::current_root().or(config.agent.agents_dir);
+        let resource_root = config.agent.agents_dir.clone();
         tokio::spawn(async move {
-            drain_to_completion(handles, store, &sid, client, workdir, config, handle_clone).await;
+            opencoder_core::agent::scope::with_root(
+                resource_root,
+                drain_to_completion(
+                    handles,
+                    store,
+                    &sid,
+                    client,
+                    DrainContext {
+                        workdir,
+                        config_home,
+                        config,
+                    },
+                    handle_clone,
+                ),
+            )
+            .await;
         });
         true
     } else {
@@ -417,19 +551,22 @@ pub async fn send_cmd(handles: &HandleMap, session_id: &str, cmd: DrainCmd) -> b
 async fn apply_drain_cmd(
     session: &mut opencoder_session::SessionState,
     cmd: DrainCmd,
-    tx: &broadcast::Sender<SseEvt>,
+    handle: &SessionHandle,
     sink: &opencoder_session::EventSink,
     sid: &str,
     workdir: &std::path::Path,
+    config_home: Option<&std::path::Path>,
 ) {
     // Mirror the main `run` callback: broadcast to live SSE subscribers AND
     // persist the event to the `session_events` table via the sink. Without
     // the `sink.push`, drain-command events (Compaction, Done,
-    // TranscriptReset, PlanHandoff, …) would never reach disk, so an SSE
+    // TranscriptReset, …) would never reach disk, so an SSE
     // reconnect replay (`?after=<seq>`) would silently miss them.
+    // 广播走 `broadcast_evt`（ring + 直播），与主回调同一条 pre-subscribe
+    // gap 桥接路径。
     let mut broadcast = |ev: SessionEvent| {
         let (sse, _) = sse_from_session_event(sid, &ev);
-        let _ = tx.send(sse);
+        handle.broadcast_evt(sse);
         let _ = sink.push(&ev);
     };
     match cmd {
@@ -440,8 +577,11 @@ async fn apply_drain_cmd(
                 Err(e) => broadcast(SessionEvent::Error(format!("compact: {e:#}"))),
             }
         }
+        // Execution handoff (web parity of the autopilot ACT phase): collapse
+        // the transcript to the newest assistant brief as a single synthetic
+        // directive, persist the boundary, and switch back to `act`.
         DrainCmd::Handoff { extra } => {
-            if let Some(plan) = plan_handoff::handoff(session, &extra) {
+            if handoff::reset_to_directive(session, &extra).is_some() {
                 if let Some(store) = &session.store {
                     let _ = store
                         .update_session(
@@ -450,8 +590,8 @@ async fn apply_drain_cmd(
                                 agent: Some("act".into()),
                                 handoff_seq: session.handoff_seq,
                                 handoff_plan: session.handoff_plan.clone(),
-                                clear_plan_snapshot: true,
-                                plan_input_count: Some(session.plan_input_count as i64),
+                                clear_summary: true,
+                                clear_skill: true,
                                 updated_at: Some(opencoder_core::message::now_ms()),
                                 ..Default::default()
                             },
@@ -459,26 +599,23 @@ async fn apply_drain_cmd(
                         .await;
                 }
                 broadcast(SessionEvent::TranscriptReset(session.messages.clone()));
-                broadcast(SessionEvent::PlanHandoff(plan));
                 broadcast(SessionEvent::Done);
             } else {
-                broadcast(SessionEvent::Error("no plan to hand off".into()));
+                broadcast(SessionEvent::Error(
+                    "nothing to hand off: no assistant reply yet".into(),
+                ));
             }
         }
         DrainCmd::SetSkill(body) => {
             session.set_skill(body);
             broadcast(SessionEvent::Done);
         }
-        DrainCmd::ReloadConfig => match Config::load(workdir) {
+        // Operator isolation: the reload must reproduce the execution's
+        // frozen config home, not the daemon user's live `~/.opencoder`.
+        DrainCmd::ReloadConfig => match Config::load_with_home(workdir, config_home) {
             Ok(new_cfg) => {
                 match new_cfg.resolve_endpoint() {
-                    Ok(ep) => match ChatClient::new_with_read_timeout(
-                        &ep.base_url,
-                        &ep.api_key,
-                        &ep.headers,
-                        new_cfg.stream_idle_timeout(),
-                        new_cfg.network.proxy.as_deref(),
-                    ) {
+                    Ok(ep) => match ChatClient::from_config(&new_cfg, &ep) {
                         Ok(c) => {
                             session.apply_config_reload(new_cfg, Arc::new(c) as Arc<dyn ChatStream>)
                         }
@@ -508,9 +645,6 @@ async fn apply_drain_cmd(
         DrainCmd::SetAnnotation(text) => {
             crate::handle_questions::apply_set_annotation(session, text).await;
         }
-        DrainCmd::ResetPlanPhase => {
-            crate::handle_questions::apply_reset_plan_phase(session).await;
-        }
     }
 }
 
@@ -518,205 +652,17 @@ async fn apply_drain_cmd(
 async fn process_drain_cmds(
     session: &mut opencoder_session::SessionState,
     rx_guard: &mut CmdRxGuard,
-    tx: &broadcast::Sender<SseEvt>,
+    handle: &SessionHandle,
     sink: &opencoder_session::EventSink,
     sid: &str,
     workdir: &std::path::Path,
+    config_home: Option<&std::path::Path>,
 ) {
     if let Some(rx) = rx_guard.rx.as_mut() {
         while let Ok(cmd) = rx.try_recv() {
-            apply_drain_cmd(session, cmd, tx, sink, sid, workdir).await;
+            apply_drain_cmd(session, cmd, handle, sink, sid, workdir, config_home).await;
         }
     }
-}
-
-/// F3: bounded drain-restart budget. When a drain run fails while steer/queue
-/// inputs are still pending, the drain retries up to this many times so a
-/// transient failure (LLM 5xx, store hiccup) does not silently strand inputs
-/// the admit POST already promised to consume. Bounded so a persistently
-/// failing store/config cannot hot-loop.
-const MAX_DRAIN_RESTARTS: u32 = 2;
-
-/// Count inputs still awaiting consumption in either delivery channel. A
-/// store read error counts as zero: an unreadable store must not be mistaken
-/// for "client still owed inputs" and resurrect a failing drain.
-async fn pending_input_count(store: &Arc<dyn Store>, sid: &str) -> usize {
-    store
-        .pending_inputs(sid, Delivery::Steer)
-        .await
-        .unwrap_or_default()
-        .len()
-        + store
-            .pending_inputs(sid, Delivery::Queue)
-            .await
-            .unwrap_or_default()
-            .len()
-}
-
-/// Pure restart policy for the drain loop: retry only when the attempt
-/// failed, the client is still owed pending inputs, the drain was not
-/// hard-cancelled (POST /stop semantics must be preserved), and the retry
-/// budget remains.
-fn should_restart_drain(
-    result: &Result<()>,
-    pending: usize,
-    cancelled: bool,
-    attempt: u32,
-) -> bool {
-    result.is_err() && pending > 0 && !cancelled && attempt < MAX_DRAIN_RESTARTS
-}
-
-/// Drive the session runner to completion, broadcasting events.
-async fn drain_to_completion(
-    handles: HandleMap,
-    store: Arc<dyn Store>,
-    session_id: &str,
-    client: Arc<dyn ChatStream>,
-    workdir: std::path::PathBuf,
-    mut config: Config,
-    handle: Arc<SessionHandle>,
-) {
-    let guard = DrainGuard {
-        handle: handle.clone(),
-    };
-    let mut rx_guard = CmdRxGuard {
-        handle: handle.clone(),
-        rx: handle.cmd_rx.lock().map(|mut g| g.take()).ok().flatten(),
-    };
-
-    {
-        let ov = handle.overrides.lock().await;
-        if let Some(a) = &ov.agent {
-            config.agent.default = a.clone();
-        }
-        if let Some(m) = &ov.model {
-            config.model = m.clone();
-        }
-    }
-
-    let cancel_token = handle.cancel.lock().await.clone();
-    let mut session = match resume_session(
-        store.clone(),
-        session_id,
-        config.clone(),
-        client.clone(),
-        workdir.clone(),
-        Some(cancel_token),
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(session_id, error = %e, "drain: cannot resume (session row missing?)");
-            let mut map = handles.lock().await;
-            // Only reclaim the map entry when nobody is listening. Live SSE
-            // subscribers still hold THIS handle's broadcast receiver: removing
-            // the entry would orphan them (a later prompt creates a NEW
-            // handle/tx they never receive, and their eventual
-            // `release_events_subscriber` would decrement that fresh instance's
-            // counter — underflow). The check runs under the map lock, which is
-            // the same lock every subscribe/increment takes, so a zero count is
-            // authoritative. With subscribers attached, keep the entry: the
-            // normal eviction path (last subscriber leaves while idle) reclaims
-            // it later. Also only remove when the entry is still THIS instance —
-            // it may have been deleted + recreated meanwhile (e.g. DELETE).
-            let still_current = map.get(session_id).is_some_and(|h| Arc::ptr_eq(h, &handle));
-            let live =
-                handle.subscribers.load(Ordering::SeqCst) > 0 || handle.tx.receiver_count() > 0;
-            if live {
-                warn!(
-                    session_id,
-                    subscribers = handle.subscribers.load(Ordering::SeqCst),
-                    "drain: resume failed but SSE subscribers remain; keeping handle"
-                );
-            } else if still_current {
-                map.remove(session_id);
-            }
-            return;
-        }
-    };
-    session.cancel = Some(handle.cancel.lock().await.clone());
-    session.child_turn_cancels = handle.child_turn_cancels.clone();
-    session.child_steer_gates = handle.child_steer_gates.clone();
-    session.child_cancels = handle.child_cancels.clone();
-    session.turn_cancel = Some(handle.turn_cancel.clone());
-    // Rebind the question hub to the handle's stable instance and mark a web
-    // listener as attached: `resume_session` builds a fresh (unattached) hub,
-    // which would make every `question` tool call fall back to
-    // NO_LISTENER_REPLY. The runner's registry (runner/registry.rs) builds the
-    // `question` tool from `session.question_hub` inside `run()`, which is
-    // invoked AFTER this swap — so the tool gets exactly this handle's hub,
-    // letting the /questions endpoints answer it mid-turn.
-    session.question_hub = handle.question_hub.clone();
-    handle.question_hub.attach();
-
-    let tx = handle.tx.clone();
-    let sid = session_id.to_string();
-    let (sink, flusher) =
-        opencoder_session::spawn_event_flusher(Some(store.clone()), session_id.to_string());
-    // F3: bounded restart loop. The admit POST already answered success, so
-    // pending steer/queue rows are a durable promise — abandoning the drain on
-    // the first Err would strand them with nothing left to consume them.
-    // Retry while inputs remain pending, the hard-cancel token has not fired
-    // (POST /stop must win: run breaks cleanly on cancel and a cancelled
-    // drain is never resurrected), and the budget lasts — bounded so a
-    // persistently failing store/config cannot hot-loop. Sink / flusher / tx
-    // stay alive across retries so retried runs still persist + broadcast
-    // events; the drops below run exactly once, after the loop.
-    let mut result = Ok(());
-    for attempt in 0..=MAX_DRAIN_RESTARTS {
-        result = run(&mut session, String::new(), |ev| {
-            let (sse, _kind) = sse_from_session_event(&sid, &ev);
-            let _ = tx.send(sse);
-            let _ = sink.push(&ev);
-        })
-        .await;
-
-        // After each attempt, process queued drain commands so a restart
-        // still sees a settled command queue.
-        process_drain_cmds(&mut session, &mut rx_guard, &tx, &sink, &sid, &workdir).await;
-
-        let cancelled = session.cancel.as_ref().is_some_and(|t| t.is_cancelled());
-        if !should_restart_drain(
-            &result,
-            pending_input_count(&store, &sid).await,
-            cancelled,
-            attempt,
-        ) {
-            break;
-        }
-        if let Err(e) = &result {
-            warn!(
-                session_id,
-                attempt,
-                error = %e,
-                "drain failed with pending inputs; bounded restart"
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-
-    // Best-effort title generation after the FIRST successful completion of a
-    // drain (mirrors `crates/cli/src/run.rs`): runs while the event sink is
-    // still alive but after the run loop breaks, bounded at 30 s so a hanging
-    // small-model endpoint can never wedge teardown. `result.is_ok()` gates
-    // it to successful runs, and the title check inside makes it once-only
-    // across a session's many drains/attempt restarts. Failures only log.
-    crate::handle_questions::maybe_generate_title(&store, &session, result.is_ok()).await;
-
-    drop(sink);
-    if let Err(e) = flusher.await {
-        warn!(session_id, error = %e, "final event flush failed");
-    }
-    drop(rx_guard);
-    if let Err(e) = result {
-        warn!(session_id, error = %e, "drain ended with error");
-    }
-    // Keep `draining` true through every teardown step. Clearing it before
-    // the event flusher finished and `cmd_rx` was restored opened a tail race:
-    // an idle-only mutation (or a fresh drain) could start against a task that
-    // had not actually relinquished all of its per-session resources yet.
-    drop(guard);
 }
 
 #[cfg(test)]

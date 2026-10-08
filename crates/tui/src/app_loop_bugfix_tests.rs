@@ -71,6 +71,7 @@ async fn fold_stale_turndone_keeps_newer_turn_running() {
         &store,
         "test-session",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -119,8 +120,7 @@ async fn done_with_pending_queue_arms_drain_pending() {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();
@@ -158,6 +158,7 @@ async fn done_with_pending_queue_arms_drain_pending() {
         &store,
         "drain-test",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -207,8 +208,7 @@ async fn done_with_empty_store_goes_idle() {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
+            kind: None,
         })
         .await
         .unwrap();
@@ -231,6 +231,7 @@ async fn done_with_empty_store_goes_idle() {
         &store,
         "idle-test",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -286,6 +287,7 @@ async fn drain_pending_restart_with_dead_worker_quits() {
         &store,
         "dead-worker-test",
         &mut queue_items,
+        &mut false,
         &mut crate::queue_admitter::AdmitUiState::default(),
         &mut running,
         &mut cancelled,
@@ -315,449 +317,5 @@ async fn drain_pending_restart_with_dead_worker_quits() {
     );
 }
 
-// ----- Bug #7: sys_tokens updated before plan→act noop early return -----
-
-/// When the user presses Shift+Tab (plan→act) while a plan turn is still
-/// running AND the plan was already submitted, the switch is intercepted
-/// with an explicit busy hint ("busy — mode switch blocked, retry when
-/// idle"): the agent stays in plan mode — no deferred auto-fire, the user
-/// re-presses at a clean idle boundary.
-///
-/// Previously `*sys_tokens` (the context-meter baseline) was overwritten with
-/// the *act*-mode system-prompt token count *before* the intercepted early
-/// return, corrupting the meter for the remainder of the running plan turn.
-/// This test locks the fix: `sys_tokens` must stay at its pre-call plan-mode
-/// baseline.
-#[tokio::test]
-async fn plan_running_noop_does_not_corrupt_sys_tokens() {
-    let mut chat = ChatView {
-        agent: "plan".into(),
-        plan_submitted: true,
-        ..ChatView::default()
-    };
-
-    let mut running = true;
-    let mut follow = true;
-    let mut input = String::new();
-    let mut cursor_idx = 0usize;
-    let mut mode_flash: Option<(String, u32)> = None;
-    let anim_tick = 7u32;
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCmd>(64);
-    let mut cancel = CancellationToken::new();
-    let workdir = std::path::Path::new(".");
-    let active_skill_body: Option<String> = None;
-
-    // Pick a sentinel baseline that is guaranteed to differ from the act-mode
-    // system-prompt token count, so the assertion is meaningful.
-    let act_tokens = sys_tokens_for("act", workdir, active_skill_body.as_deref());
-    let baseline = if act_tokens == 42_000_000 {
-        13_370_042
-    } else {
-        42_000_000
-    };
-    assert_ne!(
-        baseline, act_tokens,
-        "test setup: sentinel must differ from act-mode token count"
-    );
-    let mut sys_tokens = baseline;
-
-    let outcome = handle_switch_agent(
-        "act".into(),
-        false,
-        &mut chat,
-        &mut running,
-        &mut follow,
-        &mut input,
-        &mut cursor_idx,
-        &mut mode_flash,
-        anim_tick,
-        &cmd_tx,
-        &mut cancel,
-        &mut sys_tokens,
-        workdir,
-        &active_skill_body,
-        &mut None, // last_switch_sent dedup baseline
-    )
-    .await;
-
-    // The no-op path returns Proceed without switching.
-    assert!(matches!(outcome, SwitchOutcome::Proceed));
-    // The agent must remain in plan mode (no switch happened).
-    assert_eq!(
-        chat.agent, "plan",
-        "agent must stay in plan mode on the noop"
-    );
-    // The running flag must be untouched (still running the plan turn).
-    assert!(running, "running flag must not be cleared by the noop");
-    // The flash must announce the switch is blocked while busy.
-    assert!(
-        mode_flash
-            .as_ref()
-            .is_some_and(|(msg, tick)| msg.contains("busy") && *tick == anim_tick),
-        "mode_flash must show the 'busy' banner, got {mode_flash:?}"
-    );
-    assert!(
-        mode_flash
-            .as_ref()
-            .is_some_and(|(msg, _)| msg.contains("mode switch blocked")),
-        "mode_flash must say the mode switch is blocked, got {mode_flash:?}"
-    );
-    // The key assertion: the context-meter baseline is NOT overwritten.
-    assert_eq!(
-        sys_tokens, baseline,
-        "sys_tokens must keep the plan-mode baseline on the noop path (got {sys_tokens}, \
-         act-mode count was {act_tokens})"
-    );
-    // And no switch/start command leaked out on the noop path.
-    assert!(
-        cmd_rx.try_recv().is_err(),
-        "no UiCmd must be sent on the plan-running noop path"
-    );
-}
-
-// ----- Thinking visibility: first reasoning delta must paint the label -----
-
-#[tokio::test]
-async fn first_reasoning_delta_renders_then_hidden_appends_are_coalesced() {
-    use opencoder_store::LibsqlStore;
-
-    let store: Arc<dyn opencoder_store::Store> =
-        Arc::new(LibsqlStore::open_memory().await.unwrap());
-    let mut chat = ChatView::default();
-    let mut queue_items = Vec::new();
-    let mut running = true;
-    let mut cancelled = false;
-    let mut drain_pending = false;
-    let mut skip_next_render = false;
-    let mut follow = true;
-    let (cmd_tx, _cmd_rx) = mpsc::channel::<UiCmd>(64);
-    let mut cancel = CancellationToken::new();
-    let (_evt_tx, mut evt_rx) = mpsc::channel::<UiEvent>(64);
-
-    let mut notepad: Option<crate::notepad::NotepadView> = None;
-    fold_ui_events(
-        Some(UiEvent::Session(SessionEvent::ReasoningDelta(
-            "first".into(),
-        ))),
-        &mut chat,
-        &store,
-        "thinking-render-test",
-        &mut queue_items,
-        &mut crate::queue_admitter::AdmitUiState::default(),
-        &mut running,
-        &mut cancelled,
-        &mut drain_pending,
-        &mut skip_next_render,
-        &mut follow,
-        &cmd_tx,
-        &mut cancel,
-        &mut evt_rx,
-        &mut notepad,
-        &mut None,
-        &opencoder_session::QuestionHub::new(),
-    )
-    .await;
-    assert!(
-        !skip_next_render,
-        "the first delta creates the Thinking header and must render"
-    );
-
-    let mut notepad: Option<crate::notepad::NotepadView> = None;
-    fold_ui_events(
-        Some(UiEvent::Session(SessionEvent::ReasoningDelta(
-            " second".into(),
-        ))),
-        &mut chat,
-        &store,
-        "thinking-render-test",
-        &mut queue_items,
-        &mut crate::queue_admitter::AdmitUiState::default(),
-        &mut running,
-        &mut cancelled,
-        &mut drain_pending,
-        &mut skip_next_render,
-        &mut follow,
-        &cmd_tx,
-        &mut cancel,
-        &mut evt_rx,
-        &mut notepad,
-        &mut None,
-        &opencoder_session::QuestionHub::new(),
-    )
-    .await;
-    assert!(
-        skip_next_render,
-        "later text hidden inside an existing collapsed block may skip repaint"
-    );
-}
-
-#[tokio::test]
-async fn coalesced_first_reasoning_batch_still_renders_thinking_header() {
-    use opencoder_store::LibsqlStore;
-
-    let store: Arc<dyn opencoder_store::Store> =
-        Arc::new(LibsqlStore::open_memory().await.unwrap());
-    let mut chat = ChatView::default();
-    let mut queue_items = Vec::new();
-    let mut running = true;
-    let mut cancelled = false;
-    let mut drain_pending = false;
-    let mut skip_next_render = false;
-    let mut follow = true;
-    let (cmd_tx, _cmd_rx) = mpsc::channel::<UiCmd>(64);
-    let mut cancel = CancellationToken::new();
-    let (evt_tx, mut evt_rx) = mpsc::channel::<UiEvent>(64);
-    evt_tx
-        .send(UiEvent::Session(SessionEvent::ReasoningDelta(
-            " second".into(),
-        )))
-        .await
-        .unwrap();
-
-    let mut notepad: Option<crate::notepad::NotepadView> = None;
-    fold_ui_events(
-        Some(UiEvent::Session(SessionEvent::ReasoningDelta(
-            "first".into(),
-        ))),
-        &mut chat,
-        &store,
-        "thinking-batch-test",
-        &mut queue_items,
-        &mut crate::queue_admitter::AdmitUiState::default(),
-        &mut running,
-        &mut cancelled,
-        &mut drain_pending,
-        &mut skip_next_render,
-        &mut follow,
-        &cmd_tx,
-        &mut cancel,
-        &mut evt_rx,
-        &mut notepad,
-        &mut None,
-        &opencoder_session::QuestionHub::new(),
-    )
-    .await;
-    assert!(
-        !skip_next_render,
-        "a later hidden delta must not mask the first delta's visible header"
-    );
-    assert_eq!(chat.thinking_headers().len(), 1);
-}
-
-// ----- Bug #8: dropped AgentSwitch leaves status chip stale -----
-
-/// `AgentSwitch` is delivered via `forward_event` -> `try_send`, which silently
-/// drops the event when the UI channel is completely saturated. Since
-/// `chat.agent` is written ONLY by that event, a drop leaves the `[plan]` /
-/// `[act]` status chip stuck on the pre-switch mode. The fix: `TurnDone`
-/// carries the session's authoritative agent and `fold_ui_events` reconciles
-/// `chat.agent` from it (TurnDone is sent via `send().await`, so it always
-/// arrives).
-#[tokio::test]
-async fn turn_done_reconciles_agent_when_agent_switch_dropped() {
-    use opencoder_store::LibsqlStore;
-
-    let store: Arc<dyn opencoder_store::Store> =
-        Arc::new(LibsqlStore::open_memory().await.unwrap());
-    let mut chat = ChatView {
-        agent: "plan".into(),
-        ..ChatView::default()
-    };
-    let mut queue_items: Vec<(i64, String)> = Vec::new();
-    let mut running = true;
-    let mut cancelled = false;
-    let mut drain_pending = false;
-    let mut skip_next_render = false;
-    let mut follow = true;
-    let (cmd_tx, _cmd_rx) = mpsc::channel::<UiCmd>(64);
-    let mut cancel = CancellationToken::new();
-    let (_evt_tx, mut evt_rx) = mpsc::channel::<UiEvent>(64);
-
-    let mut notepad: Option<crate::notepad::NotepadView> = None;
-    let _flow = fold_ui_events(
-        Some(UiEvent::TurnDone("act".into())),
-        &mut chat,
-        &store,
-        "test-session",
-        &mut queue_items,
-        &mut crate::queue_admitter::AdmitUiState::default(),
-        &mut running,
-        &mut cancelled,
-        &mut drain_pending,
-        &mut skip_next_render,
-        &mut follow,
-        &cmd_tx,
-        &mut cancel,
-        &mut evt_rx,
-        &mut notepad,
-        &mut None,
-        &opencoder_session::QuestionHub::new(),
-    )
-    .await;
-
-    assert_eq!(
-        chat.agent, "act",
-        "TurnDone must reconcile chat.agent to the authoritative session agent"
-    );
-}
-
-/// Companion: `handle_switch_agent` optimistically sets `chat.agent` so the chip
-/// is correct immediately — for non-turning switches (Alt+Tab) that emit no
-/// TurnDone, and so a subsequent TranscriptReset rebuild uses the right agent.
-#[tokio::test]
-async fn handle_switch_agent_sets_agent_optimistically() {
-    let mut chat = ChatView {
-        agent: "plan".into(),
-        ..ChatView::default()
-    };
-    let mut running = false;
-    let mut follow = true;
-    let mut input = String::new();
-    let mut cursor_idx = 0usize;
-    let mut mode_flash: Option<(String, u32)> = None;
-    let anim_tick = 3u32;
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCmd>(64);
-    let mut cancel = CancellationToken::new();
-    let mut sys_tokens = 0u64;
-    let workdir = std::path::Path::new(".");
-    let active_skill_body: Option<String> = None;
-
-    let outcome = handle_switch_agent(
-        "act".into(),
-        false,
-        &mut chat,
-        &mut running,
-        &mut follow,
-        &mut input,
-        &mut cursor_idx,
-        &mut mode_flash,
-        anim_tick,
-        &cmd_tx,
-        &mut cancel,
-        &mut sys_tokens,
-        workdir,
-        &active_skill_body,
-        &mut None, // last_switch_sent dedup baseline
-    )
-    .await;
-
-    assert!(matches!(outcome, SwitchOutcome::Proceed));
-    assert_eq!(
-        chat.agent, "act",
-        "handle_switch_agent must optimistically set chat.agent before the \
-         worker confirms via AgentSwitch"
-    );
-    assert!(
-        matches!(cmd_rx.try_recv(), Ok(UiCmd::SwitchAgent(n)) if n == "act"),
-        "a non-turning switch must still send SwitchAgent to the worker"
-    );
-}
-
-// ----- Status-bar task clock (false→true baseline snap) -----
-
-/// A new task starts: `running` goes `false → true`. The accumulated task
-/// time is not reset here; submission owns that reset. The dt baseline is
-/// snapped so the preceding idle gap is excluded.
-#[test]
-fn tick_clock_does_not_reset_task_on_turn_start() {
-    let mut prev = false;
-    let mut last = Instant::now();
-    let mut task = 999_999u64; // leftover from a prior turn
-
-    tick_clock(true, &mut prev, &mut last, &mut task);
-
-    assert_eq!(
-        task, 999_999,
-        "turn start must NOT reset the task clock (reset happens only on new task submission)"
-    );
-    assert!(prev, "prev_running tracks running after the call");
-}
-
-/// Within a running task, consecutive ticks accumulate real wall-clock time.
-#[test]
-fn tick_clock_accumulates_task_while_running() {
-    let mut prev = false;
-    let mut last = Instant::now();
-    let mut task = 0u64;
-    tick_clock(true, &mut prev, &mut last, &mut task);
-    assert_eq!(task, 0, "baseline snap makes the first tick accumulate ~0");
-
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    tick_clock(true, &mut prev, &mut last, &mut task);
-
-    assert!(
-        task > 0,
-        "consecutive running ticks must accumulate; task={}",
-        task
-    );
-    assert!(
-        task < 5_000,
-        "single tick accumulation must be small; task={}",
-        task
-    );
-}
-
-/// The task clock freezes while idle and resumes from its preserved total.
-#[test]
-fn tick_clock_preserves_task_across_turn_end_and_idle() {
-    let mut prev = false;
-    let mut last = Instant::now();
-    let mut task = 0u64;
-    tick_clock(true, &mut prev, &mut last, &mut task);
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    tick_clock(true, &mut prev, &mut last, &mut task);
-    assert!(task > 0, "task time should accumulate while running");
-    let after_turn1 = task;
-
-    tick_clock(false, &mut prev, &mut last, &mut task);
-    assert_eq!(task, after_turn1, "task time must not change on turn end");
-
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    tick_clock(false, &mut prev, &mut last, &mut task);
-    assert_eq!(task, after_turn1, "task time must not advance while idle");
-
-    tick_clock(true, &mut prev, &mut last, &mut task);
-    assert_eq!(
-        task, after_turn1,
-        "task time preserved across turn boundary"
-    );
-
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    tick_clock(true, &mut prev, &mut last, &mut task);
-    assert!(
-        task > after_turn1,
-        "task time must grow during turn 2; task={}, after_turn1={}",
-        task,
-        after_turn1
-    );
-}
-
-/// `false -> true` snaps the dt baseline so a long idle gap between turns is
-/// never charged to the task clock.
-#[test]
-fn tick_clock_false_to_true_excludes_idle_gap() {
-    let mut prev = false;
-    let mut last = Instant::now();
-    let mut task = 0u64;
-    tick_clock(true, &mut prev, &mut last, &mut task);
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    tick_clock(true, &mut prev, &mut last, &mut task);
-    let after_turn1 = task;
-    assert!(task > 0, "turn 1 must accumulate task time");
-
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    tick_clock(false, &mut prev, &mut last, &mut task);
-    assert_eq!(task, after_turn1, "idle tick must not accumulate");
-
-    tick_clock(true, &mut prev, &mut last, &mut task);
-    assert_eq!(
-        task, after_turn1,
-        "false→true must snap the baseline so the idle gap is not counted"
-    );
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    tick_clock(true, &mut prev, &mut last, &mut task);
-    assert!(
-        task > after_turn1,
-        "task time must grow after the turn-2 baseline snap"
-    );
-}
+#[path = "app_loop_bugfix_tests/streaming_and_clock.rs"]
+mod streaming_and_clock;

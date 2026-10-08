@@ -88,8 +88,8 @@ fn assert_no_llm_calls(evs: &[SessionEvent]) {
 // tests
 // ---------------------------------------------------------------------------
 
-/// `/plan review code` queued in drain mode: mode switches to plan BEFORE any
-/// LLM call, then "review code" runs in plan mode (exactly 1 LLM turn).
+/// `/plan review code` queued in drain mode: the agent switches to plan
+/// BEFORE any LLM call, then "review code" runs (exactly 1 LLM turn).
 #[tokio::test]
 async fn drain_mode_queue_plan_switches_before_llm() {
     let store = mem_store().await;
@@ -286,21 +286,22 @@ async fn drain_mode_queue_skill_consumed() {
 
     // One-shot `$skill` semantics (see skill_one_shot.rs): the skill lives
     // exactly for the run that consumed the token. Activation is proven by
-    // the captured LLM request carrying a skill artifact ([skill loaded]
-    // body injection or [active skill] tail reminder); the run-end hook
-    // clears the skill afterwards.
+    // the captured LLM request carrying a skill artifact (the transient
+    // [skill loaded] body payload or [active skill] tail reminder); the
+    // run-end hook clears the skill afterwards.
     assert_eq!(
         mock.requests().len(),
         1,
         "exactly 1 LLM call (skill prompt)"
     );
     assert!(
-        mock.requests().iter().any(|req| req
-            .messages
+        mock.requests()
             .iter()
-            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
-            .any(|t| t.contains("[skill loaded]") || t.contains("[active skill]"))),
+            .any(|req| opencoder_llm::lower_messages(&req.messages)
+                .iter()
+                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+                .any(|t| t.contains("[skill loaded]") || t.contains("[active skill]"))),
         "skill activated by $review token (request carries skill artifact)"
     );
     assert!(

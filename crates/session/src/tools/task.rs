@@ -31,15 +31,15 @@ impl Tool for TaskTool {
     }
 }
 
-/// Description of the `task` tool, parameterised by agent kind. `explore` is
-/// always advertised; `build` is shown only in act mode (never in plan mode,
-/// which stays read-only).
-pub fn description_for(plan: bool) -> String {
+/// Description of the `task` tool. `explore` is always advertised; `build`
+/// is shown only when `hide_build` is false (plan mode always hides it,
+/// as does any agent while the task-plan skill is active).
+pub fn description_for(hide_build: bool) -> String {
     let prefix = "Launch a subagent to handle a delegated task in isolation. \
                   The subagent has its own message history and tools, and returns a final summary. \
                   Use subagent_type \"explore\" for read-only codebase investigation \
                   (search/read)";
-    let build_clause = if plan {
+    let build_clause = if hide_build {
         String::new()
     } else {
         ", or \"build\" for implementation work (bash/edit).".to_string()
@@ -50,9 +50,9 @@ pub fn description_for(plan: bool) -> String {
 /// Parameter schema of the `task` tool, parameterised identically to
 /// [`description_for`]. The `subagent_type` description only lists the kinds
 /// the model may actually use.
-pub fn parameters_for(plan: bool) -> Value {
+pub fn parameters_for(hide_build: bool) -> Value {
     let mut subagent_type_desc = String::from("Agent type: \"explore\" (read-only)");
-    if !plan {
+    if !hide_build {
         subagent_type_desc.push_str(", or \"build\" (full tools)");
     }
     subagent_type_desc.push_str(". Defaults to \"explore\".");

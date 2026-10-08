@@ -66,7 +66,6 @@ fn draw_frame(
         None,
         None,
         None,
-        None,
         keymap_menu,
         None,
         hits,
@@ -82,6 +81,7 @@ fn draw_frame(
         true,
         opencoder_core::ApMode::Off,
         "act",
+        false,
         None,
     )
     .unwrap();
@@ -160,7 +160,8 @@ fn shorter_thinking_frame_never_reveals_old_lines() {
     old.apply(&SessionEvent::ReasoningDelta(
         "old-overlap-marker\nold-tail".into(),
     ));
-    old.toggle_thinking_at(0);
+    old.toggle_tool_call_at(0, 0);
+    old.toggle_tool_call_at(0, 1);
     draw_frame(
         &mut terminal,
         &old,
@@ -174,7 +175,8 @@ fn shorter_thinking_frame_never_reveals_old_lines() {
 
     let mut new = ChatView::default();
     new.apply(&SessionEvent::ReasoningDelta("new".into()));
-    new.toggle_thinking_at(0);
+    new.toggle_tool_call_at(0, 0);
+    new.toggle_tool_call_at(0, 1);
     for _ in 0..2 {
         draw_frame(
             &mut terminal,
@@ -338,8 +340,7 @@ async fn notepad_fullscreen_hides_chat_and_clears_hits() {
         None,
         None,
         None,
-        None,
-        None, // file_menu
+        None, // agent_menu
         &mut hits,
         &mut viewport,
         false,
@@ -353,6 +354,7 @@ async fn notepad_fullscreen_hides_chat_and_clears_hits() {
         true,
         opencoder_core::ApMode::Off,
         "act",
+        false,
         Some(view),
     )
     .unwrap();
@@ -369,7 +371,6 @@ async fn notepad_fullscreen_hides_chat_and_clears_hits() {
     assert!(hits.queue_btns.is_empty());
     assert!(hits.thinking_btns.is_empty());
     assert!(hits.subagent_btns.is_empty());
-    assert!(hits.tool_btns.is_empty());
     assert!(hits.compaction_btns.is_empty());
 
     let text = buffer_text(terminal.backend().buffer());

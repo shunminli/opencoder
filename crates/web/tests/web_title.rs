@@ -22,13 +22,14 @@ struct Ctx {
     mock: Arc<MockChatClient>,
 }
 
-/// App with a scripted mock and a pinned-off autopilot (a developer's global
-/// ap.json must not append a review round to this two-call sequence). The
+/// App with a scripted mock and developer-wide autopilot/local memory disabled
+/// so extra model rounds cannot consume the two scripted replies. The
 /// project config pins model + small_model so the title request's model is
 /// assertable.
 async fn app(mock: MockChatClient) -> Ctx {
     let store: Arc<dyn Store> = Arc::new(LibsqlStore::open_memory().await.unwrap());
     let workdir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(workdir.join("opencoder.json"), r#"{"local_memory":false}"#).unwrap();
     std::fs::create_dir_all(workdir.join(".opencoder")).unwrap();
     std::fs::write(
         workdir.join(".opencoder").join("ap.json"),
@@ -43,10 +44,15 @@ async fn app(mock: MockChatClient) -> Ctx {
     let mock = Arc::new(mock);
     let handles = opencoder_web::handle::new_handle_map();
     let state = Arc::new(opencoder_web::AppState {
+        config_home: None,
+        brain: opencoder_web::api_brain::mock_brain(store.clone()),
         store: store.clone(),
         workdir: workdir.clone(),
         handles: handles.clone(),
         nodes: Arc::new(opencoder_web::nodes_state::NodeHub::new()),
+        controls: Arc::new(opencoder_web::control_state::ControlHub::new()),
+        team: opencoder_web::team_state::mock(),
+        project: opencoder_web::ProjectService::new(),
         client_override: Some(mock.clone() as Arc<dyn ChatStream>),
     });
     Ctx {
@@ -168,8 +174,8 @@ async fn successful_drain_persists_generated_title() {
     // The title round must target the small model, not the primary.
     let reqs = ctx.mock.requests();
     assert!(reqs.len() >= 2, "expected a run round + a title round");
-    assert_eq!(reqs.last().unwrap().model, "mini");
-    assert_eq!(reqs[0].model, "big");
+    assert_eq!(reqs.last().unwrap().model, "a/mini");
+    assert_eq!(reqs[0].model, "a/big");
     // The drain pinned the project config: primary id must be the default.
     let cfg = opencoder_core::Config::load(&ctx.workdir).unwrap();
     // small_model_or_primary strips the provider prefix ("a/mini" -> "mini").

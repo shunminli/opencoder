@@ -138,8 +138,9 @@ pub(super) async fn has_pending_steers(session: &SessionState) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SteerApplyOutcome {
     /// Batch fully applied; run_loop proceeds to the LLM/drain step.
-    /// `recorded` tells the caller whether any item became a real user
-    /// message (used by the skip-LLM idle-drain decision).
+    /// `recorded` tells the caller whether any item supplied an LLM input: a
+    /// real user message or a preserved clear-context handoff directive (used
+    /// by the skip-LLM idle-drain decision).
     Continue { recorded: bool },
     /// Sentinel ClearContext or bare-control-command-only batch: `Done` was
     /// emitted, run_loop must end the turn without an LLM call.
@@ -183,11 +184,18 @@ pub(super) async fn apply_steer_batch(
             let remaining: Vec<i64> = steer_prompts[idx..].iter().map(|(s, _, _)| *s).collect();
             super::input_recovery::unpromote_batch(session, &remaining).await;
             on_event(SessionEvent::Status("interrupted".into()));
+            // Terminal frame owed here too: the caller breaks on Cancelled
+            // and nothing else emits `Done` (real-browser acceptance).
+            on_event(SessionEvent::Done);
             return Ok(SteerApplyOutcome::Cancelled);
         }
+        // Echo only what the model will see: the compound tail is recorded
+        // as the real user turn; a bare control command is applied inline
+        // with nothing recorded, so its echo is empty (display surfaces
+        // suppress empty echoes).
         on_event(SessionEvent::SteerConsumed {
             seq: *seq,
-            text: p.clone(),
+            text: crate::control_cmd::consumed_echo_text(p).unwrap_or_default(),
         });
         // Defensive: a steered control command is applied immediately and
         // NOT recorded as user text, so "/plan" never leaks to the LLM.
@@ -203,8 +211,14 @@ pub(super) async fn apply_steer_batch(
                 && crate::control_cmd::is_clear_context_handoff(
                     session.handoff_plan.as_deref().unwrap_or(""),
                 );
+            if matches!(cmd, crate::control_cmd::ControlCmd::ClearContext) && !clear_sentinel {
+                // A seeded clear (including plan→act execution handoff) owns
+                // the next provider turn even though it is synthetic rather
+                // than a stored user message.
+                steer_recorded = true;
+            }
             // Compound (/plan review): record the rest as a real
-            // user message in the new mode.
+            // user message in the new agent.
             if let Some(rest) = rest {
                 clear_sentinel = false;
                 crate::skill_resolve::record_compound(session, &rest, imgs).await;
@@ -216,7 +230,7 @@ pub(super) async fn apply_steer_batch(
             continue;
         }
         clear_sentinel = false;
-        // Resolve `$skill` tokens, apply plan tag, record as real user turn.
+        // Resolve `$skill` tokens, record as a real user turn.
         crate::skill_resolve::record_compound(session, p, imgs).await;
         super::input_recovery::mark_input_recorded(session, *seq).await;
         steer_recorded = true;

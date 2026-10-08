@@ -74,12 +74,14 @@ async fn call_echo_tool_via_registry() {
         .expect("echo tool should be registered");
 
     let ctx = opencoder_core::ToolContext {
+        extra_env: Vec::new(),
         session_id: session_id.into(),
         message_id: "m1".into(),
         agent: "act".into(),
         working_dir: std::path::PathBuf::from("."),
         max_output: 4096,
         proxy: None,
+        tools_path: None,
     };
     let out = echo
         .execute(serde_json::json!({"text": "hello world"}), &ctx)
@@ -103,12 +105,14 @@ async fn call_add_tool_returns_sum() {
         .expect("add tool should be registered");
 
     let ctx = opencoder_core::ToolContext {
+        extra_env: Vec::new(),
         session_id: session_id.into(),
         message_id: "m1".into(),
         agent: "act".into(),
         working_dir: std::path::PathBuf::from("."),
         max_output: 4096,
         proxy: None,
+        tools_path: None,
     };
     let out = add
         .execute(serde_json::json!({"a": 7, "b": 35}), &ctx)

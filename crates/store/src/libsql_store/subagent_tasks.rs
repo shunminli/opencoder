@@ -143,6 +143,7 @@ mod tests {
 
     fn session(id: &str) -> SessionMeta {
         SessionMeta {
+            kind: None,
             id: id.into(),
             title: Some(id.into()),
             agent: Some("build".into()),
@@ -159,8 +160,6 @@ mod tests {
             skill: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
         }
     }
 

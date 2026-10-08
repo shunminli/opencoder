@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use opencoder_core::{
     message::now_ms, resolve_agent, Config, ContentBlock, Message, MessageUsage, Role,
 };
-use opencoder_llm::{lower_messages, ChatRequest, ChatStream, LlmEvent};
+use opencoder_llm::ChatStream;
 use opencoder_store::{
     Delivery, EventKind, SessionEventRecord, Store, SubagentStatus, SubagentTaskRecord,
 };
@@ -33,6 +33,23 @@ pub async fn resume(
         .await?
         .ok_or_else(|| anyhow!("session not found: {id}"))?;
 
+    let stored_harness = store.harness_runtime(id).await?;
+    let mut harness = stored_harness.clone().unwrap_or_default();
+    if stored_harness.is_none() && store.last_message_seq(id).await? == 0 {
+        harness.harness =
+            opencoder_core::agent::scope::with_root_sync(config.agent.agents_dir.clone(), || {
+                opencoder_core::harness::agent_harness(
+                    meta.agent.as_deref().unwrap_or(&config.agent.default),
+                )
+            });
+    }
+
+    opencoder_core::harness::pin_agent_settings(
+        &mut harness,
+        &config,
+        meta.agent.as_deref().unwrap_or(&config.agent.default),
+    )
+    .map_err(anyhow::Error::msg)?;
     // Prefer the stored model/agent so resume is faithful to the original run.
     if let Some(m) = &meta.model {
         config.model = m.clone();
@@ -47,9 +64,27 @@ pub async fn resume(
         })
     });
     let agent_name = meta.agent.as_deref().unwrap_or(&config.agent.default);
-    let agent = resolve_agent(agent_name)
-        .or_else(|| resolve_agent("act"))
-        .ok_or_else(|| anyhow!("agent not found: {agent_name}"))?;
+    let snapshot = harness
+        .resource_root
+        .as_ref()
+        .map(|root| crate::harness::resources::restore_agent(root))
+        .transpose()?;
+    let agent = if let Some(agent) = snapshot.filter(|agent| agent.name == agent_name) {
+        agent
+    } else {
+        harness.resource_root = None;
+        opencoder_core::agent::scope::with_root_sync(config.agent.agents_dir.clone(), || {
+            resolve_agent(agent_name)
+        })
+        .or_else(|| {
+            if config.agent.agents_dir.is_none() {
+                resolve_agent("act")
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| anyhow!("agent not found: {agent_name}"))?
+    };
 
     // Loading strategy:
     //  - Compaction path (summary_seq set, no handoff): load ONLY the tail
@@ -58,7 +93,7 @@ pub async fn resume(
     //    to re-derive them -- the fix for long-session resume stalls caused by
     //    reloading + deserializing thousands of soft-deleted head messages.
     //  - Handoff / no-compaction path: full load. Handoff is an early one-time
-    //    plan->act transition with small data; no-compaction has nothing to skip.
+    //    handoff transition with small data; no-compaction has nothing to skip.
     let mut messages: Vec<Message> =
         if meta.handoff_seq.is_none() && matches!(meta.summary_seq, Some(sk) if sk > 0) {
             store
@@ -80,15 +115,15 @@ pub async fn resume(
         }
     }
 
-    // Plan→act handoff (dominant reset) and compaction are mutually exclusive
-    // on resume: when a handoff boundary was persisted, trim the plan-mode
-    // history and re-attach the synthetic plan instruction; otherwise apply a
+    // Transcript handoff (dominant reset) and compaction are mutually exclusive
+    // on resume: when a handoff boundary was persisted, trim the discarded
+    // history and re-attach the synthetic boundary message; otherwise apply a
     // persisted compaction trim. Handoff wins because it replaces the whole
-    // transcript, so any stale compaction metadata from plan mode is moot.
+    // transcript, so any stale compaction metadata from the cleared history is moot.
     if let Some(hs) = meta.handoff_seq {
-        if let Some(plan_display) = &meta.handoff_plan {
+        if let Some(boundary_display) = &meta.handoff_plan {
             let hs = hs as usize;
-            // The discarded plan-mode head is still in the store; re-derive its
+            // The discarded head is still in the store; re-derive its
             // recent images and attach them to the handoff instruction so they
             // survive resume.
             let preserved_images = if hs < messages.len() {
@@ -101,15 +136,17 @@ pub async fn resume(
             } else {
                 messages = Vec::new();
             }
-            // Distinguish the ClearContext boundary flavours from a plan->act
+            // Distinguish the ClearContext boundary flavours from a directive
             // handoff: the blank sentinel / last-say seed markers stored by
             // control_cmd::ClearContext.
-            let mut head_msg = if crate::control_cmd::is_clear_context_handoff(plan_display) {
+            let mut head_msg = if crate::control_cmd::is_clear_context_handoff(boundary_display) {
                 crate::control_cmd::fresh_start_message()
-            } else if crate::control_cmd::is_clear_context_seed(plan_display) {
-                crate::control_cmd::seed_message(crate::control_cmd::clear_seed_text(plan_display))
+            } else if crate::control_cmd::is_clear_context_seed(boundary_display) {
+                crate::control_cmd::seed_message(crate::control_cmd::clear_seed_text(
+                    boundary_display,
+                ))
             } else {
-                crate::plan_handoff::handoff_message(plan_display)
+                crate::handoff::handoff_message(boundary_display)
             };
             for url in &preserved_images {
                 head_msg.blocks.push(ContentBlock::Image {
@@ -150,6 +187,8 @@ pub async fn resume(
     if !dangling.is_empty() {
         let n_dangling = dangling.len();
         let synthetic = Message {
+            provider_state: None,
+            display: None,
             id: crate::runner::new_id(),
             role: Role::Tool,
             blocks: dangling,
@@ -171,6 +210,11 @@ pub async fn resume(
 
     let n = messages.len();
     let model = config.model_id().to_string();
+    // Agent pool snapshots follow the agent the persisted session names
+    // (meta.agent, config default, then act fallback) — a resumed file-agent
+    // session gets its tool dirs and skill roots back.
+    let tools_path = crate::agent_pools::tools_path_for(&config, &agent.name);
+    let skill_roots = crate::agent_pools::skill_roots_for(&agent.name);
 
     // Handoff supersedes compaction: if a handoff boundary exists, any
     // residual compaction metadata (summary_seq / summary / summary_images)
@@ -189,31 +233,13 @@ pub async fn resume(
         )
     };
 
-    // Legacy plan-phase backfill: sessions created before the plan-phase
-    // columns existed persist counter=0 / snapshot=NULL in the store even when
-    // the plan agent produced a real plan. Recover both from the (already
-    // handoff/compaction-trimmed) transcript so a resumed plan session re-arms
-    // the Shift+Tab / `/act_clear_context` handoff. Phase-bounded: only a
-    // plan-agent assistant answer is accepted (`newest_plan_agent_text`).
-    // The session row's agent column is NULL for ts-origin sessions by
-    // design, so NULL is allowed through the gate; an explicit non-plan
-    // agent refuses the backfill.
-    let (plan_input_count, plan_snapshot) = if meta.plan_input_count <= 0
-        && meta.plan_snapshot.is_none()
-        && meta.agent.as_deref().is_none_or(|a| a == "plan")
-    {
-        match crate::plan_handoff::newest_plan_agent_text(&messages) {
-            Some(plan) => (1, Some(plan)),
-            None => (0, None),
-        }
-    } else {
-        (
-            meta.plan_input_count.max(0) as usize,
-            meta.plan_snapshot.clone(),
-        )
-    };
-
     let s = SessionState {
+        env_passthrough: harness
+            .envs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        harness,
         id: id.to_string(),
         messages,
         agent,
@@ -222,14 +248,21 @@ pub async fn resume(
         working_dir,
         config,
         client,
+        tools_path,
+        skill_roots,
         last_usage: opencoder_llm::Usage::default(),
         store: Some(store),
         // Restore the persisted skill. Under one-shot semantics a normally
         // COMPLETED run has already cleared `sessions.skill` (NULL row ->
         // nothing resurrects); a non-NULL value means the session crashed
         // MID-run, and the resumed run must continue the skill —
-        // `skill_lifecycle::clear_on_run_end` clears it when that run ends.
+        // `skill_lifecycle::clear_on_run_end` clears it when that run ends
+        // (sole exception: `abort_keeps_skill` keeps an aborted task-plan,
+        // so an interrupted plan survives to be delivered after resume).
         skill_prompt: Arc::new(Mutex::new(meta.skill.clone())),
+        // A restored (crash-mid-run) skill re-delivers its body ONCE on the
+        // resumed run's first LLM round — the delivery gate starts unspent.
+        skill_body_delivered: Arc::new(Mutex::new(false)),
         active_skill_names: Arc::new(Mutex::new(crate::resume_helpers::infer_skill_names(
             &meta.skill,
         ))),
@@ -248,8 +281,6 @@ pub async fn resume(
         handoff_seq: meta.handoff_seq,
         handoff_plan: meta.handoff_plan.clone(),
         requirement: meta.requirement.clone(),
-        plan_snapshot,
-        plan_input_count,
         question_hub: crate::QuestionHub::new(),
     };
     Ok(s)
@@ -276,6 +307,15 @@ pub async fn resume_and_replay(
     working_dir: PathBuf,
     replay_cancel: Option<CancellationToken>,
 ) -> Result<SessionState> {
+    if store
+        .harness_runtime(id)
+        .await?
+        .is_some_and(|r| r.harness == opencoder_core::harness::Harness::Codex)
+    {
+        let mut session = resume(store, id, config, client, working_dir).await?;
+        session.cancel = replay_cancel;
+        return Ok(session);
+    }
     let candidates: Vec<SubagentTaskRecord> = store
         .list_subagent_tasks(id)
         .await
@@ -345,6 +385,8 @@ pub async fn resume_and_replay(
     // via its dangling-`tool_use` reconciliation.
     if !backfill.is_empty() {
         let tool_msg = Message {
+            provider_state: None,
+            display: None,
             id: crate::runner::new_id(),
             role: Role::Tool,
             blocks: backfill,
@@ -427,6 +469,9 @@ async fn filter_replay_candidates(
 /// the interrupted call is transparently resumed. No-op when there is no store
 /// or no cancelled tasks (e.g. children, which hold no `task` tool).
 pub async fn replay_cancelled_tasks(session: &mut SessionState, has_new_input: bool) {
+    if session.harness.harness == opencoder_core::harness::Harness::Codex {
+        return;
+    }
     let store = match session.store.clone() {
         Some(s) => s,
         None => return,
@@ -524,6 +569,8 @@ pub async fn replay_cancelled_tasks(session: &mut SessionState, has_new_input: b
         return;
     }
     let tool_msg = Message {
+        provider_state: None,
+        display: None,
         id: crate::runner::new_id(),
         role: Role::Tool,
         blocks: backfill,
@@ -567,6 +614,8 @@ async fn abandon_cancelled_tasks(
         );
     }
     let tool_msg = Message {
+        provider_state: None,
+        display: None,
         id: crate::runner::new_id(),
         role: Role::Tool,
         blocks: backfill,
@@ -717,64 +766,4 @@ async fn replay_child(
     Ok((text, ok))
 }
 
-/// Generate a short title from the first user/assistant exchange, using the
-/// small model when configured. Persists the title to the store. Non-fatal:
-/// errors are logged and swallowed.
-pub async fn generate_title(session: &SessionState) {
-    if session.store.is_none() {
-        return;
-    }
-    let store = session.store.clone().unwrap();
-    if let Err(e) = generate_title_inner(session, &store).await {
-        tracing::warn!(session_id = %session.id, error = %e, "title generation failed");
-    }
-}
-
-async fn generate_title_inner(session: &SessionState, store: &Arc<dyn Store>) -> Result<()> {
-    let msgs = lower_messages(&session.messages);
-    let req = ChatRequest {
-        model: session.config.small_model_or_primary().to_string(),
-        messages: msgs,
-        tools: Vec::new(),
-        tool_choice: None,
-        temperature: Some(0.3),
-        max_tokens: Some(64),
-        reasoning_effort: None,
-        cache_salt: crate::cache_salt_for(session),
-    };
-    let mut rx = session.client.chat_stream(req).context("title llm call")?;
-    let mut text = String::new();
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            LlmEvent::TextDelta(t) => text.push_str(&t),
-            LlmEvent::Completed { text: t, .. } => {
-                if !t.is_empty() {
-                    text = t;
-                }
-                break;
-            }
-            LlmEvent::Retrying { .. } => {
-                // Mid-stream retry: drop deltas so the two attempts aren't
-                // concatenated; the final `Completed` overwrites `text`.
-                text.clear();
-            }
-            LlmEvent::Error(e) => return Err(anyhow!(e)),
-            _ => {}
-        }
-    }
-    let title: String = text.trim().chars().take(80).collect();
-    if title.is_empty() {
-        return Ok(());
-    }
-    store
-        .update_session(
-            &session.id,
-            &opencoder_store::SessionPatch {
-                title: Some(title),
-                updated_at: Some(opencoder_core::message::now_ms()),
-                ..Default::default()
-            },
-        )
-        .await?;
-    Ok(())
-}
+pub use crate::harness::title::generate_title;

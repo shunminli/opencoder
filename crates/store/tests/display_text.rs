@@ -41,8 +41,7 @@ async fn make_session(store: &LibsqlStore, id: &str, now: i64) {
         skill: None,
         task_type: None,
         requirement: None,
-        plan_snapshot: None,
-        plan_input_count: 0,
+        kind: None,
     };
     store.create_session(&meta).await.unwrap();
 }
@@ -225,8 +224,8 @@ async fn v5_to_v6_migration_adds_display_text() {
         "old row keeps NULL via pending_inputs"
     );
 
-    // Version bumped to the latest (SCHEMA_VERSION=12 after the
-    // autopilot_mode migration), and a second reopen is idempotent.
+    // Version bumped to the latest (SCHEMA_VERSION after the newest
+    // migration step), and a second reopen is idempotent.
     drop(store);
     let store2 = LibsqlStore::open(&db_path).await.unwrap();
     {
@@ -239,8 +238,8 @@ async fn v5_to_v6_migration_adds_display_text() {
         let r = rows.next().await.unwrap().unwrap();
         let v: i64 = r.get(0).unwrap();
         assert_eq!(
-            v, 12,
-            "schema version must be 12 (latest) after v5 migration"
+            v, 33,
+            "schema version must be 33 (latest) after v5 migration"
         );
     }
     let again = store2.pending_inputs("s1", Delivery::Queue).await.unwrap();

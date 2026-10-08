@@ -1,0 +1,470 @@
+// canvasEditor.jsx — the visual DAG editor canvas: React Flow assembly of
+// the palette / toolbar / inspector around specToCanvas state. The `spec`
+// prop is an INITIAL value only (the parent remounts via key when it wants
+// a fresh load); every structural change flows out through onSpecChange.
+// CanvasEditor itself only mounts a ReactFlowProvider — useReactFlow must
+// be called INSIDE the provider (React Flow's own provider wraps only the
+// <ReactFlow> children, not the component that renders it).
+
+import {
+  addEdge,
+  Background,
+  BackgroundVariant,
+  Controls,
+  MarkerType,
+  ReactFlow,
+  ReactFlowProvider,
+  useEdgesState,
+  useNodesInitialized,
+  useNodesState,
+  useReactFlow,
+} from '@xyflow/react';
+import '@xyflow/react/dist/style.css';
+import { LinkOutlined } from '@ant-design/icons';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useMessage } from '../../ui/appMessage.js';
+import { layoutEditorNodes } from './canvasLayout.js';
+import { canConnect, canvasToSpec, editNodeBox, newStep, specProblemIndex, specToCanvas } from './canvasModel.js';
+import { CanvasToolbar, StepPalette } from './canvasToolbar.jsx';
+import { SpecMetaForm, StepInspector } from './stepInspector.jsx';
+import { editNodeTypes } from './stepNode.jsx';
+
+/// orderDepNames(nodes, edges, id) → deduped incoming edge sources for node
+/// `id`, ordered by the source's position in the node array — the exact
+/// order canvasToSpec rebuilds depends_on with, so the node card's 依赖
+/// summary and the emitted spec can never disagree.
+function orderDepNames(nodes, edges, id) {
+  const pos = new Map();
+  (Array.isArray(nodes) ? nodes : []).forEach((n, i) => {
+    if (n && typeof n.id === 'string') {
+      pos.set(n.id, i);
+    }
+  });
+  const seen = new Set();
+  const names = [];
+  for (const e of Array.isArray(edges) ? edges : []) {
+    if (!e || e.target !== id || typeof e.source !== 'string' || seen.has(e.source) || !pos.has(e.source)) {
+      continue;
+    }
+    seen.add(e.source);
+    names.push(e.source);
+  }
+  return names.sort((a, b) => pos.get(a) - pos.get(b));
+}
+
+/// CanvasEditor — uncontrolled-after-mount canvas over a DagSpec draft.
+/// props: spec (initial), problems (validateSpec strings for red dots +
+/// toolbar badge), positions ({stepName: {x,y}} session-state map),
+/// onSpecChange(spec), onPositionsChange(positions).
+export function CanvasEditor(props) {
+  return (
+    <ReactFlowProvider>
+      <EditorCanvas {...props} />
+    </ReactFlowProvider>
+  );
+}
+
+/// EditorCanvas — hook body of CanvasEditor (kept inside the provider so
+/// useReactFlow / fitView / screenToFlowPosition resolve).
+function EditorCanvas({ spec, problems, positions, onSpecChange, onPositionsChange }) {
+  const msg = useMessage();
+  const [nodes, setNodes, onNodesChange] = useNodesState([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [linkMode, setLinkMode] = useState(false); // toolbar 连线 toggle
+  const [linkFrom, setLinkFrom] = useState(null); // armed source node id
+  const [fitEpoch, setFitEpoch] = useState(0); // autoLayout → refit-after-commit
+  const [meta, setMeta] = useState(spec); // SpecMetaForm base (name/description)
+  const specRef = useRef(spec); // name/description carry-through for emit
+  const dirtyRef = useRef(false); // observe structural edits after the first change
+  const emittedRef = useRef(JSON.stringify(canvasToSpec(specToCanvas(spec), spec)));
+  const laidRef = useRef(false); // init effect ran; meta effect may touch nodes
+  const fittedRef = useRef(false); // mount-fit fired once; later re-measures must not refit
+  const { fitView, screenToFlowPosition } = useReactFlow();
+  const wrapRef = useRef(null);
+
+  // One-time load: spec → nodes/edges, dagre-laid with the session positions.
+  useEffect(() => {
+    const init = specToCanvas(spec);
+    setNodes(layoutEditorNodes(init.nodes, init.edges, { positions: positions || {} }));
+    setEdges(init.edges);
+    laidRef.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Structural changes (add/rename/remove/connect) emit the rebuilt spec.
+  useEffect(() => {
+    if (!dirtyRef.current) {
+      return;
+    }
+    // React Flow can commit node metadata before its pending edge update.
+    // Keep observing the graph, so that earlier commit cannot consume the edit.
+    const next = canvasToSpec({ nodes, edges }, specRef.current);
+    const serialized = JSON.stringify(next);
+    if (serialized === emittedRef.current) return;
+    emittedRef.current = serialized;
+    onSpecChange(next);
+  }, [nodes, edges, onSpecChange]);
+
+  // Node card meta (dep summary + red invalid dot) follows edges/problems.
+  useEffect(() => {
+    if (!laidRef.current) {
+      return;
+    }
+    setNodes((cur) => {
+      const idx = specProblemIndex(problems || [], cur);
+      return cur.map((n) => ({
+        ...n,
+        data: {
+          ...n.data,
+          kindType: (n.data && n.data.step && n.data.step.kind && n.data.step.kind.type) || '',
+          depNames: orderDepNames(cur, edges, n.id),
+          invalid: (idx.get(n.id) || []).length > 0,
+        },
+      }));
+    });
+  }, [edges, problems]);
+
+  // Click-to-connect affordance: highlight the armed source and every
+  // still-legal target so the second click is guided. Runs off the same
+  // state as the meta effect; both merge via data spread, order matters.
+  useEffect(() => {
+    setNodes((cur) =>
+      cur.map((n) => {
+        const linkSource = !!linkFrom && n.id === linkFrom;
+        const linkTarget = !!linkFrom && !linkSource && canConnect(edges, linkFrom, n.id) === null;
+        if (n.data && n.data.linkSource === linkSource && n.data.linkTarget === linkTarget) {
+          return n;
+        }
+        return { ...n, data: { ...n.data, linkSource, linkTarget } };
+      }),
+    );
+  }, [linkFrom, edges]);
+
+  // Fit once the nodes are actually measured — a fixed 60ms timer raced
+  // the antd Drawer animation and ResizeObserver, fitting to a partial
+  // graph and leaving later edges outside the viewport.
+  const nodesReady = useNodesInitialized();
+  useEffect(() => {
+    // Once-guard: nodesInitialized flips false again whenever a node lacks
+    // a measured height (e.g. addStep before RO runs); refitting then would
+    // hijack the viewport on every added step. The initial fit fires once
+    // per mount; fitEpoch (autoLayout) stays the refit channel.
+    if (nodesReady && !fittedRef.current) {
+      fittedRef.current = true;
+      fitView({ padding: 0.18, duration: 200 });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodesReady]);
+
+  // Post-layout refit channel: the epoch bump re-renders AFTER setNodes has
+  // committed the new positions, so fitView reads them deterministically
+  // (no timer guess).
+  useEffect(() => {
+    if (fitEpoch > 0) {
+      fitView({ padding: 0.18, duration: 250 });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitEpoch]);
+
+  // Drawer resize → refit so nodes never drift off-screen.
+  useEffect(() => {
+    if (typeof ResizeObserver === 'undefined' || !wrapRef.current) {
+      return undefined;
+    }
+    const ro = new ResizeObserver(() => {
+      if (laidRef.current) {
+        fitView({ padding: 0.18, duration: 150 });
+      }
+    });
+    ro.observe(wrapRef.current);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const markDirty = () => {
+    dirtyRef.current = true;
+  };
+
+  // Position/selection changes flow through silently; deletions emit.
+  const onNodesChangeWrapped = useCallback(
+    (changes) => {
+      onNodesChange(changes);
+      if (changes.some((c) => c.type === 'remove')) {
+        markDirty();
+      }
+    },
+    [onNodesChange],
+  );
+  const onEdgesChangeWrapped = useCallback(
+    (changes) => {
+      onEdgesChange(changes);
+      if (changes.some((c) => c.type === 'remove')) {
+        markDirty();
+      }
+    },
+    [onEdgesChange],
+  );
+
+  const onConnect = useCallback(
+    (params) => {
+      const reason = canConnect(edges, params.source, params.target);
+      if (reason) {
+        msg.warning(reason);
+        return false;
+      }
+      // Explicit '>' id keeps addEdge off the default getEdgeId, whose '-'
+      // separator collides for a→b-c vs a-b→c (spec edges use the same id).
+      setEdges(addEdge({
+        ...params,
+        id: 'e-' + params.source + '>' + params.target,
+        type: 'smoothstep',
+        markerEnd: { type: MarkerType.ArrowClosed },
+      }, edges));
+      markDirty();
+      return true;
+    },
+    [edges, setEdges],
+  );
+
+  // Click-to-connect: with a source armed (toolbar 连线 toggle, or a handle
+  // click that dropped without a valid target), the first click picks the
+  // source and the next click on another node adds the dependency through
+  // onConnect's canConnect guard. Plain clicks keep select-inspector.
+  const onNodeClick = useCallback(
+    (_e, node) => {
+      if (!linkFrom) {
+        if (linkMode) {
+          setLinkFrom(node.id);
+        }
+        return;
+      }
+      if (linkFrom === node.id) {
+        setLinkFrom(null);
+        return;
+      }
+      if (onConnect({ source: linkFrom, target: node.id })) {
+        setLinkFrom(null);
+      }
+    },
+    [linkMode, linkFrom, onConnect],
+  );
+
+  // A handle press that ends without a valid drop arms click-to-target (the
+  // tiny handles are hard to drag). A drop ON a handle that the
+  // isValidConnection guard rejected explains why nothing got drawn.
+  const onConnectEnd = useCallback(
+    (_e, state) => {
+      const from = state && state.fromHandle && state.fromHandle.nodeId;
+      if (!from) {
+        return;
+      }
+      const to = state.toHandle && state.toHandle.nodeId;
+      if (to) {
+        const reason = canConnect(edges, from, to);
+        if (reason) {
+          msg.warning(reason);
+        }
+        return;
+      }
+      setLinkFrom(from);
+    },
+    [edges],
+  );
+
+  // Esc releases the armed source (link mode itself stays until toggled).
+  useEffect(() => {
+    if (!linkFrom) {
+      return undefined;
+    }
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        setLinkFrom(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [linkFrom]);
+
+  const toggleLinkMode = useCallback(() => {
+    setLinkFrom(null);
+    setLinkMode((m) => !m);
+  }, []);
+
+  // Drag stops persist the pin into the session-state positions map only.
+  const onNodeDragStop = useCallback(
+    (_e, node) => {
+      onPositionsChange({ ...(positions || {}), [node.id]: node.position });
+    },
+    [positions, onPositionsChange],
+  );
+
+  const addStep = (kindType, position) => {
+    const taken = nodes.map((n) => n.id);
+    const step = newStep(kindType, taken);
+    const node = {
+      id: step.name,
+      type: 'stepEdit',
+      position: position || { x: 60, y: 60 + taken.length * 24 },
+      ...editNodeBox(),
+      selected: true, // keep React Flow's selection state in sync with selectedId
+      data: { step, kindType, depNames: [], placed: true },
+    };
+    setNodes(nodes.concat(node));
+    setSelectedId(step.name);
+    markDirty();
+  };
+
+  // HTML5 drop from the palette (dataTransfer carries the kind type).
+  const onDrop = (e) => {
+    e.preventDefault();
+    const kind = e.dataTransfer.getData('application/opencoder-step');
+    if (!['agent', 'binary', 'dynamic'].includes(kind)) {
+      return;
+    }
+    addStep(kind, screenToFlowPosition({ x: e.clientX, y: e.clientY }));
+  };
+  const onDragOver = (e) => {
+    e.preventDefault();
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = 'move';
+    }
+  };
+
+  const autoLayout = () => {
+    setNodes((cur) => layoutEditorNodes(cur, edges, {}));
+    onPositionsChange({});
+    markDirty();
+    setFitEpoch((v) => v + 1); // refit AFTER the new positions commit (effect below)
+  };
+
+  // ---- Inspector wiring -------------------------------------------------
+  const selectedNode = nodes.find((n) => n.id === selectedId) || null;
+  const problemIdx = useMemo(() => specProblemIndex(problems || [], nodes), [problems, nodes]);
+  const problemMapFor = (id) => problemIdx.get(id) || [];
+
+  const updateStep = (nextStep) => {
+    setNodes((cur) =>
+      cur.map((n) =>
+        n.id === selectedId
+          ? { ...n, data: { ...n.data, step: nextStep, kindType: (nextStep.kind && nextStep.kind.type) || '' } }
+          : n,
+      ),
+    );
+    markDirty();
+  };
+
+  const renameNode = (name) => {
+    const old = selectedId;
+    if (!old || name === old) {
+      return;
+    }
+    setNodes((cur) =>
+      cur.map((n) => {
+        let step = n.data.step;
+        if (step.kind?.type === 'dynamic' && step.kind.source?.type === 'step_output' && step.kind.source.step === old) {
+          step = { ...step, kind: { ...step.kind, source: { ...step.kind.source, step: name } } };
+        }
+        if (n.id === old) step = { ...step, name };
+        return { ...n, id: n.id === old ? name : n.id, data: { ...n.data, step } };
+      }),
+    );
+    setEdges((cur) =>
+      cur.map((e) => {
+        const s = e.source === old ? name : e.source;
+        const t = e.target === old ? name : e.target;
+        return e.source === old || e.target === old ? { ...e, id: 'e-' + s + '>' + t, source: s, target: t } : e;
+      }),
+    );
+    if (positions && positions[old]) {
+      const nextPos = { ...positions };
+      nextPos[name] = nextPos[old];
+      delete nextPos[old];
+      onPositionsChange(nextPos);
+    }
+    setSelectedId(name);
+    markDirty();
+  };
+
+  const removeNode = () => {
+    const id = selectedId;
+    setNodes((cur) => cur.filter((n) => n.id !== id));
+    setEdges((cur) => cur.filter((e) => e.source !== id && e.target !== id));
+    setSelectedId(null);
+    markDirty();
+  };
+
+  // SpecMetaForm edits name/description plus the whole-run 并发上限
+  // (max_concurrency); `meta` state (not just the ref)
+  // keeps the controlled inputs re-rendering while the canvas emits.
+  const applyMeta = (partial) => {
+    const next = { ...meta, ...partial };
+    setMeta(next);
+    specRef.current = next;
+    onSpecChange(canvasToSpec({ nodes, edges }, next));
+  };
+
+  return (
+    <div className="dag-edit-wrap">
+      <StepPalette onAdd={(k) => addStep(k)} />
+      <div
+        className={'dag-edit-stage' + (linkMode ? ' dag-edit-stage--linkmode' : '')}
+        ref={wrapRef}
+        onDrop={onDrop}
+        onDragOver={onDragOver}
+      >
+        <CanvasToolbar
+          problems={problems || []}
+          onAutoLayout={autoLayout}
+          onFitView={() => fitView({ padding: 0.18, duration: 200 })}
+          linkMode={linkMode}
+          onToggleLink={toggleLinkMode}
+        />
+        {(linkMode || linkFrom) && (
+          <div className={linkFrom ? 'dag-edit-linkbar dag-edit-linkbar--armed' : 'dag-edit-linkbar'}>
+            <LinkOutlined />
+            <span>
+              {linkFrom
+                ? `连线：${linkFrom} → 点击目标步骤（Esc 取消）`
+                : '连线模式：点击源步骤，再点击目标步骤完成依赖'}
+            </span>
+          </div>
+        )}
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={editNodeTypes}
+          onNodesChange={onNodesChangeWrapped}
+          onEdgesChange={onEdgesChangeWrapped}
+          onConnect={onConnect}
+          onNodeClick={onNodeClick}
+          onConnectEnd={onConnectEnd}
+          onPaneClick={() => setLinkFrom(null)}
+          onSelectionChange={({ nodes: sel }) => setSelectedId(sel.length ? sel[0].id : null)}
+          onNodeDragStop={onNodeDragStop}
+          isValidConnection={(c) => canConnect(edges, c.source, c.target) === null}
+          deleteKeyCode={['Delete', 'Backspace']}
+          defaultEdgeOptions={{ type: 'smoothstep', markerEnd: { type: MarkerType.ArrowClosed } }}
+          fitView
+          fitViewOptions={{ padding: 0.18 }}
+          proOptions={{ hideAttribution: false }}
+        >
+          <Background variant={BackgroundVariant.Dots} gap={20} size={1} />
+          <Controls showInteractive={false} />
+        </ReactFlow>
+      </div>
+      {selectedNode ? (
+        <StepInspector
+          step={selectedNode.data.step}
+          allNames={nodes.filter((n) => n.id !== selectedId).map((n) => n.id)}
+          problemList={problemMapFor(selectedId)}
+          onChange={updateStep}
+          onRename={renameNode}
+          onRemove={removeNode}
+        />
+      ) : (
+        <SpecMetaForm spec={meta} onChange={applyMeta} />
+      )}
+    </div>
+  );
+}

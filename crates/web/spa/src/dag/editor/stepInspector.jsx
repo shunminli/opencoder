@@ -1,0 +1,256 @@
+// stepInspector.jsx — right-hand property panel for the DAG spec editor.
+// StepInspector edits ONE selected step (name / kind / prompt / resource /
+// agent / model / how_append / sandbox / timeout) as fully controlled antd
+// inputs inside a vertical Form (no Form instance, no local copy of the
+// step); every edit is delegated upward through onChange / onRename /
+// onRemove with a fresh immutable step object. SpecMetaForm is the fallback
+// panel shown while no node is selected. Problem strings come from
+// specValidate.js via the parent.
+
+import { Alert, Button, Form, Input, InputNumber, Popconfirm, Select, Typography } from 'antd';
+import { useEffect, useState } from 'react';
+import { MONO_VAR } from '../../ui/mono.js';
+import { changeStepKind, renameStep } from './canvasModel.js';
+import { SourceFields } from '../dynamic/sourceFields.jsx';
+import { BinaryResourceField } from '../resources/field.jsx';
+
+const { Text } = Typography;
+const { TextArea } = Input;
+
+const KIND_OPTIONS = [
+  { value: 'agent', label: 'Agent 步骤' },
+  { value: 'binary', label: 'Binary 步骤' },
+  { value: 'dynamic', label: '动态步骤' },
+];
+
+/// withKindField(step, key, value) → new step with kind[key] set; empty
+/// values are REMOVED from the kind payload so the wire shape stays clean.
+function withKindField(step, key, value) {
+  const kind = { ...(step && step.kind) };
+  if (value === undefined || value === null || (value === '' && key !== 'args')) {
+    delete kind[key];
+  } else {
+    kind[key] = value;
+  }
+  return { ...step, kind };
+}
+
+/// toTimeout(v) → positive integer for timeout_secs, else undefined.
+function toTimeout(v) {
+  const n = Math.trunc(Number(v));
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/// StepInspector — controlled editor for the selected step.
+/// onRename(name) commits a valid new name (invalid candidates stay in the
+/// input and render the renameStep error inline); onChange(step) commits
+/// every other field edit; onRemove() deletes the node.
+export function StepInspector({ step, allNames, problemList, onChange, onRename, onRemove }) {
+  if (!step || typeof step !== 'object') {
+    return null;
+  }
+  const dynamic = step.kind?.type === 'dynamic';
+  const kind = (dynamic ? step.kind.template : step.kind) || {};
+  const kindType = kind.type || '';
+  const updateField = (key, value) => {
+    const next = withKindField({ ...step, kind }, key, value);
+    onChange(dynamic ? { ...step, kind: { ...step.kind, template: next.kind } } : next);
+  };
+  const stepName = typeof step.name === 'string' ? step.name : '';
+  const problems = Array.isArray(problemList) ? problemList : [];
+  return (
+    <div className="dag-edit-inspector">
+      {problems.length ? (
+        <Alert
+          type="error"
+          style={{ marginBottom: 10 }}
+          title="校验未通过"
+          description={
+            <ul style={{ margin: 0, paddingLeft: 16 }}>
+              {problems.map((p, i) => (
+                <li key={i}>{p}</li>
+              ))}
+            </ul>
+          }
+        />
+      ) : null}
+      <NameField stepName={stepName} allNames={allNames} onRename={onRename} />
+      <Form layout="vertical" size="small">
+        <Form.Item label="类型">
+          <Select
+            options={KIND_OPTIONS}
+            value={step.kind?.type}
+            onChange={(v) => onChange(changeStepKind(step, v))}
+          />
+        </Form.Item>
+        {dynamic && <SourceFields step={step} allNames={allNames} onChange={onChange} />}
+        <Form.Item label="依赖触发条件">
+          <Select value={step.trigger_rule || 'all_success'}
+            options={[{ value: 'all_success', label: '依赖全部成功' }, { value: 'all_done', label: '依赖全部结束（含失败）' }]}
+            onChange={(trigger_rule) => onChange({ ...step, trigger_rule })} />
+        </Form.Item>
+        {dynamic && <Form.Item label="实例失败策略">
+          <Select value={step.kind.failure_policy || 'fail_fast'}
+            options={[{ value: 'fail_fast', label: '首个失败停止其余实例' }, { value: 'collect_all', label: '继续执行并收集全部结果' }]}
+            onChange={(failure_policy) => onChange({ ...step, kind: { ...step.kind, failure_policy } })} />
+        </Form.Item>}
+        {kindType === 'agent' ? (
+          <>
+            <Form.Item label="提示词 (prompt)">
+              <TextArea
+                rows={3}
+                value={kind.prompt || ''}
+                onChange={(e) => updateField('prompt', e.target.value)}
+              />
+            </Form.Item>
+            <Form.Item label="Agent 名">
+              <Input
+                placeholder="可选：自定义 agent 名"
+                value={kind.agent || ''}
+                onChange={(e) => updateField('agent', e.target.value)}
+              />
+            </Form.Item>
+            <Form.Item label="模型覆盖">
+              <Input
+                placeholder="可选：模型覆盖"
+                value={kind.model || ''}
+                onChange={(e) => updateField('model', e.target.value)}
+              />
+            </Form.Item>
+            <Form.Item
+              label="经验追加 (how_append)"
+              extra={'可选：执行前追加到本次 how.md 副本（≤8KB）'}
+            >
+              <TextArea
+                rows={2}
+                placeholder="可选：追加到本次 how.md 的文本"
+                value={kind.how_append || ''}
+                onChange={(e) => updateField('how_append', e.target.value)}
+              />
+            </Form.Item>
+          </>
+        ) : null}
+        {kindType === 'binary' ? (
+          <>
+            <BinaryResourceField value={kind.resource || ''} onChange={(resource) => updateField('resource', resource)} />
+            <BinaryArguments value={kind.args ?? []} onChange={(args) => updateField('args', args)} />
+          </>
+        ) : null}
+        <Form.Item label="超时（秒）">
+          <InputNumber
+            min={1}
+            precision={0}
+            placeholder="可选（秒）"
+            style={{ width: '100%' }}
+            value={step.timeout_secs ?? null}
+            onChange={(v) => onChange({ ...step, timeout_secs: toTimeout(v) })}
+          />
+        </Form.Item>
+      </Form>
+      <Popconfirm
+        title="删除该步骤及其依赖连线？"
+        okText="删除"
+        cancelText="取消"
+        onConfirm={onRemove}
+      >
+        <Button danger block>
+          删除步骤
+        </Button>
+      </Popconfirm>
+    </div>
+  );
+}
+
+function BinaryArguments({ value, onChange }) {
+  const [draft, setDraft] = useState(typeof value === 'string' ? value : JSON.stringify(value));
+  const [error, setError] = useState('');
+  useEffect(() => {
+    setDraft(typeof value === 'string' ? value : JSON.stringify(value));
+    setError(typeof value === 'string' ? '参数必须是 JSON 字符串数组' : '');
+  }, [JSON.stringify(value)]);
+  const change = (text) => {
+    setDraft(text);
+    try {
+      const args = JSON.parse(text);
+      if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string' || arg.includes('\0'))) throw new Error();
+      setError('');
+      onChange(args);
+    } catch { setError('参数必须是 JSON 字符串数组'); onChange(text); }
+  };
+  return <Form.Item label="参数数组" validateStatus={error ? 'error' : undefined} help={error || '保留空格、引号和空参数，不经过 shell 解析'}>
+    <Input.TextArea rows={2} value={draft} onChange={(event) => change(event.target.value)} />
+  </Form.Item>;
+}
+
+/// NameField — the step-name input with inline validation. Valid candidates
+/// are committed immediately (onRename); invalid ones stay in the draft and
+/// show the renameStep error until fixed or the committed name changes.
+function NameField({ stepName, allNames, onRename }) {
+  const [draft, setDraft] = useState(stepName);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    setDraft(stepName);
+    setError('');
+  }, [stepName]);
+  const handle = (v) => {
+    setDraft(v);
+    const err = renameStep(v, allNames);
+    setError(err || '');
+    if (err === null) {
+      onRename(v);
+    }
+  };
+  return (
+    <Form layout="vertical" size="small">
+      <Form.Item
+        label="步骤名"
+        validateStatus={error ? 'error' : undefined}
+        help={error || undefined}
+        style={{ marginBottom: 10 }}
+      >
+        <Input value={draft} onChange={(e) => handle(e.target.value)} />
+      </Form.Item>
+    </Form>
+  );
+}
+
+/// SpecMetaForm — fallback panel while nothing is selected: edits the spec
+/// name, optional description and the whole-run max_concurrency bound
+/// through onChange({name} / {description} / {max_concurrency}).
+export function SpecMetaForm({ spec, onChange }) {
+  const meta = spec && typeof spec === 'object' ? spec : {};
+  const concurrency = typeof meta.max_concurrency === 'number' ? meta.max_concurrency : undefined;
+  return (
+    <div className="dag-edit-inspector">
+      <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+        未选中步骤时，可编辑工作流基础信息。
+      </Text>
+      <Form layout="vertical" size="small">
+        <Form.Item label="工作流名称">
+          <Input
+            value={typeof meta.name === 'string' ? meta.name : ''}
+            onChange={(e) => onChange({ name: e.target.value })}
+          />
+        </Form.Item>
+        <Form.Item label="描述（可选）">
+          <TextArea
+            rows={2}
+            value={typeof meta.description === 'string' ? meta.description : ''}
+            onChange={(e) => onChange({ description: e.target.value || undefined })}
+          />
+        </Form.Item>
+        <Form.Item label="并发上限（1-30，默认 4）">
+          <InputNumber
+            min={1}
+            max={30}
+            precision={0}
+            style={{ width: '100%' }}
+            value={concurrency}
+            placeholder="默认 4"
+            onChange={(v) => onChange({ max_concurrency: typeof v === 'number' ? v : undefined })}
+          />
+        </Form.Item>
+      </Form>
+    </div>
+  );
+}

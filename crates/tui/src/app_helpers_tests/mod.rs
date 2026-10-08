@@ -11,6 +11,7 @@ mod mouse_helpers;
 mod mouse_scroll_tests;
 mod mouse_tests;
 mod mouse_wheel_tests;
+mod submit_flash_tests;
 
 // ----- Input-history recording (Enter / Tab recall via arrow keys) -----
 
@@ -53,7 +54,13 @@ fn push_user_records_history_and_echoes_transcript() {
     let mut chat = ChatView::default();
     let mut history: Vec<String> = Vec::new();
     let mut hist_idx: Option<usize> = None;
-    push_user(&mut chat, &mut history, &mut hist_idx, "hello world");
+    push_user(
+        &mut chat,
+        &mut history,
+        &mut hist_idx,
+        "hello world",
+        "hello world",
+    );
     assert_eq!(history, vec!["hello world".to_string()]);
     assert_eq!(hist_idx, None);
     // push_user now creates a ChatBlock::User with markdown-rendered body.
@@ -149,14 +156,16 @@ fn paste_non_file_text_returned_verbatim() {
     assert_eq!(paste_payload("hello world", dir.path()), "hello world");
 }
 
-/// Ctrl+T is now a pure act<->plan mode toggle and must NOT be consumed by
-/// `pre_key_intercept` (so it falls through to `handle_key`, which switches
-/// mode without collapsing thinking or clearing the input). Ctrl+L owns the
-/// collapse/clear/follow behaviour (without the forced redraw — that moved to
-/// Ctrl+F).
+/// Ctrl+T belongs to `handle_key`'s act/plan switch and must NOT be consumed
+/// by `pre_key_intercept`. Ctrl+L owns the collapse/clear/follow behaviour
+/// (without the forced redraw — that moved to Ctrl+F).
 #[test]
-fn ctrl_t_not_intercepted_ctrl_l_clears_ctrl_f_redraws() {
-    fn run(key: KeyEvent) -> (bool, String, usize, bool, bool) {
+fn ctrl_t_passes_to_mode_handler_ctrl_l_clears_ctrl_f_redraws() {
+    let (sidecar_tx, _sidecar_rx) = mpsc::channel::<crate::sidecar_ui::SidecarCmd>(8);
+    fn run(
+        key: KeyEvent,
+        sidecar_tx: &mpsc::Sender<crate::sidecar_ui::SidecarCmd>,
+    ) -> (bool, String, usize, bool, bool) {
         let mut chat = ChatView::default();
         let mut subagent_focus: Option<usize> = None;
         let mut follow = false;
@@ -174,6 +183,7 @@ fn ctrl_t_not_intercepted_ctrl_l_clears_ctrl_f_redraws() {
             &mut input,
             &mut cursor,
             &mut needs_clear,
+            sidecar_tx,
         );
         (consumed, input, cursor, needs_clear, follow)
     }
@@ -182,8 +192,8 @@ fn ctrl_t_not_intercepted_ctrl_l_clears_ctrl_f_redraws() {
     let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
     let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
 
-    // Ctrl+T must pass through untouched (handled downstream as a mode toggle).
-    let (t_consumed, t_input, t_cursor, t_clear, t_follow) = run(ctrl_t);
+    // Ctrl+T must pass through untouched for handle_key to switch modes.
+    let (t_consumed, t_input, t_cursor, t_clear, t_follow) = run(ctrl_t, &sidecar_tx);
     assert!(
         !t_consumed,
         "Ctrl+T must NOT be consumed by pre_key_intercept"
@@ -193,12 +203,12 @@ fn ctrl_t_not_intercepted_ctrl_l_clears_ctrl_f_redraws() {
         "Ctrl+T must leave the input untouched"
     );
     assert_eq!(t_cursor, 5, "Ctrl+T must not move the cursor");
-    assert!(!t_clear, "Ctrl+T must not request a forced clear/redraw");
+    assert!(!t_clear, "Ctrl+T must not force a redraw");
     assert!(!t_follow, "Ctrl+T must not touch follow mode");
 
     // Ctrl+L still collapses thinking / clears the input, but no longer
     // forces the full-screen redraw (that is Ctrl+F's job now).
-    let (l_consumed, l_input, l_cursor, l_clear, l_follow) = run(ctrl_l);
+    let (l_consumed, l_input, l_cursor, l_clear, l_follow) = run(ctrl_l, &sidecar_tx);
     assert!(l_consumed, "Ctrl+L must be consumed by pre_key_intercept");
     assert!(l_input.is_empty(), "Ctrl+L must clear the input");
     assert_eq!(l_cursor, 0, "Ctrl+L must reset the cursor");
@@ -213,7 +223,7 @@ fn ctrl_t_not_intercepted_ctrl_l_clears_ctrl_f_redraws() {
 
     // Ctrl+F: force redraw only — consumes the key, sets needs_clear, and
     // leaves the input / cursor untouched.
-    let (f_consumed, f_input, f_cursor, f_clear, f_follow) = run(ctrl_f);
+    let (f_consumed, f_input, f_cursor, f_clear, f_follow) = run(ctrl_f, &sidecar_tx);
     assert!(f_consumed, "Ctrl+F must be consumed by pre_key_intercept");
     assert_eq!(
         f_input, "hello world",
@@ -381,7 +391,7 @@ async fn restore_pending_mirrors_restores_display_text_at_reload() {
     let q_seq = store.admit_input(&row).await.unwrap();
     // Steered input admitted without a display form (pre-display_text rows).
     let s_seq = store
-        .admit_input(&pending_row(0, sid, 2, Delivery::Steer, "steer me", None))
+        .admit_input(&pending_row(1, sid, 2, Delivery::Steer, "steer me", None))
         .await
         .unwrap();
 
@@ -522,8 +532,6 @@ async fn skill_only_submit_while_running_drains_images_via_queue() {
             workdir_hash: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
             created_at: 0,
             updated_at: 0,
             summary: None,
@@ -532,6 +540,7 @@ async fn skill_only_submit_while_running_drains_images_via_queue() {
             handoff_seq: None,
             handoff_plan: None,
             skill: None,
+            kind: None,
         })
         .await
         .unwrap();
@@ -541,8 +550,9 @@ async fn skill_only_submit_while_running_drains_images_via_queue() {
         vec![("data:image/png;base64,AAAA".into(), "img1.png".into())];
 
     // Step 1: snapshot WITHOUT clearing (images survive a failed admit).
-    let skill_name = "my-skill";
-    let trigger = crate::skill_display::skill_trigger(skill_name);
+    // Skill-only submits queue the RAW `$name` text (verbatim admission);
+    // the runner resolves it and injects its own trigger at consumption.
+    let trigger = "$my-skill".to_string();
     let image_uris = crate::app_helpers::snapshot_image_uris(&pending_images);
 
     // Step 2: admit as a queued input (mirrors the else branch).
@@ -600,8 +610,6 @@ async fn combined_skill_and_text_submit_while_running_queues_clean_text() {
             workdir_hash: None,
             task_type: None,
             requirement: None,
-            plan_snapshot: None,
-            plan_input_count: 0,
             created_at: 0,
             updated_at: 0,
             summary: None,
@@ -610,6 +618,7 @@ async fn combined_skill_and_text_submit_while_running_queues_clean_text() {
             handoff_seq: None,
             handoff_plan: None,
             skill: None,
+            kind: None,
         })
         .await
         .unwrap();

@@ -14,6 +14,15 @@ pub struct ToolContext {
     /// `config.network.proxy` from the session so tools honor the configured
     /// proxy; env fallbacks are applied at use time via `effective_proxy`.
     pub proxy: Option<String>,
+    /// Colon-joined extra PATH dirs for agent-private tools
+    /// (`agents/<name>/tools/v{n}/…`). `None` = no injection (builtin
+    /// agents and plain sessions never set it).
+    pub tools_path: Option<String>,
+    /// Extra `KEY=VALUE` env pairs injected into every spawned tool
+    /// process (bash today). Workflow-orchestrated sessions use this to
+    /// expose step-scoped contract vars (e.g. `OPENCODER_HOW_APPEND`);
+    /// plain sessions keep it empty.
+    pub extra_env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +69,8 @@ pub struct ToolSchema {
 }
 
 #[async_trait]
+// async_trait annotates futures that are already must-use on Rust 1.99.
+#[allow(clippy::double_must_use)]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;

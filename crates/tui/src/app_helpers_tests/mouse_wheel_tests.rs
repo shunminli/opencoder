@@ -5,7 +5,7 @@
 
 use super::mouse_helpers::*;
 use crate::app_helpers::*;
-use crossterm::event::KeyModifiers;
+use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 fn wheel_event(kind: MouseEventKind, row: u16) -> MouseEvent {
@@ -32,7 +32,7 @@ async fn wheel_up_in_queue_panel_scrolls_panel_only() {
     let mut subagent_focus: Option<usize> = None;
     let mut subagent_sys = 0u64;
     let mut queue_items: Vec<(i64, String)> = Vec::new();
-    let store = StubStore;
+    let store = StubStore::default();
 
     handle_mouse(
         wheel_event(MouseEventKind::ScrollUp, 1),
@@ -74,7 +74,7 @@ async fn wheel_down_advances_toward_newest() {
     let mut subagent_focus: Option<usize> = None;
     let mut subagent_sys = 0u64;
     let mut queue_items: Vec<(i64, String)> = Vec::new();
-    let store = StubStore;
+    let store = StubStore::default();
 
     handle_mouse(
         wheel_event(MouseEventKind::ScrollDown, 1),
@@ -130,7 +130,7 @@ async fn wheel_outside_queue_panel_scrolls_body() {
     let mut subagent_focus: Option<usize> = None;
     let mut subagent_sys = 0u64;
     let mut queue_items: Vec<(i64, String)> = Vec::new();
-    let store = StubStore;
+    let store = StubStore::default();
 
     // row 6 is inside the body rect (rows 4..16), below the panel (rows 0..3).
     handle_mouse(
@@ -154,7 +154,7 @@ async fn wheel_outside_queue_panel_scrolls_body() {
     assert_eq!(queue_scroll, 1, "panel offset untouched");
 }
 
-/// Without a queue-panel hit rect (panel hidden, e.g. plan mode), the wheel
+/// Without a queue-panel hit rect (panel hidden, e.g. in the plan editor), the wheel
 /// keeps scrolling the body — stale `queue_scroll` stays put and is clamped
 /// by the renderer.
 #[tokio::test]
@@ -169,7 +169,7 @@ async fn wheel_with_no_queue_panel_keeps_body_behavior() {
     let mut subagent_focus: Option<usize> = None;
     let mut subagent_sys = 0u64;
     let mut queue_items: Vec<(i64, String)> = Vec::new();
-    let store = StubStore;
+    let store = StubStore::default();
 
     handle_mouse(
         wheel_event(MouseEventKind::ScrollUp, 6),
